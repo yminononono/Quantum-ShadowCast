@@ -1,0 +1,16 @@
+# ShadowCast — Josephson Junction Process Simulator
+# Install: pip install -r requirements.txt
+
+# Required
+streamlit>=1.28.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# GDS loader (install one of the following)
+# Recommended: gdstk (fast, actively maintained)
+gdstk>=0.9.0
+# Alternative: gdspy (legacy, widely used)
+# gdspy>=1.6.0
+
+# Optional: more accurate polygon offset for non-convex shapes
+# shapely>=2.0.0
