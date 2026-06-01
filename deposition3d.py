@@ -82,17 +82,16 @@ def build_occluders(p: ProcessParams):
         L = p.bridge_len                            # suspended bridge width (x)
         Wj = p.bridge_w                             # junction width (y)
         u = p.undercut
-        gap, t_pmma = p.bridge_gap, p.t_pmma        # gap = bridge underside height
+        gap, t_pmma = p.t_mma, p.t_pmma             # gap = MMA height = bridge underside
         z_top = gap + t_pmma
 
-        # Open windows must sit on either side of the bridge so the tilted
-        # beam can reach the floor and slide under the bridge.  Make the trench
-        # comfortably wider than the under-bridge reach (gap·tanθ).
-        # Window must be wide enough that the far electrode wall does not
-        # shadow the under-bridge region; then the junction is bridge-limited
-        # (the intended Dolan behaviour, overlap ≈ 2·gap·tanθ − L).
+        # Horizontal opening between each bridge edge and the PMMA wall.  When
+        # bridge_pmma_gap is 0 we auto-size it wide enough that the tilted beam
+        # clears the wall and reaches under the bridge (bridge-limited junction,
+        # overlap ≈ 2·gap·tanθ − L); otherwise the user sets it directly.
         tanmax = np.tan(np.radians(max(abs(p.angle1), abs(p.angle2))))
-        window = tanmax * z_top + L + 250.0
+        auto_window = tanmax * z_top + L + 250.0
+        window = p.bridge_pmma_gap if p.bridge_pmma_gap > 0 else auto_window
         trench_hx = L / 2 + window                  # PMMA trench half-width (x)
         ap_hy = Wj / 2                              # aperture half-width (y)
         R = trench_hx + u + 400.0
@@ -337,7 +336,7 @@ def simulate(p: ProcessParams) -> DepositionResult:
     # the open trench floods both depositions onto the leads; the actual JJ is
     # the under-bridge overlap, so confine the measurement to the bridge zone.
     if p.mode == "Dolan bridge":
-        reach = p.bridge_gap * np.tan(np.radians(max(abs(p.angle1), abs(p.angle2))))
+        reach = p.t_mma * np.tan(np.radians(max(abs(p.angle1), abs(p.angle2))))
         junc_xmax = p.bridge_len / 2 + reach + 2 * vox
         junc_ymax = p.bridge_w / 2 + 2 * vox
     else:

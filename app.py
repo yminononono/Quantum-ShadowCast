@@ -46,14 +46,13 @@ with st.sidebar:
     st.subheader("Bilayer resist")
     st.caption("Recipe arxiv:2101.01453 — PMMA A-4 ≈250 nm / MMA EL-13 ≈900 nm")
     t_pmma   = st.slider("PMMA [nm]  (top, no undercut)",   100, 800, 250, 25)
-    bridge_gap = st.slider("Bridge gap [nm]  (suspended height = shadow-defining)",
-                           100, 1500, 900, 25,
-                           help="Air-gap height under the Dolan bridge. "
-                                "Junction overlap ≈ 2·gap·tanθ − bridge width. "
-                                "Independent of the MMA layer thickness.")
-    t_mma    = bridge_gap   # MMA bottom layer fills the gap region
+    t_mma    = st.slider("MMA [nm]  (bottom = bridge height / vertical gap)",
+                         100, 1500, 900, 25,
+                         help="MMA bottom-layer thickness.  The bridge underside "
+                              "sits at z = MMA height, so this sets the vertical "
+                              "shadow gap.  Junction overlap ≈ 2·MMA·tanθ − bridge width.")
     undercut = st.slider("MMA undercut u [nm]  (one-sided)",  0, 500, 150, 10)
-    st.caption(f"Total resist: {t_pmma+bridge_gap} nm  ·  bridge gap (shadow height) = {bridge_gap} nm")
+    st.caption(f"Total resist: {t_pmma+t_mma} nm  ·  vertical shadow gap = MMA = {t_mma} nm")
 
     st.subheader("Evaporation 1")
     angle1   = st.slider("Polar θ₁ [°]",     -60, 60, -24, 1)
@@ -73,11 +72,17 @@ with st.sidebar:
                                50, 2000, 250, 10)
         bridge_w   = st.slider("Bridge length [nm]  (junction width, y)",
                                50, 1000, 250, 10)
-        t_shadow   = bridge_gap * np.tan(np.radians(max(abs(angle1), abs(angle2))))
+        bridge_pmma_gap = st.slider(
+            "Bridge ↔ PMMA opening [nm]  (per side, 0 = auto)",
+            0, 2000, 0, 25,
+            help="Horizontal gap between each bridge edge and the PMMA wall "
+                 "(the trench window). 0 auto-sizes it wide enough for the "
+                 "tilted beam to reach under the bridge.")
+        t_shadow   = t_mma * np.tan(np.radians(max(abs(angle1), abs(angle2))))
         st.caption(
-            f"Shadow projection = gap · tan θ = {t_shadow:.0f} nm  \n"
+            f"Shadow projection = MMA · tan θ = {t_shadow:.0f} nm  \n"
             f"Junction when bridge width **<** {2*t_shadow:.0f} nm  \n"
-            f"(bridge_len < 2 · gap · tan θ  →  deposits meet under bridge)"
+            f"(bridge_len < 2 · MMA · tan θ  →  deposits meet under bridge)"
         )
         manhattan_wx = manhattan_wy = bridge_w
         manhattan_theta = 60.0; manhattan_delta = 15.0; manhattan_h = 1800.0
@@ -104,7 +109,7 @@ with st.sidebar:
         st.markdown("Designed resist line openings (Manhattan crossing):")
         manhattan_wx = st.slider("x-arm opening wx [nm]", 100, 2000, 600, 10)
         manhattan_wy = st.slider("y-arm opening wy [nm]", 100, 2000, 600, 10)
-        bridge_len = 700; bridge_w = 300
+        bridge_len = 700; bridge_w = 300; bridge_pmma_gap = 0.0
         _tan = np.tan(np.radians(manhattan_theta))
         _shrink = manhattan_h * np.sin(np.radians(manhattan_delta)) / _tan if _tan > 1e-9 else 0.0
         st.caption(
@@ -119,10 +124,10 @@ with st.sidebar:
     show_undercut = st.checkbox("Show undercut regions (top view)", True)
 
 params = ProcessParams(
-    t_pmma=t_pmma, t_mma=t_mma, bridge_gap=bridge_gap, undercut=undercut,
+    t_pmma=t_pmma, t_mma=t_mma, undercut=undercut,
     angle1=angle1, phi1=phi1, t_metal1=t_metal1,
     angle2=angle2, phi2=phi2, t_metal2=t_metal2,
-    bridge_len=bridge_len, bridge_w=bridge_w,
+    bridge_len=bridge_len, bridge_w=bridge_w, bridge_pmma_gap=bridge_pmma_gap,
     manhattan_wx=manhattan_wx, manhattan_wy=manhattan_wy,
     manhattan_theta=manhattan_theta, manhattan_delta=manhattan_delta,
     manhattan_h=manhattan_h,
@@ -137,10 +142,10 @@ def _run_engine(ekey, _params):
     jm, area, ox, oy = junction_footprint(r)
     return r, jm, area, ox, oy
 
-ekey = (params.mode, params.t_pmma, params.t_mma, params.bridge_gap, params.undercut,
+ekey = (params.mode, params.t_pmma, params.t_mma, params.undercut,
         params.angle1, params.phi1, params.t_metal1,
         params.angle2, params.phi2, params.t_metal2,
-        params.bridge_len, params.bridge_w,
+        params.bridge_len, params.bridge_w, params.bridge_pmma_gap,
         params.manhattan_wx, params.manhattan_wy,
         params.manhattan_theta, params.manhattan_delta, params.manhattan_h)
 with st.spinner("Running 3D shadow-evaporation engine..."):
@@ -303,7 +308,7 @@ with tab4:
 
     if eng_area <= 0:
         if mode == "Dolan bridge":
-            t_shadow_total = 2 * params.bridge_gap * np.tan(
+            t_shadow_total = 2 * params.t_mma * np.tan(
                 np.radians(max(abs(angle1), abs(angle2))))
             st.error(
                 f"❌ Open circuit — no junction overlap (engine).  \n"
@@ -330,7 +335,8 @@ with tab4:
     if mode == "Dolan bridge":
         scan_opts = ["θ₁", "θ₂", "φ₁", "φ₂",
                      "bridge_len", "bridge_w",
-                     "MMA thickness", "Undercut u", "PMMA thickness"]
+                     "MMA height", "Bridge↔PMMA gap",
+                     "Undercut u", "PMMA thickness"]
     else:
         scan_opts = ["θ tilt", "δ offset", "h resist",
                      "x-arm width", "y-arm width"]
@@ -342,7 +348,8 @@ with tab4:
         "φ₂":           ("phi2",        np.linspace(-90,90,100),    "φ₂ [°]"),
         "bridge_len":   ("bridge_len",  np.linspace(100,2000,100),  "bridge_len [nm]"),
         "bridge_w":     ("bridge_w",    np.linspace(50,800,100),    "bridge_w [nm]"),
-        "Bridge gap":   ("bridge_gap",  np.linspace(100,1500,100),  "bridge gap [nm]"),
+        "MMA height":   ("t_mma",       np.linspace(100,1500,100),  "MMA height [nm]"),
+        "Bridge↔PMMA gap":("bridge_pmma_gap", np.linspace(0,2000,100),"bridge↔PMMA gap [nm]"),
         "Undercut u":   ("undercut",    np.linspace(0,400,100),     "u [nm]"),
         "PMMA thickness":("t_pmma",     np.linspace(100,800,100),   "PMMA [nm]"),
         "θ tilt":       ("manhattan_theta", np.linspace(30,80,100),  "θ [°]"),
@@ -397,7 +404,8 @@ with tab5:
         detail = {
             "Mode":                  params.mode,
             "PMMA [nm]":             params.t_pmma,
-            "Bridge gap [nm]":       params.bridge_gap,
+            "MMA [nm] (vert. gap)":  params.t_mma,
+            "Bridge↔PMMA gap [nm]":  params.bridge_pmma_gap,
             "Total resist [nm]":     params.t_resist,
             "Undercut u [nm]":       params.undercut,
             "θ₁ [°]":                params.angle1,

@@ -50,11 +50,8 @@ class ProcessParams:
     # ── Bilayer resist ─────────────────────────────────────────
     # Recipe: arxiv:2101.01453 — PMMA A-4 ~250 nm on MMA EL-13 ~900 nm.
     t_pmma:   float = 250.0   # PMMA top layer [nm]  (no undercut)
-    t_mma:    float = 900.0   # MMA  bot layer [nm]  (undercut sublayer)
+    t_mma:    float = 900.0   # MMA  bot layer [nm]  (= bridge underside height / vertical gap)
     undercut: float = 150.0   # MMA one-sided undercut [nm]
-    # Suspended-bridge air-gap height (shadow-defining).  Independent control;
-    # defaults to the MMA thickness but can be set freely.
-    bridge_gap: float = 900.0  # bridge underside height above substrate [nm]
 
     # ── Evaporation 1 ─────────────────────────────────────────
     # Uniaxial tilt ±24° (same azimuth φ, opposite polar θ); 30 nm Al each.
@@ -72,6 +69,10 @@ class ProcessParams:
     #             narrow dimension (≈ critical dimension, 250 nm in recipe).
     bridge_len: float = 250.0   # bridge width   [nm]  (along evap x-axis)
     bridge_w:   float = 250.0   # bridge length  [nm]  (junction width, y-axis)
+    # Horizontal opening between each bridge edge and the PMMA wall (per side).
+    # Sets the trench window width; the tilted beam must clear this to reach
+    # under the bridge.  0 → auto (wide enough for the beam to reach the floor).
+    bridge_pmma_gap: float = 0.0  # one-sided bridge↔PMMA opening [nm]; 0 = auto
 
     # ── Manhattan / double-oblique geometry (arxiv:2605.19590) ─
     # Two perpendicular resist line openings (Manhattan crossing).
@@ -97,12 +98,11 @@ class ProcessParams:
     def t_gap(self) -> float:
         """Height of the suspended bridge above the substrate.
 
-        The metal tongue that reaches under the bridge is shadowed by the
-        bridge bottom edge, so the under-bridge junction overlap is governed by
-        this gap — NOT the full resist height.
-        Standard Dolan overlap:  2·bridge_gap·tanθ − bridge_len.
+        The bridge underside sits at the top of the MMA layer (z = t_mma), so
+        the under-bridge junction overlap is governed by the MMA height — NOT
+        the full resist height.  Standard Dolan overlap:  2·t_mma·tanθ − bridge_len.
         """
-        return self.bridge_gap
+        return self.t_mma
 
     # Dolan: x-direction opening half-widths
     @property

@@ -20,7 +20,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.colors import ListedColormap, BoundaryNorm, to_rgba
 from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 
@@ -103,6 +103,27 @@ def _draw(ax, cat, h_axis, v_axis, h_label, v_label, title, hlim=None, vlim=None
         ax.set_xlim(-hlim, hlim)
     if vlim is not None:
         ax.set_ylim(vlim[0], vlim[1])
+
+
+def _overlay_cats(ax, cat, h_axis, v_axis, cats, alpha=0.62, zorder=3):
+    """Overlay selected categories as a translucent RGBA image.
+
+    Lets whatever is drawn beneath (resist / undercut shelf) remain visible
+    through the deposited metal in the top view.
+    """
+    nh, nv = cat.shape
+    rgba = np.zeros((nh, nv, 4), dtype=float)
+    any_set = False
+    for c in cats:
+        m = cat == c
+        if m.any():
+            rgba[m] = to_rgba(_COLORS[c], alpha)
+            any_set = True
+    if not any_set:
+        return
+    extent = [h_axis[0], h_axis[-1], v_axis[0], v_axis[-1]]
+    ax.imshow(np.transpose(rgba, (1, 0, 2)), origin="lower", extent=extent,
+              aspect="auto", interpolation="nearest", zorder=zorder)
 
 
 def _oxide_overlay(ax, al1, exclude, h_axis, v_axis, lw=0.9):
@@ -374,37 +395,44 @@ def _resist_cat_top(cat, upper_resist, lower_resist):
 
 
 def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None):
-    """5-panel staged top view: resist (with undercut) → evap1 → ox → evap2 → lift-off."""
+    """5-panel staged top view: resist (with undercut) → evap1 → ox → evap2 → lift-off.
+
+    The resist / undercut pattern is drawn opaque underneath, then the deposited
+    metal is layered on top semi-transparently so the resist mask stays visible.
+    """
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
 
-    def cat_build(inc_al1=False, inc_al2=False,
-                  liftoff=False, emphasise_junc=False):
+    # Opaque resist base (substrate visible through the open holes).
+    resist_base = np.full(al1f.shape, C_EMPTY, np.int8)
+    _resist_cat_top(resist_base, upper_resist, lower_resist)
+    empty_base = np.full(al1f.shape, C_EMPTY, np.int8)
+
+    def metal_cat(inc_al1=False, inc_al2=False, emphasise_junc=False):
         cat = np.full(al1f.shape, C_EMPTY, np.int8)
-        if not liftoff:
-            _resist_cat_top(cat, upper_resist, lower_resist)
-            if inc_al1: cat[al1f] = C_AL1
-            if inc_al2: cat[al2f] = C_AL2
-        else:
-            cat[al1f] = C_AL1
-            cat[al2f] = C_AL2
-            if emphasise_junc and junc_mask is not None:
-                cat[junc_mask] = C_JUNC
+        if inc_al1: cat[al1f] = C_AL1
+        if inc_al2: cat[al2f] = C_AL2
+        if emphasise_junc and junc_mask is not None:
+            cat[junc_mask] = C_JUNC
         return cat
 
+    # (title, base_grid, metal_grid, metal_alpha, show_ox)
     panels = [
-        ("1. Resist only",   cat_build(),                                 False),
-        ("2. Evaporation 1", cat_build(inc_al1=True),                     False),
-        ("3. Oxidation",     cat_build(inc_al1=True),                     True),
-        ("4. Evaporation 2", cat_build(inc_al1=True, inc_al2=True),       True),
-        ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True), True),
+        ("1. Resist only",   resist_base, metal_cat(),                          0.62, False),
+        ("2. Evaporation 1", resist_base, metal_cat(inc_al1=True),              0.62, False),
+        ("3. Oxidation",     resist_base, metal_cat(inc_al1=True),              0.62, True),
+        ("4. Evaporation 2", resist_base, metal_cat(inc_al1=True, inc_al2=True),0.62, True),
+        ("5. Lift-off (JJ)", empty_base,
+         metal_cat(inc_al1=True, inc_al2=True, emphasise_junc=True),            1.00, True),
     ]
 
     no_excl = np.zeros_like(al1f)
     hw = _top_half(r, view_half)
     fig, axes = plt.subplots(2, 3, figsize=(13.5, 9.0), sharex=True, sharey=True)
     axes = axes.ravel()
-    for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
-        _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
+    for k, (ax, (title, base, mcat, malpha, show_ox)) in enumerate(zip(axes, panels)):
+        _draw(ax, base, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
+        _overlay_cats(ax, mcat, r.xs, r.ys,
+                      [C_AL1, C_AL2, C_JUNC], alpha=malpha, zorder=3)
         ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
         ax.set_aspect("equal")
         if show_ox:
@@ -420,24 +448,30 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None):
 
 
 def render_top_view(r: DepositionResult, junc_mask=None, view_half=None):
-    """Single top-down floor map: Al1 / Al2 / junction on the substrate."""
+    """Single top-down floor map: resist/undercut (opaque) with Al1 / Al2 /
+    junction layered on top semi-transparently so the resist mask stays visible."""
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
-    cat = np.full(al1f.shape, C_EMPTY, np.int8)
-    _resist_cat_top(cat, upper_resist, lower_resist)
-    cat[al1f] = C_AL1
-    cat[al2f] = C_AL2
+    base = np.full(al1f.shape, C_EMPTY, np.int8)
+    _resist_cat_top(base, upper_resist, lower_resist)
+
+    mcat = np.full(al1f.shape, C_EMPTY, np.int8)
+    mcat[al1f] = C_AL1
+    mcat[al2f] = C_AL2
     if junc_mask is not None:
-        cat[junc_mask] = C_JUNC
+        mcat[junc_mask] = C_JUNC
 
     hw = _top_half(r, view_half)
     fig, ax = plt.subplots(figsize=(6.0, 5.4))
-    _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", "Top view (floor deposit)")
+    _draw(ax, base, r.xs, r.ys, "x  [nm]", "y  [nm]", "Top view (floor deposit)")
+    _overlay_cats(ax, mcat, r.xs, r.ys, [C_AL1, C_AL2, C_JUNC],
+                  alpha=0.62, zorder=3)
     ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
     ax.set_aspect("equal")
     _oxide_overlay(ax, al1f, np.zeros_like(al1f), r.xs, r.ys)
     _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
     _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
-    present = sorted([c for c in np.unique(cat).tolist() if c != C_EMPTY])
+    present = [c for c in (C_RESIST_LO, C_RESIST_UP) if (base == c).any()]
+    present += [c for c in (C_AL1, C_AL2, C_JUNC) if (mcat == c).any()]
     if present:
         _legend(fig, present)
     fig.tight_layout(rect=[0, 0.08, 1, 1])

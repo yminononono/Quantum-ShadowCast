@@ -49,8 +49,8 @@ def draw_phi_cross_section(params: ProcessParams) -> plt.Figure:
     resist_half  = p.bridge_width / 2 + 400
     opening_half = p.bridge_width / 2
     uc_half      = opening_half + p.undercut
-    bridge_y0    = p.bridge_gap
-    bridge_y1    = p.bridge_gap + 60
+    bridge_y0    = p.t_mma
+    bridge_y1    = p.t_mma + 60
     resist_y1    = p.t_resist
 
     evaps = [
