@@ -84,6 +84,36 @@ def _legend(fig, present):
                frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.02))
 
 
+def _beam_arrow_cs(ax, d, plane, hlim, ztop, color, label, side=-1):
+    """Draw the evaporation beam direction as an arrow on a cross section."""
+    dh = d[0] if plane == "x-z" else d[1]
+    dz = d[2]
+    n = np.hypot(dh, dz) or 1.0
+    dh, dz = dh / n, dz / n
+    L = 0.6 * ztop
+    head = np.array([side * 0.45 * hlim, 0.45 * ztop])   # near surface
+    tail = head - L * np.array([dh, dz])                 # up toward source
+    ax.annotate("", xy=head, xytext=tail,
+                arrowprops=dict(arrowstyle="-|>", color=color, lw=2.2))
+    ax.text(tail[0], tail[1] + 0.06 * ztop, label, color=color,
+            fontsize=8, ha="center", fontweight="bold")
+
+
+def _beam_arrow_top(ax, d, hw, color, label, side=-1):
+    """Draw the in-plane (azimuth) beam direction as an arrow on the top view."""
+    dh, dv = d[0], d[1]
+    n = np.hypot(dh, dv)
+    if n < 1e-9:
+        return
+    dh, dv = dh / n, dv / n
+    L = 0.5 * hw
+    head = np.array([0.0, 0.0])
+    tail = head - L * np.array([dh, dv])
+    ax.annotate("", xy=head, xytext=tail,
+                arrowprops=dict(arrowstyle="-|>", color=color, lw=2.0))
+    ax.text(tail[0], tail[1], label, color=color, fontsize=8, fontweight="bold")
+
+
 def _zoom_half(r, plane):
     """Half-width [nm] of a view window centred on the junction."""
     jxm = r.meta.get("junc_xmax", r.meta["R"])
@@ -137,8 +167,13 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
 
     title = (f"x–z cross section  (y = {slice_pos:.0f} nm)" if plane == "x-z"
              else f"y–z cross section  (x = {slice_pos:.0f} nm)")
+    hlim = _zoom_half(r, plane)
     fig, ax = plt.subplots(figsize=(7.5, 4.2))
-    _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=_zoom_half(r, plane))
+    _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim)
+    _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, r.z_top, _COLORS[C_AL1],
+                   "evap 1", side=-1)
+    _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, r.z_top, _COLORS[C_AL2],
+                   "evap 2", side=+1)
     _legend(fig, sorted(np.unique(cat).tolist()))
     fig.tight_layout(rect=[0, 0.08, 1, 1])
     return fig
@@ -191,8 +226,14 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
 
     hlim = _zoom_half(r, plane)
     fig, axes = plt.subplots(1, 5, figsize=(21, 4.4), sharey=True)
-    for ax, (title, cat) in zip(axes, panels):
+    for k, (ax, (title, cat)) in enumerate(zip(axes, panels)):
         _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim)
+        if k in (1, 2):       # evap-1 related panels
+            _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, r.z_top,
+                           _COLORS[C_AL1], "evap 1", side=-1)
+        if k == 3:            # evap-2 panel
+            _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, r.z_top,
+                           _COLORS[C_AL2], "evap 2", side=+1)
     _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP,
                   C_AL1, C_ALOX, C_AL2, C_JUNC])
     fig.tight_layout(rect=[0, 0.07, 1, 1])
@@ -260,10 +301,14 @@ def render_top_stages(r: DepositionResult, junc_mask=None):
     jym = r.meta.get("junc_ymax", r.meta["R"])
     hw = min(max(jxm, jym) * 3.0, r.meta["R"])
     fig, axes = plt.subplots(1, 5, figsize=(21, 4.6), sharey=True)
-    for ax, (title, cat) in zip(axes, panels):
+    for k, (ax, (title, cat)) in enumerate(zip(axes, panels)):
         _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
         ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
         ax.set_aspect("equal")
+        if k in (1, 2):
+            _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
+        if k == 3:
+            _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
     _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_AL1, C_ALOX, C_AL2, C_JUNC])
     fig.tight_layout(rect=[0, 0.08, 1, 1])
     return fig
@@ -287,6 +332,8 @@ def render_top_view(r: DepositionResult, junc_mask=None):
     _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", "Top view (floor deposit)")
     ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
     ax.set_aspect("equal")
+    _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
+    _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
     present = sorted([c for c in np.unique(cat).tolist() if c != C_EMPTY])
     if present:
         _legend(fig, present)

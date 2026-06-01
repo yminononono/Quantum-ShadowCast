@@ -292,21 +292,20 @@ def simulate(p: ProcessParams) -> DepositionResult:
 
     al1 = _deposit(lab, xs, ys, zs, vox, d1, p.t_metal1, boxes)
 
-    # oxide: a thin skin on top of al1 (one cell toward source of beam 1)
-    alox = np.zeros_like(al1)
-    fwd1 = np.round(d1 / (np.abs(d1).max() + 1e-12)).astype(int)
-    ai, aj, ak = np.where(al1)
-    oi, oj, ok = ai - fwd1[0], aj - fwd1[1], ak - fwd1[2]
-    m = ((oi >= 0) & (oi < lab.shape[0]) & (oj >= 0) & (oj < lab.shape[1]) &
-         (ok >= 0) & (ok < lab.shape[2]))
-    oi, oj, ok = oi[m], oj[m], ok[m]
-    free = (lab[oi, oj, ok] == EMPTY) & (~al1[oi, oj, ok])
-    alox[oi[free], oj[free], ok[free]] = True
+    # Oxide: a thin (~few-nm) conformal skin coating ALL exposed faces of al1
+    # — top and sides.  Physically it is far thinner than a voxel, so it is
+    # drawn one cell thick for visibility but is NOT treated as geometry: it
+    # does not shadow or block evaporation 2.
+    neigh = np.zeros_like(al1)
+    neigh[1:, :, :] |= al1[:-1, :, :]; neigh[:-1, :, :] |= al1[1:, :, :]
+    neigh[:, 1:, :] |= al1[:, :-1, :]; neigh[:, :-1, :] |= al1[:, 1:, :]
+    neigh[:, :, 1:] |= al1[:, :, :-1]; neigh[:, :, :-1] |= al1[:, :, 1:]
+    alox = neigh & (~al1) & (lab == EMPTY)
 
-    # evaporation 2 sees al1+alox as additional solid surface
+    # evaporation 2 sees only the al1 metal as additional solid (oxide is
+    # geometrically negligible and does not occlude the beam)
     lab2 = lab.copy()
     lab2[al1] = RESIST
-    lab2[alox] = RESIST
     al2 = _deposit(lab2, xs, ys, zs, vox, d2, p.t_metal2, boxes)
 
     z_floor = p.t_metal1 + p.t_metal2 + max(p.t_metal1 * 0.1, 3) + 2 * vox

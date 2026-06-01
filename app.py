@@ -140,6 +140,9 @@ ekey = (params.mode, params.t_pmma, params.t_mma, params.undercut,
         params.manhattan_theta, params.manhattan_delta, params.manhattan_h)
 with st.spinner("Running 3D shadow-evaporation engine..."):
     eng, eng_jm, eng_area, eng_ox, eng_oy = _run_engine(ekey, params)
+# Engine-based critical current (jc = 10 kA/cm², Ambegaokar-Baratoff),
+# consistent with junction_area.py:  Ic[µA] = area_nm2 · 1e-4
+eng_ic = eng_area * 1e-4
 
 # ─── Tabs ─────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -229,73 +232,79 @@ with tab2:
 
 # ═══ TAB 3: φ Junction View ══════════════════════════════════════
 with tab3:
-    st.subheader("φ (Azimuthal) Angle — Junction Geometry")
-    if mode == "Dolan bridge":
-        col1, col2 = st.columns([1,1])
-        with col1:
-            st.markdown("**Top-down junction map**")
-            with st.spinner("Rendering..."):
-                fig3 = draw_junction_topview(params)
-                st.pyplot(fig3, use_container_width=True)
-                plt.close(fig3)
-        with col2:
-            st.markdown("**φ scan**")
+    st.subheader("Junction Map (engine) + φ azimuth view")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.markdown("**Engine junction map** (floor deposit, JJ highlighted)")
+        with st.spinner("Rendering..."):
+            fig3 = vv.render_top_view(eng, eng_jm)
+            st.pyplot(fig3, use_container_width=True)
+            plt.close(fig3)
+    with col2:
+        if mode == "Dolan bridge":
+            st.markdown("**φ scan** (analytic estimate)")
             sweep = st.radio("Sweep", ["φ₂", "φ₁"], horizontal=True, key="phi_sw")
             wk = "phi2" if sweep == "φ₂" else "phi1"
             with st.spinner("Computing..."):
                 fig4 = draw_phi_scan(params, which=wk)
                 st.pyplot(fig4, use_container_width=True)
                 plt.close(fig4)
-    else:
-        st.info(
-            "φ-sweep view applies to the Dolan model. "
-            "For Manhattan double-oblique, the junction is set by Eq A6 "
-            "(θ, δ, h) — see the **Top View** and **Junction Area** tabs."
-        )
+        else:
+            st.info(
+                "For Manhattan, the two beams run at φ₁ / φ₂ (default 0° / 90°). "
+                "Adjust them in the sidebar; the engine recomputes the overlap."
+            )
 
     st.divider()
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Overlap x", f"{res['overlap_x_nm']:.1f} nm")
-    c2.metric("Overlap y", f"{res['overlap_y_nm']:.1f} nm")
-    c3.metric("Area",      f"{res['area_nm2']:.0f} nm²")
-    c4.metric("Tilt α",    f"{res['junction_tilt_deg']:.1f}°")
-    c5.metric("Est. Ic",   f"{res['ic_estimate_uA']:.3f} µA")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Overlap x (engine)", f"{eng_ox:.0f} nm")
+    c2.metric("Overlap y (engine)", f"{eng_oy:.0f} nm")
+    c3.metric("Area (engine)",      f"{eng_area:.0f} nm²")
+    c4.metric("Est. Ic (engine)",   f"{eng_ic:.3f} µA")
 
-    if res["area_nm2"] <= 0:
-        st.error("❌ Open circuit — no junction overlap.")
-    elif min(res["overlap_x_nm"], res["overlap_y_nm"]) < 20:
-        st.warning("⚠️ Tight overlap margin.")
+    if eng_area <= 0:
+        st.error("❌ Open circuit — no junction overlap (engine).")
+    elif min(eng_ox, eng_oy) < 2 * eng.vox:
+        st.warning("⚠️ Tight overlap margin (near voxel resolution).")
     else:
-        st.success("✅ Junction formed.")
+        st.success("✅ Junction formed (engine).")
 
 # ═══ TAB 4: Break Check ══════════════════════════════════════════
 with tab4:
     st.subheader("Open Circuit / Short Circuit Check")
 
-    ox, oy = res["overlap_x_nm"], res["overlap_y_nm"]
+    ox, oy = eng_ox, eng_oy
     c1,c2,c3 = st.columns(3)
-    c1.metric("Overlap x × y", f"{ox:.1f} × {oy:.1f} nm")
-    c2.metric("Area", f"{res['area_nm2']:.0f} nm²")
-    c3.metric("Est. Ic", f"{res['ic_estimate_uA']:.3f} µA")
+    c1.metric("Overlap x × y (engine)", f"{ox:.0f} × {oy:.0f} nm")
+    c2.metric("Area (engine)", f"{eng_area:.0f} nm²")
+    c3.metric("Est. Ic (engine)", f"{eng_ic:.3f} µA")
 
-    if res["area_nm2"] <= 0:
+    if eng_area <= 0:
         if mode == "Dolan bridge":
             t_shadow_total = 2 * params.t_mma * np.tan(
                 np.radians(max(abs(angle1), abs(angle2))))
             st.error(
-                f"❌ Open circuit — no junction overlap.  \n"
-                f"Current shadow projection: 2×t_mma×tan(θ) ≈ {t_shadow_total:.0f} nm  \n"
+                f"❌ Open circuit — no junction overlap (engine).  \n"
+                f"Shadow projection: 2×t_mma×tan(θ) ≈ {t_shadow_total:.0f} nm  \n"
                 f"bridge width must be **<** {t_shadow_total:.0f} nm for junction to form."
             )
         else:
-            st.error("❌ Open circuit — adjust θ, φ, or arm widths.")
-    elif min(ox, oy) < 30:
-        st.warning("⚠️ Tight margin — check process tolerances.")
+            _t = np.tan(np.radians(params.manhattan_theta))
+            _trans = params.manhattan_h * _t * np.sin(np.radians(params.manhattan_delta))
+            st.error(
+                f"❌ Open circuit (engine).  Transverse sidewall shadow "
+                f"h·tanθ·sinδ ≈ {_trans:.0f} nm exceeds the linewidth — "
+                f"reduce θ/h or increase the linewidth."
+            )
+    elif min(ox, oy) < 2 * eng.vox:
+        st.warning("⚠️ Tight margin — near voxel resolution; check tolerances.")
     else:
-        st.success(f"✅ Junction formed: {ox:.1f} × {oy:.1f} nm")
+        st.success(f"✅ Junction formed (engine): {ox:.0f} × {oy:.0f} nm")
 
     st.divider()
     st.subheader("Parameter Scan")
+    st.caption("Fast analytic estimate for exploring trends. The headline "
+               "open/short judgment above uses the 3D engine.")
     if mode == "Dolan bridge":
         scan_opts = ["θ₁", "θ₂", "φ₁", "φ₂",
                      "bridge_len", "bridge_w",
@@ -353,13 +362,14 @@ with tab4:
 # ═══ TAB 5: Junction Area ════════════════════════════════════════
 with tab5:
     st.subheader("Junction Area & Full Parameter Summary")
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Overlap x",  f"{res['overlap_x_nm']:.1f} nm")
-    c2.metric("Overlap y",  f"{res['overlap_y_nm']:.1f} nm")
-    c3.metric("Area A",     f"{res['area_nm2']:.0f} nm²")
-    c4.metric("Tilt α",     f"{res['junction_tilt_deg']:.1f}°")
-    c5.metric("Est. Ic",    f"{res['ic_estimate_uA']:.3f} µA",
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Overlap x (engine)",  f"{eng_ox:.0f} nm")
+    c2.metric("Overlap y (engine)",  f"{eng_oy:.0f} nm")
+    c3.metric("Area A (engine)",     f"{eng_area:.0f} nm²")
+    c4.metric("Est. Ic (engine)",    f"{eng_ic:.3f} µA",
               help="Al, 4K: jc=10 kA/cm² (Ambegaokar-Baratoff)")
+    st.caption(f"Engine voxel size = {eng.vox:.1f} nm "
+               "(area/overlap resolution).")
     st.divider()
     if mode == "Dolan bridge":
         detail = {
@@ -380,11 +390,11 @@ with tab5:
             "sy₂ [nm]":              res["sy2"],
             "bridge_len [nm]":       params.bridge_len,
             "bridge_w [nm]":         params.bridge_w,
-            "Overlap x [nm]":        res["overlap_x_nm"],
-            "Overlap y [nm]":        res["overlap_y_nm"],
-            "Junction area [nm²]":   res["area_nm2"],
-            "Junction tilt α [°]":   res["junction_tilt_deg"],
-            "Estimated Ic [µA]":     res["ic_estimate_uA"],
+            "Overlap x (engine) [nm]":   eng_ox,
+            "Overlap y (engine) [nm]":   eng_oy,
+            "Junction area (engine) [nm²]": eng_area,
+            "Estimated Ic (engine) [µA]":  eng_ic,
+            "Engine voxel [nm]":     eng.vox,
         }
     else:
         detail = {
@@ -394,13 +404,14 @@ with tab5:
             "Imaging resist h [nm]": params.manhattan_h,
             "x-arm opening wx [nm]": params.manhattan_wx,
             "y-arm opening wy [nm]": params.manhattan_wy,
+            "φ₁ [°]":                params.phi1,
+            "φ₂ [°]":                params.phi2,
             "shrink h·sinδ/tanθ [nm]": res.get("shrink_nm", 0.0),
-            "w_narrow x [nm]":       res.get("wnarrow_x_nm", res["overlap_x_nm"]),
-            "w_narrow y [nm]":       res.get("wnarrow_y_nm", res["overlap_y_nm"]),
-            "Overlap x [nm]":        res["overlap_x_nm"],
-            "Overlap y [nm]":        res["overlap_y_nm"],
-            "Junction area [nm²]":   res["area_nm2"],
-            "Estimated Ic [µA]":     res["ic_estimate_uA"],
+            "Overlap x (engine) [nm]":   eng_ox,
+            "Overlap y (engine) [nm]":   eng_oy,
+            "Junction area (engine) [nm²]": eng_area,
+            "Estimated Ic (engine) [µA]":  eng_ic,
+            "Engine voxel [nm]":     eng.vox,
         }
     num_detail = {k:v for k,v in detail.items() if isinstance(v, (int,float))}
     str_detail = {k:v for k,v in detail.items() if isinstance(v, str)}
