@@ -504,11 +504,32 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
     return fig
 
 
+def _slice_marker(ax, slice_line, hw):
+    """Draw a dashed line on the top view marking the cross-section slice.
+
+    ``slice_line`` is ``(plane, pos)``: an "x-z" slice cuts at constant y → a
+    horizontal line; a "y-z" slice cuts at constant x → a vertical line.
+    """
+    if slice_line is None:
+        return
+    plane, pos = slice_line
+    col = "#ffd166"
+    if plane == "x-z":
+        ax.axhline(pos, color=col, lw=1.8, ls="--", zorder=9)
+        ax.text(hw * 0.98, pos, f" slice y={pos:.0f}", color=col, fontsize=8,
+                ha="right", va="bottom", fontweight="bold", zorder=10)
+    else:
+        ax.axvline(pos, color=col, lw=1.8, ls="--", zorder=9)
+        ax.text(pos, hw * 0.98, f"slice x={pos:.0f} ", color=col, fontsize=8,
+                ha="left", va="top", rotation=90, fontweight="bold", zorder=10)
+
+
 def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
-                    juncs=None):
+                    juncs=None, slice_line=None):
     """Single top-down floor map: resist/undercut (opaque) with Al1 / Al2 /
     junction layered on top semi-transparently so the resist mask stays visible.
-    The AlOx barrier is filled on top of Al1 and separate junctions are labelled."""
+    The AlOx barrier is filled on top of Al1 and separate junctions are labelled.
+    When ``slice_line=(plane, pos)`` is given, the cross-section cut is marked."""
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
     base = np.full(al1f.shape, C_EMPTY, np.int8)
     _resist_cat_top(base, upper_resist, lower_resist)
@@ -528,6 +549,7 @@ def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
     ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
     ax.set_aspect("equal")
     _junc_labels(ax, juncs)
+    _slice_marker(ax, slice_line, hw)
     _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
     _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
     present = [c for c in (C_RESIST_LO, C_RESIST_UP) if (base == c).any()]

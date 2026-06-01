@@ -14,6 +14,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import json, copy, os, sys
+from dataclasses import asdict
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -27,6 +28,84 @@ from junction_area import compute_junction_area
 from deposition3d import simulate, junction_footprint
 import voxel_view as vv
 
+# ─── Ray-scan resolution presets:  name → (max_cells_per_axis, min_voxel_nm) ──
+RES_LEVELS = {
+    "Standard (fast)":   (140, 6.0),
+    "Fine":              (200, 4.0),
+    "Ultra-fine (slow)": (260, 3.0),
+}
+
+# Sidebar widget keys.  Mode-specific widgets get DISTINCT keys (prefixed) so
+# switching modes can never feed an out-of-range value into a shared slider.
+_SHARED_KEYS = ["t_pmma", "t_mma", "undercut", "angle1", "phi1", "t_metal1"]
+_DOLAN_KEYS = {"angle2": "d_angle2", "phi2": "d_phi2", "t_metal2": "d_tmetal2",
+               "bridge_len": "d_bridge_len", "bridge_w": "d_bridge_w",
+               "bridge_pmma_gap": "d_bridge_pmma_gap"}
+_MANH_KEYS = {"manhattan_theta": "m_theta", "phi2": "m_phi2",
+              "t_metal2": "m_tmetal2", "manhattan_h": "m_h",
+              "manhattan_wx": "m_wx", "manhattan_wy": "m_wy"}
+# (slider min, max) per widget key — used to clamp loaded values so an
+# out-of-range file can never crash widget creation.
+_KEY_RANGE = {
+    "t_pmma": (100, 800), "t_mma": (100, 1500), "undercut": (0, 500),
+    "angle1": (-60, 60), "phi1": (-90, 90), "t_metal1": (10, 200),
+    "d_angle2": (-60, 60), "d_phi2": (-90, 90), "d_tmetal2": (10, 200),
+    "d_bridge_len": (50, 2000), "d_bridge_w": (50, 1000),
+    "d_bridge_pmma_gap": (0, 2000),
+    "m_theta": (30, 80), "m_phi2": (-90, 180), "m_tmetal2": (10, 200),
+    "m_h": (500, 3000), "m_wx": (100, 2000), "m_wy": (100, 2000),
+}
+
+
+def _set_clamped_int(key, val):
+    lo, hi = _KEY_RANGE[key]
+    st.session_state[key] = int(round(min(max(float(val), lo), hi)))
+
+
+def _apply_loaded_params(pdict, raydict):
+    """Push loaded parameter values into widget session_state (before widgets
+    are created).  Returns the number of fields applied."""
+    applied = 0
+    mode_in = pdict.get("mode")
+    if mode_in in ("Dolan bridge", "Manhattan"):
+        st.session_state["mode"] = mode_in
+        applied += 1
+    for fld in _SHARED_KEYS:
+        if pdict.get(fld) is not None:
+            _set_clamped_int(fld, pdict[fld]); applied += 1
+    keymap = (_DOLAN_KEYS if mode_in == "Dolan bridge"
+              else _MANH_KEYS if mode_in == "Manhattan" else {})
+    for fld, key in keymap.items():
+        if pdict.get(fld) is not None:
+            _set_clamped_int(key, pdict[fld]); applied += 1
+    if raydict and raydict.get("resolution") in RES_LEVELS:
+        st.session_state["res_level"] = raydict["resolution"]; applied += 1
+    return applied
+
+
+def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level):
+    """Serialise the full process (parameters + ray-scan + junction results)
+    to a JSON string that can be re-loaded to restore every parameter."""
+    juncs_out = [dict(area_nm2=float(j["area"]), overlap_x_nm=float(j["ox"]),
+                      overlap_y_nm=float(j["oy"]), center_x_nm=float(j["cx"]),
+                      center_y_nm=float(j["cy"]), cells=int(j["cells"]))
+                 for j in juncs]
+    out = {
+        "shadowcast": "v6",
+        "mode": params.mode,
+        "parameters": asdict(params),
+        "ray_scan": {"resolution": res_level,
+                     "max_cells": int(eng.meta.get("max_cells", 0)),
+                     "min_vox_nm": float(eng.meta.get("min_vox", 0.0)),
+                     "voxel_nm": float(eng.vox)},
+        "results": {"junction_area_nm2": float(area),
+                    "overlap_x_nm": float(ox), "overlap_y_nm": float(oy),
+                    "n_junctions": int(njunc), "est_Ic_uA": float(ic),
+                    "junctions": juncs_out},
+    }
+    return json.dumps(out, indent=2)
+
+
 st.set_page_config(page_title="ShadowCast", page_icon="⚛️", layout="wide")
 st.title("⚛️ ShadowCast — Josephson Junction Process Simulator")
 st.caption(
@@ -37,48 +116,85 @@ st.caption(
 
 # ─── Sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
+    # ── Save / Load ───────────────────────────────────────────────
+    st.header("💾 Save / Load")
+    _imp = st.file_uploader("Load parameters (JSON)", type=["json"],
+                            key="param_import")
+    if _imp is not None:
+        _sig = (_imp.name, _imp.size)
+        if st.session_state.get("_imported_sig") != _sig:
+            try:
+                _data = json.load(_imp)
+                _pdict = _data.get("parameters", _data)
+                _raydict = _data.get("ray_scan", {})
+                _n = _apply_loaded_params(_pdict, _raydict)
+                st.session_state["_imported_sig"] = _sig
+                st.success(f"✅ Loaded {_n} parameters — applying…")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+    # Filled with the export download button after the engine has run.
+    _save_box = st.container()
+    st.divider()
+
     st.header("📂 GDS File")
     uploaded = st.file_uploader("Upload GDS / GDSII", type=["gds", "gdsii"])
 
     st.header("🔧 Process Parameters")
-    mode = st.radio("Junction type", ["Dolan bridge", "Manhattan"], horizontal=True)
+    st.session_state.setdefault("mode", "Dolan bridge")
+    mode = st.radio("Junction type", ["Dolan bridge", "Manhattan"],
+                    horizontal=True, key="mode")
 
     st.subheader("Bilayer resist")
     st.caption("Recipe arxiv:2101.01453 — PMMA A-4 ≈250 nm / MMA EL-13 ≈900 nm")
-    t_pmma   = st.slider("PMMA [nm]  (top, no undercut)",   100, 800, 250, 25)
-    t_mma    = st.slider("MMA [nm]  (bottom = bridge height / vertical gap)",
-                         100, 1500, 900, 25,
-                         help="MMA bottom-layer thickness.  The bridge underside "
-                              "sits at z = MMA height, so this sets the vertical "
-                              "shadow gap.  Junction overlap ≈ 2·MMA·tanθ − bridge width.")
-    undercut = st.slider("MMA undercut u [nm]  (one-sided)",  0, 500, 150, 10)
+    st.session_state.setdefault("t_pmma", 250)
+    t_pmma = st.slider("PMMA [nm]  (top, no undercut)", 100, 800,
+                       step=25, key="t_pmma")
+    st.session_state.setdefault("t_mma", 900)
+    t_mma = st.slider("MMA [nm]  (bottom = bridge height / vertical gap)",
+                      100, 1500, step=25, key="t_mma",
+                      help="MMA bottom-layer thickness.  The bridge underside "
+                           "sits at z = MMA height, so this sets the vertical "
+                           "shadow gap.  Junction overlap ≈ 2·MMA·tanθ − bridge width.")
+    st.session_state.setdefault("undercut", 150)
+    undercut = st.slider("MMA undercut u [nm]  (one-sided)", 0, 500,
+                         step=10, key="undercut")
     st.caption(f"Total resist: {t_pmma+t_mma} nm  ·  vertical shadow gap = MMA = {t_mma} nm")
 
     st.subheader("Evaporation 1")
-    angle1   = st.slider("Polar θ₁ [°]",     -60, 60, -24, 1)
-    phi1     = st.slider("Azimuthal φ₁ [°]", -90, 90,   0, 1)
-    t_metal1 = st.slider("Metal d₁ [nm]",     10, 200,  30, 5)
+    st.session_state.setdefault("angle1", -24)
+    angle1 = st.slider("Polar θ₁ [°]", -60, 60, step=1, key="angle1")
+    st.session_state.setdefault("phi1", 0)
+    phi1 = st.slider("Azimuthal φ₁ [°]", -90, 90, step=1, key="phi1")
+    st.session_state.setdefault("t_metal1", 30)
+    t_metal1 = st.slider("Metal d₁ [nm]", 10, 200, step=5, key="t_metal1")
 
     if mode == "Dolan bridge":
         st.subheader("Evaporation 2")
-        angle2   = st.slider("Polar θ₂ [°]",     -60, 60,  24, 1,
-                             help="Dolan = uniaxial tilt: φ₂=φ₁, θ₂=−θ₁")
-        phi2     = st.slider("Azimuthal φ₂ [°]", -90, 90,   0, 1)
-        t_metal2 = st.slider("Metal d₂ [nm]",  10, 200, 30, 5)
+        st.session_state.setdefault("d_angle2", 24)
+        angle2 = st.slider("Polar θ₂ [°]", -60, 60, step=1, key="d_angle2",
+                           help="Dolan = uniaxial tilt: φ₂=φ₁, θ₂=−θ₁")
+        st.session_state.setdefault("d_phi2", 0)
+        phi2 = st.slider("Azimuthal φ₂ [°]", -90, 90, step=1, key="d_phi2")
+        st.session_state.setdefault("d_tmetal2", 30)
+        t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="d_tmetal2")
 
         st.subheader("Geometry")
         st.markdown("Bridge slab dimensions:")
+        st.session_state.setdefault("d_bridge_len", 250)
         bridge_len = st.slider("Bridge width [nm]  (evap direction x, shadow-defining)",
-                               50, 2000, 250, 10)
-        bridge_w   = st.slider("Bridge length [nm]  (junction width, y)",
-                               50, 1000, 250, 10)
+                               50, 2000, step=10, key="d_bridge_len")
+        st.session_state.setdefault("d_bridge_w", 250)
+        bridge_w = st.slider("Bridge length [nm]  (junction width, y)",
+                             50, 1000, step=10, key="d_bridge_w")
+        st.session_state.setdefault("d_bridge_pmma_gap", 0)
         bridge_pmma_gap = st.slider(
             "Bridge ↔ PMMA opening [nm]  (per side, 0 = auto)",
-            0, 2000, 0, 25,
+            0, 2000, step=25, key="d_bridge_pmma_gap",
             help="Horizontal gap between each bridge edge and the PMMA wall "
                  "(the trench window). 0 auto-sizes it wide enough for the "
                  "tilted beam to reach under the bridge.")
-        t_shadow   = t_mma * np.tan(np.radians(max(abs(angle1), abs(angle2))))
+        t_shadow = t_mma * np.tan(np.radians(max(abs(angle1), abs(angle2))))
         st.caption(
             f"Shadow projection = MMA · tan θ = {t_shadow:.0f} nm  \n"
             f"Junction when bridge width **<** {2*t_shadow:.0f} nm  \n"
@@ -89,26 +205,35 @@ with st.sidebar:
     else:
         st.subheader("Double-oblique evaporation")
         st.caption("Recipe arxiv:2605.19590 — θ ≈ 60°, δ ≈ 15–25°, h ≈ 1.8 µm")
+        st.session_state.setdefault("m_theta", 60)
         manhattan_theta = st.slider("Deposition tilt θ [°]  (from normal, shared)",
-                                    30, 80, 60, 1)
+                                    30, 80, step=1, key="m_theta")
         # Evaporation 1 and 2 are independent beams; default orthogonal (φ₁=0, φ₂=90).
         # φ₁ comes from the shared Evaporation-1 section above (default 0).
         st.subheader("Evaporation 2")
-        phi2     = st.slider("Azimuthal φ₂ [°]", -90, 180, 90, 1,
-                             help="Default 90° → perpendicular to Evap 1")
-        t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, 30, 5, key="m_d2")
+        st.session_state.setdefault("m_phi2", 90)
+        phi2 = st.slider("Azimuthal φ₂ [°]", -90, 180, step=1, key="m_phi2",
+                         help="Default 90° → perpendicular to Evap 1")
+        st.session_state.setdefault("m_tmetal2", 30)
+        t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="m_tmetal2")
         # Manhattan beams are tilted by the shared θ; reuse θ₁=θ₂=θ.
         angle1 = manhattan_theta
         angle2 = manhattan_theta
         # δ for Eq A6 = azimuth offset of each beam from its electrode line
         # (Evap1 line along x → offset |φ₁|; Evap2 line along y → offset |φ₂−90|).
         manhattan_delta = max(abs(phi1), abs(phi2 - 90.0), 1.0)
-        manhattan_h     = st.slider("Imaging resist h [nm]", 500, 3000, 1800, 50)
+        st.session_state.setdefault("m_h", 1800)
+        manhattan_h = st.slider("Imaging resist h [nm]", 500, 3000,
+                                step=50, key="m_h")
 
         st.subheader("Geometry")
         st.markdown("Designed resist line openings (Manhattan crossing):")
-        manhattan_wx = st.slider("x-arm opening wx [nm]", 100, 2000, 600, 10)
-        manhattan_wy = st.slider("y-arm opening wy [nm]", 100, 2000, 600, 10)
+        st.session_state.setdefault("m_wx", 600)
+        manhattan_wx = st.slider("x-arm opening wx [nm]", 100, 2000,
+                                 step=10, key="m_wx")
+        st.session_state.setdefault("m_wy", 600)
+        manhattan_wy = st.slider("y-arm opening wy [nm]", 100, 2000,
+                                 step=10, key="m_wy")
         bridge_len = 700; bridge_w = 300; bridge_pmma_gap = 0.0
         _tan = np.tan(np.radians(manhattan_theta))
         _shrink = manhattan_h * np.sin(np.radians(manhattan_delta)) / _tan if _tan > 1e-9 else 0.0
@@ -117,6 +242,16 @@ with st.sidebar:
             f"shrink = {_shrink:.0f} nm → w_narrow = "
             f"{max(manhattan_wx-_shrink,0):.0f} × {max(manhattan_wy-_shrink,0):.0f} nm"
         )
+
+    st.divider()
+    st.subheader("Ray-scan resolution")
+    st.session_state.setdefault("res_level", "Standard (fast)")
+    res_level = st.selectbox(
+        "Voxel grid density", list(RES_LEVELS.keys()), key="res_level",
+        help="Finer = the tilted beam is ray-traced into a denser voxel grid "
+             "(smaller voxels) for sharper metal / junction edges, at the cost "
+             "of speed and memory.")
+    _max_cells, _min_vox = RES_LEVELS[res_level]
 
     st.divider()
     st.subheader("Display")
@@ -137,8 +272,8 @@ res = compute_junction_area(params)
 
 # ─── 3D physical deposition engine (source of truth) ──────────────
 @st.cache_data(show_spinner=False)
-def _run_engine(ekey, _params):
-    r = simulate(_params)
+def _run_engine(ekey, _params, max_cells, min_vox):
+    r = simulate(_params, max_cells=max_cells, min_vox=min_vox)
     jm, area, ox, oy, juncs = junction_footprint(r)
     return r, jm, area, ox, oy, juncs
 
@@ -147,13 +282,25 @@ ekey = (params.mode, params.t_pmma, params.t_mma, params.undercut,
         params.angle2, params.phi2, params.t_metal2,
         params.bridge_len, params.bridge_w, params.bridge_pmma_gap,
         params.manhattan_wx, params.manhattan_wy,
-        params.manhattan_theta, params.manhattan_delta, params.manhattan_h)
+        params.manhattan_theta, params.manhattan_delta, params.manhattan_h,
+        _max_cells, _min_vox)
 with st.spinner("Running 3D shadow-evaporation engine..."):
-    eng, eng_jm, eng_area, eng_ox, eng_oy, eng_juncs = _run_engine(ekey, params)
+    eng, eng_jm, eng_area, eng_ox, eng_oy, eng_juncs = _run_engine(
+        ekey, params, _max_cells, _min_vox)
 eng_njunc = len(eng_juncs)
 # Engine-based critical current (jc = 10 kA/cm², Ambegaokar-Baratoff),
 # consistent with junction_area.py:  Ic[µA] = area_nm2 · 1e-4
 eng_ic = eng_area * 1e-4
+
+# Now the engine has run, fill the sidebar Save box with a download button that
+# exports every parameter + the junction results (re-loadable via the uploader).
+with _save_box:
+    st.download_button(
+        "💾 Save parameters + results",
+        data=_build_export(params, eng, eng_area, eng_ox, eng_oy,
+                           eng_njunc, eng_ic, eng_juncs, res_level),
+        file_name="shadowcast_params.json", mime="application/json",
+        use_container_width=True)
 
 # ─── Tabs ─────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -202,6 +349,18 @@ with tab1:
                              step=50.0, key="cs_half")
         cs_zmax = vr2.slider("Z max [nm]", 100.0, _ztop,
                              step=50.0, key="cs_zmax")
+
+    # Orientation aid: show WHERE the chosen slice cuts through the device on a
+    # top view (dashed yellow line), so the cross section is easy to locate.
+    lc1, lc2 = st.columns([1, 1])
+    with lc1:
+        st.markdown("**Slice location** (top view)")
+        with st.spinner("Locating slice..."):
+            figloc = vv.render_top_view(eng, eng_jm, view_half=cs_half,
+                                        juncs=eng_juncs,
+                                        slice_line=(_pl, slice_pos))
+            st.pyplot(figloc, use_container_width=True)
+            plt.close(figloc)
 
     with st.spinner("Slicing voxel grid..."):
         st.markdown("**Process stages** — resist → evap 1 → oxidation → evap 2 → lift-off")
@@ -486,7 +645,10 @@ with tab5:
         {"Parameter": [r[0] for r in rows],
          "Value":     [r[1] for r in rows]},
         use_container_width=True, hide_index=True)
-    st.download_button("📋 Export JSON",
-                       data=json.dumps({k: (v if isinstance(v,str) else float(v))
-                                        for k,v in detail.items()}, indent=2),
-                       file_name="jj_params.json", mime="application/json")
+    st.download_button(
+        "💾 Export parameters + results (re-loadable)",
+        data=_build_export(params, eng, eng_area, eng_ox, eng_oy,
+                           eng_njunc, eng_ic, eng_juncs, res_level),
+        file_name="shadowcast_params.json", mime="application/json",
+        help="Re-load this file with the sidebar uploader to restore every "
+             "parameter.")
