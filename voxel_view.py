@@ -219,9 +219,14 @@ def _junc_labels(ax, juncs):
                           ec="#0e1117", lw=0.8))
 
 
-def _beam_arrow_cs(ax, d, plane, hlim, ztop, color, label, side=-1):
-    """Draw the evaporation beam direction as an arrow on a cross section."""
-    dh = d[0] if plane == "x-z" else d[1]
+def _beam_arrow_cs(ax, d, uvec, hlim, ztop, color, label, side=-1):
+    """Draw the evaporation beam direction as an arrow on a cross section.
+
+    ``uvec=(ux,uy)`` is the in-plane unit vector of the slice direction; the
+    beam's horizontal component is projected onto it so the arrow tilt is
+    correct for an obliquely-oriented slice."""
+    ux, uy = uvec
+    dh = d[0] * ux + d[1] * uy
     dz = d[2]
     n = np.hypot(dh, dz) or 1.0
     dh, dz = dh / n, dz / n
@@ -250,18 +255,20 @@ def _beam_arrow_top(ax, d, hw, color, label, side=-1):
     ax.text(tail[0], tail[1], label, color=color, fontsize=8, fontweight="bold")
 
 
-def _zoom_half(r, plane, view_half=None):
+def _zoom_half(r, view_half=None):
     """Half-width [nm] of a view window centred on the junction.
 
     When ``view_half`` is given it overrides the auto window (clamped to the
     simulated grid extent); otherwise the window auto-fits the junction zone.
+    The slice can be cut at an arbitrary in-plane angle, so the auto window
+    uses the larger of the x / y junction extents.
     """
     grid_R = r.meta.get("grid_R", r.meta["R"])
     if view_half is not None:
         return float(np.clip(view_half, 50.0, grid_R))
     jxm = r.meta.get("junc_xmax", r.meta["R"])
     jym = r.meta.get("junc_ymax", r.meta["R"])
-    half = (jxm if plane == "x-z" else jym)
+    half = max(jxm, jym)
     return min(max(half * 2.5, 300.0), grid_R)
 
 
@@ -279,15 +286,56 @@ def _top_half(r, view_half=None):
 # cross-section slices
 # ════════════════════════════════════════════════════════════════
 
-def _slice_planes(r, plane, slice_pos):
-    """Return (solid2d, al1, al2, alox, h_axis, h_label) for one slice."""
-    if plane == "x-z":
-        j = r.idx_y(slice_pos)
-        return (r.solid[:, j, :], r.al1[:, j, :], r.al2[:, j, :],
-                r.alox[:, j, :], r.xs, "x  [nm]  (evaporation axis)")
-    i = r.idx_x(slice_pos)
-    return (r.solid[i, :, :], r.al1[i, :, :], r.al2[i, :, :],
-            r.alox[i, :, :], r.ys, "y  [nm]")
+def _slice_dirs(angle_deg):
+    """In-plane unit vectors for a slice at azimuth ``angle_deg``.
+
+    Returns ``(u, n)`` where ``u`` is along the slice and ``n`` is the
+    perpendicular (offset) direction.  ``angle_deg=0`` → cut along x at
+    y=offset; ``angle_deg=90`` → cut along y."""
+    a = np.deg2rad(angle_deg)
+    ca, sa = np.cos(a), np.sin(a)
+    return (ca, sa), (-sa, ca)
+
+
+def _oblique_columns(r, angle_deg, offset):
+    """Sample voxel columns along an in-plane line at azimuth ``angle_deg`` with
+    perpendicular ``offset`` [nm].
+
+    Returns ``(ix, iy, s_axis, inside)``: nearest-neighbour column indices into
+    the (Nx,Ny) grid for each point P(s) = s·u + offset·n, the running distance
+    ``s`` along the slice, and a boolean ``inside`` flagging samples that fall
+    within the simulated grid (the rest are clipped to the edge)."""
+    (ux, uy), (nx, ny) = _slice_dirs(angle_deg)
+    vox = r.vox
+    grid_R = r.meta.get("grid_R", r.meta["R"])
+    s = np.arange(-grid_R, grid_R + vox, vox)
+    px = s * ux + offset * nx
+    py = s * uy + offset * ny
+    ix = np.rint((px - r.xs[0]) / vox).astype(int)
+    iy = np.rint((py - r.ys[0]) / vox).astype(int)
+    inside = ((ix >= 0) & (ix < len(r.xs)) &
+              (iy >= 0) & (iy < len(r.ys)))
+    ix = np.clip(ix, 0, len(r.xs) - 1)
+    iy = np.clip(iy, 0, len(r.ys) - 1)
+    return ix, iy, s, inside
+
+
+def _slice_planes(r, angle_deg, offset):
+    """Return (solid2d, al1, al2, alox, h_axis, h_label, ix, iy) for an oblique
+    slice at azimuth ``angle_deg`` and perpendicular ``offset`` [nm]."""
+    ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
+    solid2d = r.solid[ix, iy, :].copy()
+    al1 = r.al1[ix, iy, :].copy()
+    al2 = r.al2[ix, iy, :].copy()
+    alox = r.alox[ix, iy, :].copy()
+    out = ~inside
+    if out.any():                         # blank columns outside the grid
+        solid2d[out, :] = EMPTY
+        al1[out, :] = False
+        al2[out, :] = False
+        alox[out, :] = False
+    label = f"distance along slice  [nm]   (α = {angle_deg:.0f}°)"
+    return solid2d, al1, al2, alox, s, label, ix, iy
 
 
 def _resist_cat_cross(cat, solid2d, zs, z_split):
@@ -298,13 +346,17 @@ def _resist_cat_cross(cat, solid2d, zs, z_split):
     cat[res & ~lower_z] = C_RESIST_UP
 
 
-def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
+def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
                          junc_mask=None, view_half=None, zmax=None):
-    """Render one combined cross-section slice (all layers, junction marked)."""
+    """Render one combined cross-section slice (all layers, junction marked).
+
+    The slice is taken at in-plane azimuth ``angle_deg`` with perpendicular
+    ``offset`` [nm] (``angle_deg=0`` → x–z cut at y=offset)."""
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
     z_split = r.meta.get("z_split", r.z_top)
-    solid2d, al1, al2, alox, h_axis, h_label = _slice_planes(r, plane, slice_pos)
+    solid2d, al1, al2, alox, h_axis, h_label, ix, iy = _slice_planes(
+        r, angle_deg, offset)
 
     cat = np.full(solid2d.shape, C_EMPTY, np.int8)
     cat[solid2d == SUBSTRATE] = C_SUBSTRATE
@@ -312,14 +364,13 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
     cat[al1] = C_AL1
     cat[al2] = C_AL2
     if junc_mask is not None:
-        jc = junc_mask[:, r.idx_y(slice_pos)] if plane == "x-z" \
-            else junc_mask[r.idx_x(slice_pos)]
+        jc = junc_mask[ix, iy]
         junc2 = jc[:, None] & (zs[None, :] >= 0) & (zs[None, :] < zf)
         cat[junc2] = C_JUNC
 
-    title = (f"x–z cross section  (y = {slice_pos:.0f} nm)" if plane == "x-z"
-             else f"y–z cross section  (x = {slice_pos:.0f} nm)")
-    hlim = _zoom_half(r, plane, view_half)
+    title = f"Cross section  (α = {angle_deg:.0f}°,  offset = {offset:.0f} nm)"
+    (ux, uy), _ = _slice_dirs(angle_deg)
+    hlim = _zoom_half(r, view_half)
     vlim = (zs[0], zmax) if zmax is not None else None
     fig, ax = plt.subplots(figsize=(7.6, 4.3))
     _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
@@ -328,9 +379,9 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
     # interface (so Al2 sits on top of the barrier) and the metal corners.
     _oxide_edges_cs(ax, al1, (solid2d == RESIST) | (solid2d == SUBSTRATE),
                     h_axis, zs)
-    _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, vtop, _COLORS[C_AL1],
+    _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), hlim, vtop, _COLORS[C_AL1],
                    "evap 1", side=-1)
-    _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, vtop, _COLORS[C_AL2],
+    _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), hlim, vtop, _COLORS[C_AL2],
                    "evap 2", side=+1)
     present = [c for c in sorted(np.unique(cat).tolist()) if c != C_EMPTY]
     _legend(fig, present)
@@ -338,17 +389,20 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
     return fig
 
 
-def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=None,
+def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None,
                   view_half=None, zmax=None):
-    """5-panel staged cross section: resist → evap1 → oxidation → evap2 → lift-off."""
+    """5-panel staged cross section: resist → evap1 → oxidation → evap2 → lift-off.
+
+    Sliced at in-plane azimuth ``angle_deg`` with perpendicular ``offset`` [nm]."""
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
     z_split = r.meta.get("z_split", r.z_top)
-    solid2d, al1, al2, alox, h_axis, h_label = _slice_planes(r, plane, slice_pos)
+    solid2d, al1, al2, alox, h_axis, h_label, ix, iy = _slice_planes(
+        r, angle_deg, offset)
+    (ux, uy), _ = _slice_dirs(angle_deg)
 
     if junc_mask is not None:
-        jc = junc_mask[:, r.idx_y(slice_pos)] if plane == "x-z" \
-            else junc_mask[r.idx_x(slice_pos)]
+        jc = junc_mask[ix, iy]
         junc2 = jc[:, None] & (zs[None, :] >= 0) & (zs[None, :] < zf)
     else:
         junc2 = None
@@ -391,7 +445,7 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
         ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True), True),
     ]
 
-    hlim = _zoom_half(r, plane, view_half)
+    hlim = _zoom_half(r, view_half)
     vlim = (zs[0], zmax) if zmax is not None else None
     vtop = zmax if zmax is not None else float(zs[-1])
     fig, axes = plt.subplots(2, 3, figsize=(13.5, 8.0), sharex=True, sharey=True)
@@ -404,10 +458,10 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
             else:
                 _oxide_edges_cs(ax, al1, ox_excl_pre, h_axis, zs)
         if k in (1, 2):       # evap-1 related panels
-            _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, vtop,
+            _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), hlim, vtop,
                            _COLORS[C_AL1], "evap 1", side=-1)
         if k == 3:            # evap-2 panel
-            _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, vtop,
+            _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), hlim, vtop,
                            _COLORS[C_AL2], "evap 2", side=+1)
     axes[-1].axis("off")      # 6th cell unused (5 stages)
     _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP,
@@ -507,21 +561,25 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
 def _slice_marker(ax, slice_line, hw):
     """Draw a dashed line on the top view marking the cross-section slice.
 
-    ``slice_line`` is ``(plane, pos)``: an "x-z" slice cuts at constant y → a
-    horizontal line; a "y-z" slice cuts at constant x → a vertical line.
+    ``slice_line`` is ``(angle_deg, offset)``: the slice runs along the in-plane
+    direction u(α) and is shifted by ``offset`` along the perpendicular n(α).
     """
     if slice_line is None:
         return
-    plane, pos = slice_line
+    angle_deg, offset = slice_line
+    (ux, uy), (nx, ny) = _slice_dirs(angle_deg)
     col = "#ffd166"
-    if plane == "x-z":
-        ax.axhline(pos, color=col, lw=1.8, ls="--", zorder=9)
-        ax.text(hw * 0.98, pos, f" slice y={pos:.0f}", color=col, fontsize=8,
-                ha="right", va="bottom", fontweight="bold", zorder=10)
-    else:
-        ax.axvline(pos, color=col, lw=1.8, ls="--", zorder=9)
-        ax.text(pos, hw * 0.98, f"slice x={pos:.0f} ", color=col, fontsize=8,
-                ha="left", va="top", rotation=90, fontweight="bold", zorder=10)
+    cx, cy = offset * nx, offset * ny           # a point on the slice line
+    L = 3.0 * hw                                # overshoot; axes clip it
+    x0, y0 = cx - L * ux, cy - L * uy
+    x1, y1 = cx + L * ux, cy + L * uy
+    ax.plot([x0, x1], [y0, y1], color=col, lw=1.8, ls="--", zorder=9)
+    # label near the +u end, kept inside the view
+    lx, ly = cx + 0.82 * hw * ux, cy + 0.82 * hw * uy
+    rot = ((angle_deg + 90) % 180) - 90         # keep text upright
+    ax.text(lx, ly, f"α={angle_deg:.0f}°, d={offset:.0f}", color=col,
+            fontsize=8, ha="center", va="bottom", rotation=rot,
+            rotation_mode="anchor", fontweight="bold", zorder=10)
 
 
 def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
@@ -529,7 +587,8 @@ def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
     """Single top-down floor map: resist/undercut (opaque) with Al1 / Al2 /
     junction layered on top semi-transparently so the resist mask stays visible.
     The AlOx barrier is filled on top of Al1 and separate junctions are labelled.
-    When ``slice_line=(plane, pos)`` is given, the cross-section cut is marked."""
+    When ``slice_line=(angle_deg, offset)`` is given, the (possibly rotated)
+    cross-section cut is marked with a dashed line."""
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
     base = np.full(al1f.shape, C_EMPTY, np.int8)
     _resist_cat_top(base, upper_resist, lower_resist)

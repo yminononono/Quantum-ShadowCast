@@ -30,9 +30,11 @@ import voxel_view as vv
 
 # ─── Ray-scan resolution presets:  name → (max_cells_per_axis, min_voxel_nm) ──
 RES_LEVELS = {
-    "Standard (fast)":   (140, 6.0),
-    "Fine":              (200, 4.0),
-    "Ultra-fine (slow)": (260, 3.0),
+    "Standard (fast)":     (140, 6.0),
+    "Fine":                (200, 4.0),
+    "Ultra-fine (slow)":   (260, 3.0),
+    "Extra-fine (slower)": (340, 2.5),
+    "Maximum (slowest)":   (420, 2.0),
 }
 
 # Sidebar widget keys.  Mode-specific widgets get DISTINCT keys (prefixed) so
@@ -313,27 +315,30 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 # ═══ TAB 1: Cross-section ════════════════════════════════════════
 with tab1:
-    st.subheader("Cross-section  (3D voxel engine — x–z and y–z planes)")
+    st.subheader("Cross-section  (3D voxel engine — rotatable slice)")
     st.markdown(
         "Metal positions are computed by the **physical shadow-evaporation engine**: "
         "the real 3-D resist geometry is built as boxes and the tilted beam is "
-        "ray-traced into a voxel grid.  Slice any plane below."
+        "ray-traced into a voxel grid.  The slice can be **rotated** to any "
+        "in-plane angle and shifted perpendicular to itself."
     )
 
-    cc1, cc2 = st.columns([1, 2])
-    with cc1:
-        plane = st.radio("Slice plane", ["x–z", "y–z"], horizontal=True)
-    with cc2:
-        if plane == "x–z":
-            ymin, ymax = float(eng.ys[0]), float(eng.ys[-1])
-            slice_pos = st.slider("Slice at y [nm]", ymin, ymax, 0.0, eng.vox)
-        else:
-            xmin, xmax = float(eng.xs[0]), float(eng.xs[-1])
-            slice_pos = st.slider("Slice at x [nm]", xmin, xmax, 0.0, eng.vox)
-
-    _pl = "x-z" if plane == "x–z" else "y-z"
-
     _gR = float(eng.meta.get("grid_R", eng.meta["R"]))
+
+    # Slice orientation: azimuth angle α (0° = x–z cut, 90° = y–z cut) and a
+    # perpendicular offset.  Persist both across reruns (key-only sliders).
+    st.session_state.setdefault("slice_angle", 0.0)
+    st.session_state.setdefault("slice_off", 0.0)
+    st.session_state["slice_off"] = float(
+        np.clip(st.session_state["slice_off"], -_gR, _gR))
+    cc1, cc2 = st.columns([1, 1])
+    with cc1:
+        slice_angle = st.slider("Slice angle α [°]  (0 = x–z, 90 = y–z)",
+                                0.0, 180.0, step=1.0, key="slice_angle")
+    with cc2:
+        slice_pos = st.slider("Perpendicular offset [nm]", -_gR, _gR,
+                              step=eng.vox, key="slice_off")
+
     _ztop = float(eng.zs[-1])
     # Persist the view range across reruns (e.g. moving the slice slider): seed
     # once, then clamp the stored value to the current grid extent.  The slider
@@ -358,18 +363,18 @@ with tab1:
         with st.spinner("Locating slice..."):
             figloc = vv.render_top_view(eng, eng_jm, view_half=cs_half,
                                         juncs=eng_juncs,
-                                        slice_line=(_pl, slice_pos))
+                                        slice_line=(slice_angle, slice_pos))
             st.pyplot(figloc, use_container_width=True)
             plt.close(figloc)
 
     with st.spinner("Slicing voxel grid..."):
         st.markdown("**Process stages** — resist → evap 1 → oxidation → evap 2 → lift-off")
-        figs = vv.render_stages(eng, _pl, slice_pos, eng_jm,
+        figs = vv.render_stages(eng, slice_angle, slice_pos, eng_jm,
                                 view_half=cs_half, zmax=cs_zmax)
         st.pyplot(figs, use_container_width=True)
         plt.close(figs)
         st.markdown("**Combined slice** (all layers, junction highlighted)")
-        figc = vv.render_cross_section(eng, _pl, slice_pos, eng_jm,
+        figc = vv.render_cross_section(eng, slice_angle, slice_pos, eng_jm,
                                        view_half=cs_half, zmax=cs_zmax)
         st.pyplot(figc, use_container_width=True)
         plt.close(figc)
