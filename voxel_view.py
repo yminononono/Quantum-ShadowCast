@@ -21,8 +21,31 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
 
 from deposition3d import EMPTY, RESIST, SUBSTRATE, DepositionResult
+
+# ── global look & feel ─────────────────────────────────────────
+plt.rcParams.update({
+    "figure.facecolor":  "#0e1117",
+    "axes.facecolor":    "#0e1117",
+    "savefig.facecolor": "#0e1117",
+    "text.color":        "#e6e6e6",
+    "axes.labelcolor":   "#c8c8c8",
+    "axes.edgecolor":    "#3a3f4b",
+    "xtick.color":       "#9aa0aa",
+    "ytick.color":       "#9aa0aa",
+    "axes.titlecolor":   "#f0f0f0",
+    "axes.titleweight":  "bold",
+    "axes.titlesize":    11,
+    "axes.labelsize":    9.5,
+    "font.size":         9,
+    "axes.grid":         False,
+    "figure.dpi":        110,
+})
+
+_OX_LINE = "#c77dff"   # oxide outline colour
 
 
 # ── category codes (drawing priority = numeric order, high wins) ───
@@ -36,14 +59,14 @@ C_ALOX = 6
 C_JUNC = 7
 
 _COLORS = {
-    C_EMPTY:     "#ffffff",
-    C_SUBSTRATE: "#cfcfcf",
-    C_RESIST_LO: "#f4e7c3",   # pale (undercut)
-    C_RESIST_UP: "#d9b25a",   # darker (imaging resist)
-    C_AL1:       "#5fa8d3",
-    C_AL2:       "#ef767a",
-    C_ALOX:      "#8338ec",
-    C_JUNC:      "#2a9d8f",
+    C_EMPTY:     "#0e1117",   # = background (invisible)
+    C_SUBSTRATE: "#4a4f5a",
+    C_RESIST_LO: "#7a6f57",   # pale (undercut sublayer)
+    C_RESIST_UP: "#c7a15a",   # imaging resist
+    C_AL1:       "#4cc9f0",
+    C_AL2:       "#f72585",
+    C_ALOX:      _OX_LINE,
+    C_JUNC:      "#2ce0b3",
 }
 _LABELS = {
     C_EMPTY:     "empty",
@@ -69,19 +92,61 @@ def _draw(ax, cat, h_axis, v_axis, h_label, v_label, title, hlim=None):
     """imshow a category grid; cat has shape (n_h, n_v) → transpose for display."""
     extent = [h_axis[0], h_axis[-1], v_axis[0], v_axis[-1]]
     ax.imshow(cat.T, origin="lower", extent=extent, aspect="auto",
-              cmap=_CMAP, norm=_NORM, interpolation="nearest")
+              cmap=_CMAP, norm=_NORM, interpolation="nearest", zorder=1)
     ax.set_xlabel(h_label)
     ax.set_ylabel(v_label)
-    ax.set_title(title)
+    ax.set_title(title, pad=8)
+    for s in ax.spines.values():
+        s.set_linewidth(0.8)
+    ax.tick_params(length=3, width=0.7)
     if hlim is not None:
         ax.set_xlim(-hlim, hlim)
 
 
-def _legend(fig, present):
-    handles = [plt.Rectangle((0, 0), 1, 1, fc=_COLORS[c]) for c in present]
-    labels = [_LABELS[c] for c in present]
-    fig.legend(handles, labels, loc="lower center", ncol=min(len(present), 4),
-               frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.02))
+def _oxide_overlay(ax, al1, exclude, h_axis, v_axis, lw=0.9):
+    """Draw the AlOx barrier as a thin outline hugging the exposed faces of Al1.
+
+    A face is oxidised only where it meets air or the second metal — never
+    where Al1 touches the resist or substrate (`exclude` marks those cells).
+    The oxide is geometrically negligible, so it is rendered as a 1-px line,
+    not as filled voxels.
+    """
+    nh, nz = al1.shape
+    oxid = al1 & False  # placeholder dtype
+    oxidizable = ~(exclude | al1)
+    dh = (h_axis[1] - h_axis[0]) if nh > 1 else 1.0
+    dz = (v_axis[1] - v_axis[0]) if nz > 1 else 1.0
+    hh, hz = dh / 2.0, dz / 2.0
+    ii, kk = np.where(al1)
+    segs = []
+    for i, k in zip(ii, kk):
+        x, z = h_axis[i], v_axis[k]
+        if k + 1 < nz and oxidizable[i, k + 1]:
+            segs.append([(x - hh, z + hz), (x + hh, z + hz)])
+        if k - 1 >= 0 and oxidizable[i, k - 1]:
+            segs.append([(x - hh, z - hz), (x + hh, z - hz)])
+        if i + 1 < nh and oxidizable[i + 1, k]:
+            segs.append([(x + hh, z - hz), (x + hh, z + hz)])
+        if i - 1 >= 0 and oxidizable[i - 1, k]:
+            segs.append([(x - hh, z - hz), (x - hh, z + hz)])
+    if segs:
+        ax.add_collection(LineCollection(segs, colors=_OX_LINE,
+                                         linewidths=lw, zorder=6))
+
+
+def _legend(fig, present, oxide=True):
+    handles, labels = [], []
+    for c in present:
+        handles.append(plt.Rectangle((0, 0), 1, 1, fc=_COLORS[c], ec="none"))
+        labels.append(_LABELS[c])
+    if oxide:
+        handles.append(Line2D([0], [0], color=_OX_LINE, lw=2.2))
+        labels.append(_LABELS[C_ALOX])
+    leg = fig.legend(handles, labels, loc="lower center",
+                     ncol=min(len(handles), 5), frameon=False, fontsize=8,
+                     bbox_to_anchor=(0.5, -0.01))
+    for t in leg.get_texts():
+        t.set_color("#d0d0d0")
 
 
 def _beam_arrow_cs(ax, d, plane, hlim, ztop, color, label, side=-1):
@@ -158,7 +223,6 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
     _resist_cat_cross(cat, solid2d, zs, z_split)
     cat[al1] = C_AL1
     cat[al2] = C_AL2
-    cat[alox] = C_ALOX
     if junc_mask is not None:
         jc = junc_mask[:, r.idx_y(slice_pos)] if plane == "x-z" \
             else junc_mask[r.idx_x(slice_pos)]
@@ -168,13 +232,16 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
     title = (f"x–z cross section  (y = {slice_pos:.0f} nm)" if plane == "x-z"
              else f"y–z cross section  (x = {slice_pos:.0f} nm)")
     hlim = _zoom_half(r, plane)
-    fig, ax = plt.subplots(figsize=(7.5, 4.2))
+    fig, ax = plt.subplots(figsize=(7.6, 4.3))
     _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim)
+    exclude = (solid2d == RESIST) | (solid2d == SUBSTRATE)
+    _oxide_overlay(ax, al1, exclude, h_axis, zs)
     _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, r.z_top, _COLORS[C_AL1],
                    "evap 1", side=-1)
     _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, r.z_top, _COLORS[C_AL2],
                    "evap 2", side=+1)
-    _legend(fig, sorted(np.unique(cat).tolist()))
+    present = [c for c in sorted(np.unique(cat).tolist()) if c != C_EMPTY]
+    _legend(fig, present)
     fig.tight_layout(rect=[0, 0.08, 1, 1])
     return fig
 
@@ -195,45 +262,49 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
 
     sub = solid2d == SUBSTRATE
 
-    def cat_build(inc_al1=False, inc_alox=False, inc_al2=False,
+    # grounded metal (for lift-off): contiguous metal stack from the floor up.
+    metal_any = al1 | al2
+    z0 = int(np.searchsorted(zs, 0.0))
+    grounded = np.zeros_like(metal_any)
+    grounded[:, z0:] = np.cumprod(metal_any[:, z0:].astype(np.int8),
+                                  axis=1).astype(bool)
+
+    def cat_build(inc_al1=False, inc_al2=False,
                   liftoff=False, emphasise_junc=False):
         cat = np.full(solid2d.shape, C_EMPTY, np.int8)
         cat[sub] = C_SUBSTRATE
         if not liftoff:
             _resist_cat_cross(cat, solid2d, zs, z_split)
             if inc_al1: cat[al1] = C_AL1
-            if inc_alox: cat[alox] = C_ALOX
             if inc_al2: cat[al2] = C_AL2
         else:
-            # Lift-off: strip the resist.  Metal survives only if it is
-            # "grounded" — part of a contiguous metal stack rising from the
-            # substrate floor.  Any metal that sat on a resist ledge loses its
-            # support and is washed away (even in a column that also has a
-            # floor deposit, the upper, gap-separated metal is removed).
-            metal_any = al1 | al2 | alox
-            z0 = int(np.searchsorted(zs, 0.0))      # first cell at/above substrate
-            grounded = np.zeros_like(metal_any)
-            stack = metal_any[:, z0:].astype(np.int8)
-            grounded[:, z0:] = np.cumprod(stack, axis=1).astype(bool)
+            # Lift-off: strip the resist; only grounded metal survives.
             cat[al1 & grounded] = C_AL1
             cat[al2 & grounded] = C_AL2
-            cat[alox & grounded] = C_ALOX
             if emphasise_junc and junc2 is not None:
                 cat[junc2 & grounded] = C_JUNC
         return cat
 
+    # oxide appears once Al1 is present and stays through evap-2 / lift-off
+    ox_resist = (solid2d == RESIST) | sub          # un-oxidised contact faces
+    ox_sub = sub
     panels = [
-        ("1. Resist only",   cat_build()),
-        ("2. Evaporation 1", cat_build(inc_al1=True)),
-        ("3. Oxidation",     cat_build(inc_al1=True, inc_alox=True)),
-        ("4. Evaporation 2", cat_build(inc_al1=True, inc_alox=True, inc_al2=True)),
-        ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True)),
+        ("1. Resist only",   cat_build(),                                False),
+        ("2. Evaporation 1", cat_build(inc_al1=True),                    False),
+        ("3. Oxidation",     cat_build(inc_al1=True),                    True),
+        ("4. Evaporation 2", cat_build(inc_al1=True, inc_al2=True),      True),
+        ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True), True),
     ]
 
     hlim = _zoom_half(r, plane)
     fig, axes = plt.subplots(1, 5, figsize=(21, 4.4), sharey=True)
-    for k, (ax, (title, cat)) in enumerate(zip(axes, panels)):
+    for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
         _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim)
+        if show_ox:
+            if k == 4:            # lift-off: resist gone, only grounded Al1
+                _oxide_overlay(ax, al1 & grounded, ox_sub, h_axis, zs)
+            else:
+                _oxide_overlay(ax, al1, ox_resist, h_axis, zs)
         if k in (1, 2):       # evap-1 related panels
             _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, r.z_top,
                            _COLORS[C_AL1], "evap 1", side=-1)
@@ -241,7 +312,7 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
             _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, r.z_top,
                            _COLORS[C_AL2], "evap 2", side=+1)
     _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP,
-                  C_AL1, C_ALOX, C_AL2, C_JUNC])
+                  C_AL1, C_AL2, C_JUNC])
     fig.tight_layout(rect=[0, 0.07, 1, 1])
     return fig
 
@@ -279,43 +350,44 @@ def render_top_stages(r: DepositionResult, junc_mask=None):
     """5-panel staged top view: resist (with undercut) → evap1 → ox → evap2 → lift-off."""
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
 
-    def cat_build(inc_al1=False, inc_alox=False, inc_al2=False,
+    def cat_build(inc_al1=False, inc_al2=False,
                   liftoff=False, emphasise_junc=False):
         cat = np.full(al1f.shape, C_EMPTY, np.int8)
         if not liftoff:
             _resist_cat_top(cat, upper_resist, lower_resist)
             if inc_al1: cat[al1f] = C_AL1
-            if inc_alox: cat[aloxf] = C_ALOX
             if inc_al2: cat[al2f] = C_AL2
         else:
             cat[al1f] = C_AL1
             cat[al2f] = C_AL2
-            cat[aloxf] = C_ALOX
             if emphasise_junc and junc_mask is not None:
                 cat[junc_mask] = C_JUNC
         return cat
 
     panels = [
-        ("1. Resist only",   cat_build()),
-        ("2. Evaporation 1", cat_build(inc_al1=True)),
-        ("3. Oxidation",     cat_build(inc_al1=True, inc_alox=True)),
-        ("4. Evaporation 2", cat_build(inc_al1=True, inc_alox=True, inc_al2=True)),
-        ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True)),
+        ("1. Resist only",   cat_build(),                                 False),
+        ("2. Evaporation 1", cat_build(inc_al1=True),                     False),
+        ("3. Oxidation",     cat_build(inc_al1=True),                     True),
+        ("4. Evaporation 2", cat_build(inc_al1=True, inc_al2=True),       True),
+        ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True), True),
     ]
 
+    no_excl = np.zeros_like(al1f)
     jxm = r.meta.get("junc_xmax", r.meta["R"])
     jym = r.meta.get("junc_ymax", r.meta["R"])
     hw = min(max(jxm, jym) * 3.0, r.meta["R"])
     fig, axes = plt.subplots(1, 5, figsize=(21, 4.6), sharey=True)
-    for k, (ax, (title, cat)) in enumerate(zip(axes, panels)):
+    for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
         _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
         ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
         ax.set_aspect("equal")
+        if show_ox:
+            _oxide_overlay(ax, al1f, no_excl, r.xs, r.ys)
         if k in (1, 2):
             _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
         if k == 3:
             _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
-    _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_AL1, C_ALOX, C_AL2, C_JUNC])
+    _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_AL1, C_AL2, C_JUNC])
     fig.tight_layout(rect=[0, 0.08, 1, 1])
     return fig
 
@@ -327,7 +399,6 @@ def render_top_view(r: DepositionResult, junc_mask=None):
     _resist_cat_top(cat, upper_resist, lower_resist)
     cat[al1f] = C_AL1
     cat[al2f] = C_AL2
-    cat[aloxf] = C_ALOX
     if junc_mask is not None:
         cat[junc_mask] = C_JUNC
 
@@ -338,6 +409,7 @@ def render_top_view(r: DepositionResult, junc_mask=None):
     _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", "Top view (floor deposit)")
     ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
     ax.set_aspect("equal")
+    _oxide_overlay(ax, al1f, np.zeros_like(al1f), r.xs, r.ys)
     _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
     _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
     present = sorted([c for c in np.unique(cat).tolist() if c != C_EMPTY])
