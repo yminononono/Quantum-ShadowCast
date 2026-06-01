@@ -21,8 +21,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm, to_rgba
-from matplotlib.collections import LineCollection
-from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
+from matplotlib.collections import PatchCollection
 
 from deposition3d import EMPTY, RESIST, SUBSTRATE, DepositionResult
 
@@ -46,6 +46,7 @@ plt.rcParams.update({
 })
 
 _OX_LINE = "#c77dff"   # oxide outline colour
+_OX_THICK = 3.0        # AlOx visual thickness [nm] (real barrier ≈ 1–2 nm)
 
 
 # ── category codes (drawing priority = numeric order, high wins) ───
@@ -88,9 +89,30 @@ _NORM = BoundaryNorm(np.arange(-0.5, _N + 0.5, 1.0), _CMAP.N)
 # low-level drawing helpers
 # ════════════════════════════════════════════════════════════════
 
+def _axis_edges(axis):
+    """Cell-edge bounds (lo, hi) for an axis of cell *centres*.
+
+    imshow's ``extent`` must span the outer cell *edges*, not the centres —
+    using centres shrinks/shifts every cell by half a voxel, which is what made
+    the substrate top, deposited metal and oxide skin look misaligned.  Because
+    the z grid is built as ``arange(-vox/2, …)`` the substrate cell centre is at
+    -vox/2, so its top edge lands exactly at z = 0.
+    """
+    a = np.asarray(axis, float)
+    if a.size < 2:
+        return float(a[0]) - 0.5, float(a[0]) + 0.5
+    return float(a[0] - (a[1] - a[0]) / 2.0), float(a[-1] + (a[-1] - a[-2]) / 2.0)
+
+
+def _extent(h_axis, v_axis):
+    hlo, hhi = _axis_edges(h_axis)
+    vlo, vhi = _axis_edges(v_axis)
+    return [hlo, hhi, vlo, vhi]
+
+
 def _draw(ax, cat, h_axis, v_axis, h_label, v_label, title, hlim=None, vlim=None):
     """imshow a category grid; cat has shape (n_h, n_v) → transpose for display."""
-    extent = [h_axis[0], h_axis[-1], v_axis[0], v_axis[-1]]
+    extent = _extent(h_axis, v_axis)
     ax.imshow(cat.T, origin="lower", extent=extent, aspect="auto",
               cmap=_CMAP, norm=_NORM, interpolation="nearest", zorder=1)
     ax.set_xlabel(h_label)
@@ -121,40 +143,52 @@ def _overlay_cats(ax, cat, h_axis, v_axis, cats, alpha=0.62, zorder=3):
             any_set = True
     if not any_set:
         return
-    extent = [h_axis[0], h_axis[-1], v_axis[0], v_axis[-1]]
+    extent = _extent(h_axis, v_axis)
     ax.imshow(np.transpose(rgba, (1, 0, 2)), origin="lower", extent=extent,
               aspect="auto", interpolation="nearest", zorder=zorder)
 
 
-def _oxide_overlay(ax, al1, exclude, h_axis, v_axis, lw=0.9):
-    """Draw the AlOx barrier as a thin outline hugging the exposed faces of Al1.
+def _oxide_edges_cs(ax, al1, exclude, h_axis, v_axis, ox_t=_OX_THICK, zorder=6):
+    """Draw the AlOx barrier as a thin (≈few-nm) skin on the exposed Al1 faces.
 
-    A face is oxidised only where it meets air or the second metal — never
-    where Al1 touches the resist or substrate (`exclude` marks those cells).
-    The oxide is geometrically negligible, so it is rendered as a 1-px line,
-    not as filled voxels.
+    For every Al1 cell, each of its 4 in-plane neighbours that is *oxidizable*
+    (i.e. air or Al2 — anything not in ``exclude`` and not Al1) gets a thin
+    ``ox_t``-wide stroke laid on that face.  Perpendicular faces are extended by
+    ``ox_t`` so convex CORNERS fill in (oxide wraps the metal corner).  Because
+    Al2-facing faces are oxidizable, the barrier is drawn at the Al1/Al2
+    interface too — so Al2 (its filled imshow cell) reads as sitting on top of
+    the thin oxide rather than the oxide being omitted there.
     """
-    nh, nz = al1.shape
-    oxid = al1 & False  # placeholder dtype
-    oxidizable = ~(exclude | al1)
-    dh = (h_axis[1] - h_axis[0]) if nh > 1 else 1.0
-    dz = (v_axis[1] - v_axis[0]) if nz > 1 else 1.0
-    hh, hz = dh / 2.0, dz / 2.0
+    if not al1.any():
+        return
+    nh, nv = al1.shape
+    dh = float(h_axis[1] - h_axis[0]) if nh > 1 else 1.0
+    dv = float(v_axis[1] - v_axis[0]) if nv > 1 else 1.0
+    hh, hv = dh / 2.0, dv / 2.0
+    oxidizable = ~(exclude | al1)          # air OR Al2 (everything Al1 can oxidize against)
     ii, kk = np.where(al1)
-    segs = []
-    for i, k in zip(ii, kk):
-        x, z = h_axis[i], v_axis[k]
-        if k + 1 < nz and oxidizable[i, k + 1]:
-            segs.append([(x - hh, z + hz), (x + hh, z + hz)])
+    rects = []
+    for i, k in zip(ii.tolist(), kk.tolist()):
+        x, z = float(h_axis[i]), float(v_axis[k])
+        if k + 1 < nv and oxidizable[i, k + 1]:
+            rects.append(Rectangle((x - hh - ox_t, z + hv), dh + 2 * ox_t, ox_t))
         if k - 1 >= 0 and oxidizable[i, k - 1]:
-            segs.append([(x - hh, z - hz), (x + hh, z - hz)])
+            rects.append(Rectangle((x - hh - ox_t, z - hv - ox_t), dh + 2 * ox_t, ox_t))
         if i + 1 < nh and oxidizable[i + 1, k]:
-            segs.append([(x + hh, z - hz), (x + hh, z + hz)])
+            rects.append(Rectangle((x + hh, z - hv - ox_t), ox_t, dv + 2 * ox_t))
         if i - 1 >= 0 and oxidizable[i - 1, k]:
-            segs.append([(x - hh, z - hz), (x - hh, z + hz)])
-    if segs:
-        ax.add_collection(LineCollection(segs, colors=_OX_LINE,
-                                         linewidths=lw, zorder=6))
+            rects.append(Rectangle((x - hh - ox_t, z - hv - ox_t), ox_t, dv + 2 * ox_t))
+    if rects:
+        ax.add_collection(PatchCollection(rects, facecolor=_OX_LINE,
+                                          edgecolor="none", zorder=zorder))
+
+
+def _oxide_fill(ax, ox_mask, h_axis, v_axis, alpha=0.9, zorder=5):
+    """Fill the AlOx cells as solid squares sitting on the metal."""
+    if not ox_mask.any():
+        return
+    cat = np.where(ox_mask, np.int8(C_ALOX), np.int8(C_EMPTY))
+    _overlay_cats(ax, cat, h_axis, v_axis, [C_ALOX], alpha=alpha, zorder=zorder)
 
 
 def _legend(fig, present, oxide=True):
@@ -163,13 +197,26 @@ def _legend(fig, present, oxide=True):
         handles.append(plt.Rectangle((0, 0), 1, 1, fc=_COLORS[c], ec="none"))
         labels.append(_LABELS[c])
     if oxide:
-        handles.append(Line2D([0], [0], color=_OX_LINE, lw=2.2))
+        handles.append(plt.Rectangle((0, 0), 1, 1, fc=_OX_LINE, ec="none",
+                                      alpha=0.9))
         labels.append(_LABELS[C_ALOX])
     leg = fig.legend(handles, labels, loc="lower center",
                      ncol=min(len(handles), 5), frameon=False, fontsize=8,
                      bbox_to_anchor=(0.5, -0.01))
     for t in leg.get_texts():
         t.set_color("#d0d0d0")
+
+
+def _junc_labels(ax, juncs):
+    """Annotate each separate Josephson junction with J1, J2, … at its centre."""
+    if not juncs or len(juncs) < 2:
+        return
+    for n, jd in enumerate(juncs, 1):
+        ax.text(jd["cx"], jd["cy"], f"J{n}", color="#0e1117",
+                fontsize=8.5, fontweight="bold", ha="center", va="center",
+                zorder=8,
+                bbox=dict(boxstyle="circle,pad=0.18", fc=_COLORS[C_JUNC],
+                          ec="#0e1117", lw=0.8))
 
 
 def _beam_arrow_cs(ax, d, plane, hlim, ztop, color, label, side=-1):
@@ -277,8 +324,10 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
     fig, ax = plt.subplots(figsize=(7.6, 4.3))
     _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
     vtop = zmax if zmax is not None else float(zs[-1])
-    exclude = (solid2d == RESIST) | (solid2d == SUBSTRATE)
-    _oxide_overlay(ax, al1, exclude, h_axis, zs)
+    # AlOx: a thin (~3 nm) skin on every exposed Al1 face, incl. the Al1/Al2
+    # interface (so Al2 sits on top of the barrier) and the metal corners.
+    _oxide_edges_cs(ax, al1, (solid2d == RESIST) | (solid2d == SUBSTRATE),
+                    h_axis, zs)
     _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, vtop, _COLORS[C_AL1],
                    "evap 1", side=-1)
     _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, vtop, _COLORS[C_AL2],
@@ -329,9 +378,11 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
                 cat[junc2 & grounded] = C_JUNC
         return cat
 
-    # oxide appears once Al1 is present and stays through evap-2 / lift-off
-    ox_resist = (solid2d == RESIST) | sub          # un-oxidised contact faces
-    ox_sub = sub
+    # oxide appears once Al1 is present and stays through evap-2 / lift-off.
+    # Drawn as a thin skin on the exposed Al1 faces: before lift-off the resist
+    # (and substrate) block oxidation; at lift-off the resist is gone so only
+    # the surviving (grounded) Al1 oxidises against air / Al2.
+    ox_excl_pre = (solid2d == RESIST) | sub
     panels = [
         ("1. Resist only",   cat_build(),                                False),
         ("2. Evaporation 1", cat_build(inc_al1=True),                    False),
@@ -348,10 +399,10 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
     for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
         _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
         if show_ox:
-            if k == 4:            # lift-off: resist gone, only grounded Al1
-                _oxide_overlay(ax, al1 & grounded, ox_sub, h_axis, zs)
+            if k == 4:        # lift-off: resist stripped, grounded Al1 only
+                _oxide_edges_cs(ax, al1 & grounded, sub, h_axis, zs)
             else:
-                _oxide_overlay(ax, al1, ox_resist, h_axis, zs)
+                _oxide_edges_cs(ax, al1, ox_excl_pre, h_axis, zs)
         if k in (1, 2):       # evap-1 related panels
             _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, vtop,
                            _COLORS[C_AL1], "evap 1", side=-1)
@@ -394,11 +445,14 @@ def _resist_cat_top(cat, upper_resist, lower_resist):
     # through-hole (open both) stays empty (substrate visible)
 
 
-def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None):
+def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
+                      juncs=None):
     """5-panel staged top view: resist (with undercut) → evap1 → ox → evap2 → lift-off.
 
     The resist / undercut pattern is drawn opaque underneath, then the deposited
     metal is layered on top semi-transparently so the resist mask stays visible.
+    The AlOx barrier is filled (as squares) on top of the Al1 footprint, and any
+    separate Josephson junctions are labelled J1, J2, … in the lift-off panel.
     """
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
 
@@ -415,28 +469,31 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None):
             cat[junc_mask] = C_JUNC
         return cat
 
-    # (title, base_grid, metal_grid, metal_alpha, show_ox)
+    ox_pre = aloxf                       # oxidation: oxide over all Al1
+    ox_post = aloxf & ~al2f              # after evap-2: Al2 sits over the barrier
+    # (title, base_grid, metal_grid, metal_alpha, ox_mask, label_junc)
     panels = [
-        ("1. Resist only",   resist_base, metal_cat(),                          0.62, False),
-        ("2. Evaporation 1", resist_base, metal_cat(inc_al1=True),              0.62, False),
-        ("3. Oxidation",     resist_base, metal_cat(inc_al1=True),              0.62, True),
-        ("4. Evaporation 2", resist_base, metal_cat(inc_al1=True, inc_al2=True),0.62, True),
+        ("1. Resist only",   resist_base, metal_cat(),                          0.62, None,    False),
+        ("2. Evaporation 1", resist_base, metal_cat(inc_al1=True),              0.62, None,    False),
+        ("3. Oxidation",     resist_base, metal_cat(inc_al1=True),              0.62, ox_pre,  False),
+        ("4. Evaporation 2", resist_base, metal_cat(inc_al1=True, inc_al2=True),0.62, ox_post, False),
         ("5. Lift-off (JJ)", empty_base,
-         metal_cat(inc_al1=True, inc_al2=True, emphasise_junc=True),            1.00, True),
+         metal_cat(inc_al1=True, inc_al2=True, emphasise_junc=True),            1.00, ox_post, True),
     ]
 
-    no_excl = np.zeros_like(al1f)
     hw = _top_half(r, view_half)
     fig, axes = plt.subplots(2, 3, figsize=(13.5, 9.0), sharex=True, sharey=True)
     axes = axes.ravel()
-    for k, (ax, (title, base, mcat, malpha, show_ox)) in enumerate(zip(axes, panels)):
+    for k, (ax, (title, base, mcat, malpha, ox_mask, lbl)) in enumerate(zip(axes, panels)):
         _draw(ax, base, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
         _overlay_cats(ax, mcat, r.xs, r.ys,
                       [C_AL1, C_AL2, C_JUNC], alpha=malpha, zorder=3)
+        if ox_mask is not None:
+            _oxide_fill(ax, ox_mask, r.xs, r.ys, alpha=0.5, zorder=4)
         ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
         ax.set_aspect("equal")
-        if show_ox:
-            _oxide_overlay(ax, al1f, no_excl, r.xs, r.ys)
+        if lbl:
+            _junc_labels(ax, juncs)
         if k in (1, 2):
             _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
         if k == 3:
@@ -447,9 +504,11 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None):
     return fig
 
 
-def render_top_view(r: DepositionResult, junc_mask=None, view_half=None):
+def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
+                    juncs=None):
     """Single top-down floor map: resist/undercut (opaque) with Al1 / Al2 /
-    junction layered on top semi-transparently so the resist mask stays visible."""
+    junction layered on top semi-transparently so the resist mask stays visible.
+    The AlOx barrier is filled on top of Al1 and separate junctions are labelled."""
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
     base = np.full(al1f.shape, C_EMPTY, np.int8)
     _resist_cat_top(base, upper_resist, lower_resist)
@@ -465,9 +524,10 @@ def render_top_view(r: DepositionResult, junc_mask=None, view_half=None):
     _draw(ax, base, r.xs, r.ys, "x  [nm]", "y  [nm]", "Top view (floor deposit)")
     _overlay_cats(ax, mcat, r.xs, r.ys, [C_AL1, C_AL2, C_JUNC],
                   alpha=0.62, zorder=3)
+    _oxide_fill(ax, aloxf & ~al2f, r.xs, r.ys, alpha=0.5, zorder=4)
     ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
     ax.set_aspect("equal")
-    _oxide_overlay(ax, al1f, np.zeros_like(al1f), r.xs, r.ys)
+    _junc_labels(ax, juncs)
     _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
     _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
     present = [c for c in (C_RESIST_LO, C_RESIST_UP) if (base == c).any()]

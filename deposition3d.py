@@ -353,12 +353,59 @@ def simulate(p: ProcessParams) -> DepositionResult:
 # Measurements from the voxel result
 # ════════════════════════════════════════════════════════════════
 
-def junction_footprint(r: DepositionResult):
-    """xy cells (on the substrate floor) where Al1, AlOx and Al2 stack up.
+def _connected_components(mask):
+    """4-connectivity labelling of a 2-D boolean mask (pure NumPy, no scipy).
 
-    Returns (mask_xy, area_nm2, ox_nm, oy_nm) where the junction is the set of
-    columns in which an Al1 voxel, an AlOx voxel above it, and an Al2 voxel
-    above that all occur near the floor (under-bridge / line-crossing region).
+    Returns (labels, n) with labels.shape == mask.shape, 0 = background and
+    1..n the component ids.  Uses union-find over the True cells.
+    """
+    n0, n1 = mask.shape
+    a0, a1 = np.where(mask)
+    m = len(a0)
+    if m == 0:
+        return np.zeros(mask.shape, np.int64), 0
+    idx = np.full(mask.shape, -1, np.int64)
+    idx[a0, a1] = np.arange(m)
+    parent = np.arange(m)
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:        # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for c in range(m):
+        i, j = a0[c], a1[c]
+        if i + 1 < n0 and mask[i + 1, j]:
+            union(c, int(idx[i + 1, j]))
+        if j + 1 < n1 and mask[i, j + 1]:
+            union(c, int(idx[i, j + 1]))
+
+    roots = np.array([find(c) for c in range(m)])
+    uniq, inv = np.unique(roots, return_inverse=True)
+    labels = np.zeros(mask.shape, np.int64)
+    labels[a0, a1] = inv + 1
+    return labels, len(uniq)
+
+
+def junction_footprint(r: DepositionResult, min_cells: int = 2):
+    """xy cells (on the substrate floor) where Al1 and Al2 stack up.
+
+    Returns ``(mask_xy, area_nm2, ox_nm, oy_nm, juncs)``.  A single device can
+    contain several distinct Josephson junctions (e.g. one on each side of a
+    Dolan bridge for some tilt angles); each spatially separate Al1∩Al2 overlap
+    is reported as its own entry in ``juncs`` — a list of dicts with keys
+    ``mask, area, ox, oy, cx, cy, cells`` (sorted largest-area first).
+
+    ``area`` is the total over all junctions; the headline ``ox/oy`` are those
+    of the largest junction (not a bounding box merging separate junctions).
     """
     zs = r.zs
     z_floor = r.meta.get("z_floor", r.z_top)
@@ -371,13 +418,31 @@ def junction_footprint(r: DepositionResult):
     jym = r.meta.get("junc_ymax", r.meta["R"])
     reg = (np.abs(r.xs)[:, None] <= jxm) & (np.abs(r.ys)[None, :] <= jym)
     junc = junc & reg
-    area = junc.sum() * r.vox * r.vox
-    # extents
-    if junc.any():
-        xi = np.where(junc.any(axis=1))[0]
-        yi = np.where(junc.any(axis=0))[0]
-        ox = (xi.max() - xi.min() + 1) * r.vox
-        oy = (yi.max() - yi.min() + 1) * r.vox
+
+    # split into spatially separate junctions (drop sub-`min_cells` specks)
+    labels, n = _connected_components(junc)
+    juncs = []
+    clean = np.zeros_like(junc)
+    for lab_id in range(1, n + 1):
+        comp = labels == lab_id
+        cnt = int(comp.sum())
+        if cnt < min_cells:
+            continue
+        clean |= comp
+        ci, cj = np.where(comp)
+        ox_c = (ci.max() - ci.min() + 1) * r.vox
+        oy_c = (cj.max() - cj.min() + 1) * r.vox
+        juncs.append(dict(
+            mask=comp, cells=cnt, area=cnt * r.vox * r.vox,
+            ox=ox_c, oy=oy_c,
+            cx=float(r.xs[ci].mean()), cy=float(r.ys[cj].mean()),
+        ))
+    juncs.sort(key=lambda d: -d["area"])
+
+    junc = clean
+    area = sum(d["area"] for d in juncs)
+    if juncs:
+        ox, oy = juncs[0]["ox"], juncs[0]["oy"]
     else:
         ox = oy = 0.0
-    return junc, area, ox, oy
+    return junc, area, ox, oy, juncs

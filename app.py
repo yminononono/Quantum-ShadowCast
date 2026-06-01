@@ -139,8 +139,8 @@ res = compute_junction_area(params)
 @st.cache_data(show_spinner=False)
 def _run_engine(ekey, _params):
     r = simulate(_params)
-    jm, area, ox, oy = junction_footprint(r)
-    return r, jm, area, ox, oy
+    jm, area, ox, oy, juncs = junction_footprint(r)
+    return r, jm, area, ox, oy, juncs
 
 ekey = (params.mode, params.t_pmma, params.t_mma, params.undercut,
         params.angle1, params.phi1, params.t_metal1,
@@ -149,7 +149,8 @@ ekey = (params.mode, params.t_pmma, params.t_mma, params.undercut,
         params.manhattan_wx, params.manhattan_wy,
         params.manhattan_theta, params.manhattan_delta, params.manhattan_h)
 with st.spinner("Running 3D shadow-evaporation engine..."):
-    eng, eng_jm, eng_area, eng_ox, eng_oy = _run_engine(ekey, params)
+    eng, eng_jm, eng_area, eng_ox, eng_oy, eng_juncs = _run_engine(ekey, params)
+eng_njunc = len(eng_juncs)
 # Engine-based critical current (jc = 10 kA/cm², Ambegaokar-Baratoff),
 # consistent with junction_area.py:  Ic[µA] = area_nm2 · 1e-4
 eng_ic = eng_area * 1e-4
@@ -187,12 +188,20 @@ with tab1:
 
     _gR = float(eng.meta.get("grid_R", eng.meta["R"]))
     _ztop = float(eng.zs[-1])
+    # Persist the view range across reruns (e.g. moving the slice slider): seed
+    # once, then clamp the stored value to the current grid extent.  The slider
+    # is created with `key` only (no `value=`) so it never snaps back to a
+    # default when something else on the page triggers a rerun.
+    st.session_state.setdefault("cs_half", min(_gR, 800.0))
+    st.session_state.setdefault("cs_zmax", min(_ztop, 600.0))
+    st.session_state["cs_half"] = float(np.clip(st.session_state["cs_half"], 100.0, _gR))
+    st.session_state["cs_zmax"] = float(np.clip(st.session_state["cs_zmax"], 100.0, _ztop))
     with st.expander("🔍 表示範囲 (View range)", expanded=False):
         vr1, vr2 = st.columns(2)
         cs_half = vr1.slider("Horizontal half-width [nm]", 100.0, _gR,
-                             min(_gR, 800.0), 50.0, key="cs_half")
+                             step=50.0, key="cs_half")
         cs_zmax = vr2.slider("Z max [nm]", 100.0, _ztop,
-                             min(_ztop, 600.0), 50.0, key="cs_zmax")
+                             step=50.0, key="cs_zmax")
 
     with st.spinner("Slicing voxel grid..."):
         st.markdown("**Process stages** — resist → evap 1 → oxidation → evap 2 → lift-off")
@@ -225,6 +234,10 @@ with tab1:
             )
         else:
             st.error("❌ Open circuit — no metal overlap under the bridge.")
+    elif eng_njunc >= 2:
+        st.success(f"✅ {eng_njunc} junctions formed "
+                   f"(largest {eng_ox:.0f} × {eng_oy:.0f} nm; total area "
+                   f"{eng_area:.0f} nm²). See Top View tab for J1…J{eng_njunc}.")
     else:
         st.success(f"✅ Junction formed: {eng_ox:.0f} × {eng_oy:.0f} nm (engine)")
 
@@ -242,20 +255,38 @@ with tab2:
         "resist → evap 1 → oxidation → evap 2 → lift-off (junction highlighted)."
     )
     _gR2 = float(eng.meta.get("grid_R", eng.meta["R"]))
+    st.session_state.setdefault("top_half", min(_gR2, 1000.0))
+    st.session_state["top_half"] = float(np.clip(st.session_state["top_half"], 100.0, _gR2))
     with st.expander("🔍 表示範囲 (View range)", expanded=False):
         top_half = st.slider("Half-width [nm]", 100.0, _gR2,
-                             min(_gR2, 1000.0), 50.0, key="top_half")
+                             step=50.0, key="top_half")
 
     with st.spinner("Rendering staged top view..."):
-        figts = vv.render_top_stages(eng, eng_jm, view_half=top_half)
+        figts = vv.render_top_stages(eng, eng_jm, view_half=top_half,
+                                     juncs=eng_juncs)
         st.pyplot(figts, use_container_width=True)
         plt.close(figts)
 
     st.markdown("**Final floor deposit** (combined)")
     with st.spinner("Rendering floor map..."):
-        figt = vv.render_top_view(eng, eng_jm, view_half=top_half)
+        figt = vv.render_top_view(eng, eng_jm, view_half=top_half,
+                                  juncs=eng_juncs)
         st.pyplot(figt, use_container_width=True)
         plt.close(figt)
+
+    if eng_njunc >= 2:
+        st.warning(f"⚠️ {eng_njunc} separate Josephson junctions detected "
+                   "(labelled J1, J2, … above, largest first).")
+        st.dataframe({
+            "Junction":      [f"J{i}" for i in range(1, eng_njunc + 1)],
+            "Area [nm²]":    [round(j["area"]) for j in eng_juncs],
+            "Overlap x [nm]":[round(j["ox"]) for j in eng_juncs],
+            "Overlap y [nm]":[round(j["oy"]) for j in eng_juncs],
+            "Center x [nm]": [round(j["cx"]) for j in eng_juncs],
+            "Center y [nm]": [round(j["cy"]) for j in eng_juncs],
+        }, use_container_width=True, hide_index=True)
+    elif eng_njunc == 1:
+        st.caption("Single Josephson junction.")
 
 # ═══ TAB 3: φ Junction View ══════════════════════════════════════
 with tab3:
@@ -264,7 +295,7 @@ with tab3:
     with col1:
         st.markdown("**Engine junction map** (floor deposit, JJ highlighted)")
         with st.spinner("Rendering..."):
-            fig3 = vv.render_top_view(eng, eng_jm)
+            fig3 = vv.render_top_view(eng, eng_jm, juncs=eng_juncs)
             st.pyplot(fig3, use_container_width=True)
             plt.close(fig3)
     with col2:
@@ -391,12 +422,14 @@ with tab4:
 # ═══ TAB 5: Junction Area ════════════════════════════════════════
 with tab5:
     st.subheader("Junction Area & Full Parameter Summary")
-    c1,c2,c3,c4 = st.columns(4)
+    c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("Overlap x (engine)",  f"{eng_ox:.0f} nm")
     c2.metric("Overlap y (engine)",  f"{eng_oy:.0f} nm")
     c3.metric("Area A (engine)",     f"{eng_area:.0f} nm²")
     c4.metric("Est. Ic (engine)",    f"{eng_ic:.3f} µA",
               help="Al, 4K: jc=10 kA/cm² (Ambegaokar-Baratoff)")
+    c5.metric("Junctions",           f"{eng_njunc}",
+              help="Number of spatially separate Al1∩Al2 overlaps")
     st.caption(f"Engine voxel size = {eng.vox:.1f} nm "
                "(area/overlap resolution).")
     st.divider()
@@ -423,6 +456,7 @@ with tab5:
             "Overlap x (engine) [nm]":   eng_ox,
             "Overlap y (engine) [nm]":   eng_oy,
             "Junction area (engine) [nm²]": eng_area,
+            "Junctions (engine)":    eng_njunc,
             "Estimated Ic (engine) [µA]":  eng_ic,
             "Engine voxel [nm]":     eng.vox,
         }
@@ -440,6 +474,7 @@ with tab5:
             "Overlap x (engine) [nm]":   eng_ox,
             "Overlap y (engine) [nm]":   eng_oy,
             "Junction area (engine) [nm²]": eng_area,
+            "Junctions (engine)":    eng_njunc,
             "Estimated Ic (engine) [µA]":  eng_ic,
             "Engine voxel [nm]":     eng.vox,
         }
