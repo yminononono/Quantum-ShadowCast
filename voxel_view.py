@@ -88,7 +88,7 @@ _NORM = BoundaryNorm(np.arange(-0.5, _N + 0.5, 1.0), _CMAP.N)
 # low-level drawing helpers
 # ════════════════════════════════════════════════════════════════
 
-def _draw(ax, cat, h_axis, v_axis, h_label, v_label, title, hlim=None):
+def _draw(ax, cat, h_axis, v_axis, h_label, v_label, title, hlim=None, vlim=None):
     """imshow a category grid; cat has shape (n_h, n_v) → transpose for display."""
     extent = [h_axis[0], h_axis[-1], v_axis[0], v_axis[-1]]
     ax.imshow(cat.T, origin="lower", extent=extent, aspect="auto",
@@ -101,6 +101,8 @@ def _draw(ax, cat, h_axis, v_axis, h_label, v_label, title, hlim=None):
     ax.tick_params(length=3, width=0.7)
     if hlim is not None:
         ax.set_xlim(-hlim, hlim)
+    if vlim is not None:
+        ax.set_ylim(vlim[0], vlim[1])
 
 
 def _oxide_overlay(ax, al1, exclude, h_axis, v_axis, lw=0.9):
@@ -179,12 +181,29 @@ def _beam_arrow_top(ax, d, hw, color, label, side=-1):
     ax.text(tail[0], tail[1], label, color=color, fontsize=8, fontweight="bold")
 
 
-def _zoom_half(r, plane):
-    """Half-width [nm] of a view window centred on the junction."""
+def _zoom_half(r, plane, view_half=None):
+    """Half-width [nm] of a view window centred on the junction.
+
+    When ``view_half`` is given it overrides the auto window (clamped to the
+    simulated grid extent); otherwise the window auto-fits the junction zone.
+    """
+    grid_R = r.meta.get("grid_R", r.meta["R"])
+    if view_half is not None:
+        return float(np.clip(view_half, 50.0, grid_R))
     jxm = r.meta.get("junc_xmax", r.meta["R"])
     jym = r.meta.get("junc_ymax", r.meta["R"])
     half = (jxm if plane == "x-z" else jym)
-    return min(max(half * 2.5, 300.0), r.meta["R"])
+    return min(max(half * 2.5, 300.0), grid_R)
+
+
+def _top_half(r, view_half=None):
+    """Half-width [nm] of the square top-view window (override-aware)."""
+    grid_R = r.meta.get("grid_R", r.meta["R"])
+    if view_half is not None:
+        return float(np.clip(view_half, 50.0, grid_R))
+    jxm = r.meta.get("junc_xmax", r.meta["R"])
+    jym = r.meta.get("junc_ymax", r.meta["R"])
+    return min(max(jxm, jym) * 3.0, grid_R)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -211,7 +230,7 @@ def _resist_cat_cross(cat, solid2d, zs, z_split):
 
 
 def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
-                         junc_mask=None):
+                         junc_mask=None, view_half=None, zmax=None):
     """Render one combined cross-section slice (all layers, junction marked)."""
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
@@ -231,9 +250,10 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
 
     title = (f"x–z cross section  (y = {slice_pos:.0f} nm)" if plane == "x-z"
              else f"y–z cross section  (x = {slice_pos:.0f} nm)")
-    hlim = _zoom_half(r, plane)
+    hlim = _zoom_half(r, plane, view_half)
+    vlim = (zs[0], zmax) if zmax is not None else None
     fig, ax = plt.subplots(figsize=(7.6, 4.3))
-    _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim)
+    _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
     exclude = (solid2d == RESIST) | (solid2d == SUBSTRATE)
     _oxide_overlay(ax, al1, exclude, h_axis, zs)
     _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, r.z_top, _COLORS[C_AL1],
@@ -246,7 +266,8 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
     return fig
 
 
-def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=None):
+def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=None,
+                  view_half=None, zmax=None):
     """5-panel staged cross section: resist → evap1 → oxidation → evap2 → lift-off."""
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
@@ -296,10 +317,11 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
         ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True), True),
     ]
 
-    hlim = _zoom_half(r, plane)
+    hlim = _zoom_half(r, plane, view_half)
+    vlim = (zs[0], zmax) if zmax is not None else None
     fig, axes = plt.subplots(1, 5, figsize=(21, 4.4), sharey=True)
     for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
-        _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim)
+        _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
         if show_ox:
             if k == 4:            # lift-off: resist gone, only grounded Al1
                 _oxide_overlay(ax, al1 & grounded, ox_sub, h_axis, zs)
@@ -346,7 +368,7 @@ def _resist_cat_top(cat, upper_resist, lower_resist):
     # through-hole (open both) stays empty (substrate visible)
 
 
-def render_top_stages(r: DepositionResult, junc_mask=None):
+def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None):
     """5-panel staged top view: resist (with undercut) → evap1 → ox → evap2 → lift-off."""
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
 
@@ -373,9 +395,7 @@ def render_top_stages(r: DepositionResult, junc_mask=None):
     ]
 
     no_excl = np.zeros_like(al1f)
-    jxm = r.meta.get("junc_xmax", r.meta["R"])
-    jym = r.meta.get("junc_ymax", r.meta["R"])
-    hw = min(max(jxm, jym) * 3.0, r.meta["R"])
+    hw = _top_half(r, view_half)
     fig, axes = plt.subplots(1, 5, figsize=(21, 4.6), sharey=True)
     for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
         _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
@@ -392,7 +412,7 @@ def render_top_stages(r: DepositionResult, junc_mask=None):
     return fig
 
 
-def render_top_view(r: DepositionResult, junc_mask=None):
+def render_top_view(r: DepositionResult, junc_mask=None, view_half=None):
     """Single top-down floor map: Al1 / Al2 / junction on the substrate."""
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
     cat = np.full(al1f.shape, C_EMPTY, np.int8)
@@ -402,9 +422,7 @@ def render_top_view(r: DepositionResult, junc_mask=None):
     if junc_mask is not None:
         cat[junc_mask] = C_JUNC
 
-    jxm = r.meta.get("junc_xmax", r.meta["R"])
-    jym = r.meta.get("junc_ymax", r.meta["R"])
-    hw = min(max(jxm, jym) * 3.0, r.meta["R"])
+    hw = _top_half(r, view_half)
     fig, ax = plt.subplots(figsize=(6.0, 5.4))
     _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", "Top view (floor deposit)")
     ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)

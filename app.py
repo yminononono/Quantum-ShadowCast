@@ -174,13 +174,25 @@ with tab1:
             slice_pos = st.slider("Slice at x [nm]", xmin, xmax, 0.0, eng.vox)
 
     _pl = "x-z" if plane == "x–z" else "y-z"
+
+    _gR = float(eng.meta.get("grid_R", eng.meta["R"]))
+    _ztop = float(eng.zs[-1])
+    with st.expander("🔍 表示範囲 (View range)", expanded=False):
+        vr1, vr2 = st.columns(2)
+        cs_half = vr1.slider("Horizontal half-width [nm]", 100.0, _gR,
+                             min(_gR, 800.0), 50.0, key="cs_half")
+        cs_zmax = vr2.slider("Z max [nm]", 100.0, _ztop,
+                             min(_ztop, 600.0), 50.0, key="cs_zmax")
+
     with st.spinner("Slicing voxel grid..."):
         st.markdown("**Process stages** — resist → evap 1 → oxidation → evap 2 → lift-off")
-        figs = vv.render_stages(eng, _pl, slice_pos, eng_jm)
+        figs = vv.render_stages(eng, _pl, slice_pos, eng_jm,
+                                view_half=cs_half, zmax=cs_zmax)
         st.pyplot(figs, use_container_width=True)
         plt.close(figs)
         st.markdown("**Combined slice** (all layers, junction highlighted)")
-        figc = vv.render_cross_section(eng, _pl, slice_pos, eng_jm)
+        figc = vv.render_cross_section(eng, _pl, slice_pos, eng_jm,
+                                       view_half=cs_half, zmax=cs_zmax)
         st.pyplot(figc, use_container_width=True)
         plt.close(figc)
 
@@ -219,14 +231,19 @@ with tab2:
         "**undercut shelf** (pale) under the imaging resist (dark).  Stages: "
         "resist → evap 1 → oxidation → evap 2 → lift-off (junction highlighted)."
     )
+    _gR2 = float(eng.meta.get("grid_R", eng.meta["R"]))
+    with st.expander("🔍 表示範囲 (View range)", expanded=False):
+        top_half = st.slider("Half-width [nm]", 100.0, _gR2,
+                             min(_gR2, 1000.0), 50.0, key="top_half")
+
     with st.spinner("Rendering staged top view..."):
-        figts = vv.render_top_stages(eng, eng_jm)
+        figts = vv.render_top_stages(eng, eng_jm, view_half=top_half)
         st.pyplot(figts, use_container_width=True)
         plt.close(figts)
 
     st.markdown("**Final floor deposit** (combined)")
     with st.spinner("Rendering floor map..."):
-        figt = vv.render_top_view(eng, eng_jm)
+        figt = vv.render_top_view(eng, eng_jm, view_half=top_half)
         st.pyplot(figt, use_container_width=True)
         plt.close(figt)
 

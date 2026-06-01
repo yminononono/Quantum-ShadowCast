@@ -30,7 +30,7 @@ EMPTY = 0
 RESIST = 1
 SUBSTRATE = 2
 
-MAX_CELLS_PER_AXIS = 110   # resolution cap (keeps the grid tractable)
+MAX_CELLS_PER_AXIS = 140   # resolution cap (keeps the grid tractable)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -281,7 +281,21 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes):
 def simulate(p: ProcessParams) -> DepositionResult:
     boxes, R, z_top, resist_h, z_split = build_occluders(p)
     t_tot_metal = p.t_metal1 + p.t_metal2 + max(p.t_metal1 * 0.1, 3)
-    xs, ys, zs, vox, z_hi = _grid_axes(R, z_top, t_tot_metal)
+
+    # The voxel grid only needs to resolve the region we actually observe
+    # (the junction and the nearby leads).  Occluder boxes are analytic AABBs
+    # that always extend to the full opening (±R), so beams are still admitted
+    # or blocked correctly even when the grid is cropped to a smaller window.
+    # Cropping lets us spend resolution where it matters: for Manhattan the
+    # opening must be very long so a 60° beam can reach the floor, which would
+    # otherwise force ~100 nm voxels — coarser than the 30 nm film, leaving
+    # patchy / missing metal.
+    if p.mode == "Dolan bridge":
+        grid_R = R
+    else:
+        span = max(p.manhattan_wx, p.manhattan_wy)
+        grid_R = min(R, 1.6 * span + 800.0)
+    xs, ys, zs, vox, z_hi = _grid_axes(grid_R, z_top, t_tot_metal)
     lab = _label_solid(xs, ys, zs, boxes)
 
     # Both modes drive the two evaporations from their own (θ, φ).  Dolan
@@ -320,7 +334,7 @@ def simulate(p: ProcessParams) -> DepositionResult:
         junc_xmax = p.manhattan_wy / 2 + 4 * vox
         junc_ymax = p.manhattan_wx / 2 + 4 * vox
     z_floor_v = z_floor
-    meta = dict(R=R, z_top=z_top, resist_h=resist_h, vox=vox,
+    meta = dict(R=R, grid_R=grid_R, z_top=z_top, resist_h=resist_h, vox=vox,
                 d1=d1, d2=d2, z_floor=z_floor_v, z_split=z_split,
                 junc_xmax=junc_xmax, junc_ymax=junc_ymax)
     return DepositionResult(xs, ys, zs, vox, lab, al1, al2, alox, z_top, meta)
