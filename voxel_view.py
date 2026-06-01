@@ -157,12 +157,13 @@ def _beam_arrow_cs(ax, d, plane, hlim, ztop, color, label, side=-1):
     dz = d[2]
     n = np.hypot(dh, dz) or 1.0
     dh, dz = dh / n, dz / n
-    L = 0.6 * ztop
-    head = np.array([side * 0.45 * hlim, 0.45 * ztop])   # near surface
+    L = 0.42 * ztop
+    head = np.array([side * 0.42 * hlim, 0.34 * ztop])   # near surface
     tail = head - L * np.array([dh, dz])                 # up toward source
     ax.annotate("", xy=head, xytext=tail,
                 arrowprops=dict(arrowstyle="-|>", color=color, lw=2.2))
-    ax.text(tail[0], tail[1] + 0.06 * ztop, label, color=color,
+    ly = min(tail[1] + 0.04 * ztop, 0.93 * ztop)         # keep label inside axes
+    ax.text(tail[0], ly, label, color=color,
             fontsize=8, ha="center", fontweight="bold")
 
 
@@ -254,11 +255,12 @@ def render_cross_section(r: DepositionResult, plane="x-z", slice_pos=0.0,
     vlim = (zs[0], zmax) if zmax is not None else None
     fig, ax = plt.subplots(figsize=(7.6, 4.3))
     _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
+    vtop = zmax if zmax is not None else float(zs[-1])
     exclude = (solid2d == RESIST) | (solid2d == SUBSTRATE)
     _oxide_overlay(ax, al1, exclude, h_axis, zs)
-    _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, r.z_top, _COLORS[C_AL1],
+    _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, vtop, _COLORS[C_AL1],
                    "evap 1", side=-1)
-    _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, r.z_top, _COLORS[C_AL2],
+    _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, vtop, _COLORS[C_AL2],
                    "evap 2", side=+1)
     present = [c for c in sorted(np.unique(cat).tolist()) if c != C_EMPTY]
     _legend(fig, present)
@@ -319,7 +321,9 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
 
     hlim = _zoom_half(r, plane, view_half)
     vlim = (zs[0], zmax) if zmax is not None else None
-    fig, axes = plt.subplots(1, 5, figsize=(21, 4.4), sharey=True)
+    vtop = zmax if zmax is not None else float(zs[-1])
+    fig, axes = plt.subplots(2, 3, figsize=(13.5, 8.0), sharex=True, sharey=True)
+    axes = axes.ravel()
     for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
         _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
         if show_ox:
@@ -328,14 +332,15 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
             else:
                 _oxide_overlay(ax, al1, ox_resist, h_axis, zs)
         if k in (1, 2):       # evap-1 related panels
-            _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, r.z_top,
+            _beam_arrow_cs(ax, r.meta["d1"], plane, hlim, vtop,
                            _COLORS[C_AL1], "evap 1", side=-1)
         if k == 3:            # evap-2 panel
-            _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, r.z_top,
+            _beam_arrow_cs(ax, r.meta["d2"], plane, hlim, vtop,
                            _COLORS[C_AL2], "evap 2", side=+1)
+    axes[-1].axis("off")      # 6th cell unused (5 stages)
     _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP,
                   C_AL1, C_AL2, C_JUNC])
-    fig.tight_layout(rect=[0, 0.07, 1, 1])
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
     return fig
 
 
@@ -396,7 +401,8 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None):
 
     no_excl = np.zeros_like(al1f)
     hw = _top_half(r, view_half)
-    fig, axes = plt.subplots(1, 5, figsize=(21, 4.6), sharey=True)
+    fig, axes = plt.subplots(2, 3, figsize=(13.5, 9.0), sharex=True, sharey=True)
+    axes = axes.ravel()
     for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
         _draw(ax, cat, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
         ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
@@ -407,8 +413,9 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None):
             _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
         if k == 3:
             _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
+    axes[-1].axis("off")      # 6th cell unused (5 stages)
     _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_AL1, C_AL2, C_JUNC])
-    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
     return fig
 
 

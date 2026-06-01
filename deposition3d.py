@@ -82,15 +82,15 @@ def build_occluders(p: ProcessParams):
         L = p.bridge_len                            # suspended bridge width (x)
         Wj = p.bridge_w                             # junction width (y)
         u = p.undercut
-        t_mma, t_pmma = p.t_mma, p.t_pmma
-        z_top = t_mma + t_pmma
+        gap, t_pmma = p.bridge_gap, p.t_pmma        # gap = bridge underside height
+        z_top = gap + t_pmma
 
         # Open windows must sit on either side of the bridge so the tilted
         # beam can reach the floor and slide under the bridge.  Make the trench
-        # comfortably wider than the under-bridge reach (t_mma·tanθ).
+        # comfortably wider than the under-bridge reach (gap·tanθ).
         # Window must be wide enough that the far electrode wall does not
         # shadow the under-bridge region; then the junction is bridge-limited
-        # (the intended Dolan behaviour, overlap ≈ 2·t_mma·tanθ − L).
+        # (the intended Dolan behaviour, overlap ≈ 2·gap·tanθ − L).
         tanmax = np.tan(np.radians(max(abs(p.angle1), abs(p.angle2))))
         window = tanmax * z_top + L + 250.0
         trench_hx = L / 2 + window                  # PMMA trench half-width (x)
@@ -98,14 +98,14 @@ def build_occluders(p: ProcessParams):
         R = trench_hx + u + 400.0
 
         boxes = []
-        # MMA layer: trench widened by undercut on all sides
-        boxes += _frame_boxes(trench_hx + u, ap_hy + u, 0.0, t_mma, R)
-        # PMMA layer: open trench (no bridge yet)
-        boxes += _frame_boxes(trench_hx, ap_hy, t_mma, z_top, R)
+        # MMA (undercut sublayer) fills 0..gap; trench widened by undercut.
+        boxes += _frame_boxes(trench_hx + u, ap_hy + u, 0.0, gap, R)
+        # PMMA layer: open trench (no bridge yet), gap..z_top
+        boxes += _frame_boxes(trench_hx, ap_hy, gap, z_top, R)
         # Suspended bridge: narrow strip across the middle of the trench,
-        # hanging over the MMA air gap.
-        boxes.append(_box(-L / 2, L / 2, -ap_hy, ap_hy, t_mma, z_top))
-        return boxes, R, z_top, t_mma, t_mma   # z_split = MMA/PMMA interface
+        # hanging over the air gap at z = gap.
+        boxes.append(_box(-L / 2, L / 2, -ap_hy, ap_hy, gap, z_top))
+        return boxes, R, z_top, gap, gap   # z_split = MMA/PMMA interface
 
     else:  # Manhattan double-oblique: two perpendicular resist lines crossing
         wA = p.manhattan_wx        # electrode A linewidth (A runs along x)
@@ -230,26 +230,36 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes):
     """
     Nx, Ny, Nz = lab.shape
     solid = lab != EMPTY
+    sgn = np.sign(d).astype(int)                  # beam-forward sign per axis
 
-    # beam-forward neighbour index offset (one voxel step along +d)
-    step = np.sign(d) * (np.abs(d) > 0.3)        # dominant-axis stepping
-    # use a finer forward probe: shift by one cell along each nonzero axis
-    fwd = np.round(d / (np.abs(d).max() + 1e-12)).astype(int)
+    def _fwd_solid(axis, s):
+        """Solidity of the forward neighbour (index + s) along one axis."""
+        out = np.zeros_like(solid)
+        if s > 0:
+            sl_o = [slice(None)] * 3; sl_i = [slice(None)] * 3
+            sl_o[axis] = slice(0, -1); sl_i[axis] = slice(1, None)
+            out[tuple(sl_o)] = solid[tuple(sl_i)]
+        elif s < 0:
+            sl_o = [slice(None)] * 3; sl_i = [slice(None)] * 3
+            sl_o[axis] = slice(1, None); sl_i[axis] = slice(0, -1)
+            out[tuple(sl_o)] = solid[tuple(sl_i)]
+        return out
 
-    occ = np.zeros_like(solid)
-    sx, sy, sz = fwd
-    # shifted solidity: neighbour = cell at (i+sx, j+sy, k+sz)
+    # A cell sits on a deposition surface if the beam, continuing along d, hits
+    # solid in ANY forward direction — i.e. the forward neighbour on at least
+    # one nonzero beam axis is solid.  Checking each axis (not a single rounded
+    # vector) is what lets the tilted beam coat *vertical resist walls*, not
+    # just horizontal floors/tops.
     nbr = np.zeros_like(solid)
-    xi = slice(max(0, -sx), Nx - max(0, sx))
-    xo = slice(max(0, sx), Nx - max(0, -sx))
-    yi = slice(max(0, -sy), Ny - max(0, sy))
-    yo = slice(max(0, sy), Ny - max(0, -sy))
-    zi = slice(max(0, -sz), Nz - max(0, sz))
-    zo = slice(max(0, sz), Nz - max(0, -sz))
-    nbr[xi, yi, zi] = solid[xo, yo, zo]
-    # forward neighbour out of domain on the -z side counts as substrate floor
-    if sz < 0:
-        nbr[:, :, :(-sz)] |= (zs[:(-sz)] < 0)[None, None, :]
+    for axis in range(3):
+        if sgn[axis] != 0:
+            nbr |= _fwd_solid(axis, int(sgn[axis]))
+    # below the bottom slab the substrate floor counts as solid (downward beam)
+    if sgn[2] < 0:
+        nbr[:, :, 0] |= (zs[0] < 0)
+
+    # dominant-axis step used only for growing the film back toward the source
+    fwd = np.round(d / (np.abs(d).max() + 1e-12)).astype(int)
 
     surface = (~solid) & nbr
     ii, jj, kk = np.where(surface)
@@ -327,7 +337,7 @@ def simulate(p: ProcessParams) -> DepositionResult:
     # the open trench floods both depositions onto the leads; the actual JJ is
     # the under-bridge overlap, so confine the measurement to the bridge zone.
     if p.mode == "Dolan bridge":
-        reach = p.t_mma * np.tan(np.radians(max(abs(p.angle1), abs(p.angle2))))
+        reach = p.bridge_gap * np.tan(np.radians(max(abs(p.angle1), abs(p.angle2))))
         junc_xmax = p.bridge_len / 2 + reach + 2 * vox
         junc_ymax = p.bridge_w / 2 + 2 * vox
     else:

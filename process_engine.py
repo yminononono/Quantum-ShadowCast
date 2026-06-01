@@ -50,8 +50,11 @@ class ProcessParams:
     # ── Bilayer resist ─────────────────────────────────────────
     # Recipe: arxiv:2101.01453 — PMMA A-4 ~250 nm on MMA EL-13 ~900 nm.
     t_pmma:   float = 250.0   # PMMA top layer [nm]  (no undercut)
-    t_mma:    float = 900.0   # MMA  bot layer [nm]  (undercut, = bridge gap height)
+    t_mma:    float = 900.0   # MMA  bot layer [nm]  (undercut sublayer)
     undercut: float = 150.0   # MMA one-sided undercut [nm]
+    # Suspended-bridge air-gap height (shadow-defining).  Independent control;
+    # defaults to the MMA thickness but can be set freely.
+    bridge_gap: float = 900.0  # bridge underside height above substrate [nm]
 
     # ── Evaporation 1 ─────────────────────────────────────────
     # Uniaxial tilt ±24° (same azimuth φ, opposite polar θ); 30 nm Al each.
@@ -94,13 +97,12 @@ class ProcessParams:
     def t_gap(self) -> float:
         """Height of the suspended bridge above the substrate.
 
-        The Dolan bridge (PMMA slab) sits on top of the MMA layer, so its
-        underside is at z = t_mma. The metal tongue that reaches under the
-        bridge is shadowed by this bottom edge, so the under-bridge junction
-        overlap is governed by t_mma — NOT the full resist height.
-        Standard Dolan overlap:  2·t_mma·tanθ − bridge_len.
+        The metal tongue that reaches under the bridge is shadowed by the
+        bridge bottom edge, so the under-bridge junction overlap is governed by
+        this gap — NOT the full resist height.
+        Standard Dolan overlap:  2·bridge_gap·tanθ − bridge_len.
         """
-        return self.t_mma
+        return self.bridge_gap
 
     # Dolan: x-direction opening half-widths
     @property
@@ -128,10 +130,6 @@ class ProcessParams:
     @property
     def bridge_width(self) -> float:
         return self.bridge_w
-
-    @property
-    def bridge_gap(self) -> float:
-        return self.t_mma   # "gap" = MMA thickness (height of air gap below bridge)
 
     @property
     def uc_half(self) -> float:
