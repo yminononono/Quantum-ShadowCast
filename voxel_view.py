@@ -205,15 +205,21 @@ def render_stages(r: DepositionResult, plane="x-z", slice_pos=0.0, junc_mask=Non
             if inc_alox: cat[alox] = C_ALOX
             if inc_al2: cat[al2] = C_AL2
         else:
+            # Lift-off: strip the resist.  Metal survives only if it is
+            # "grounded" — part of a contiguous metal stack rising from the
+            # substrate floor.  Any metal that sat on a resist ledge loses its
+            # support and is washed away (even in a column that also has a
+            # floor deposit, the upper, gap-separated metal is removed).
             metal_any = al1 | al2 | alox
-            floor = (zs >= 0) & (zs < zf)
-            surv = (metal_any & floor[None, :]).any(axis=1)
-            keep = surv[:, None]
-            cat[al1 & keep] = C_AL1
-            cat[al2 & keep] = C_AL2
-            cat[alox & keep] = C_ALOX
+            z0 = int(np.searchsorted(zs, 0.0))      # first cell at/above substrate
+            grounded = np.zeros_like(metal_any)
+            stack = metal_any[:, z0:].astype(np.int8)
+            grounded[:, z0:] = np.cumprod(stack, axis=1).astype(bool)
+            cat[al1 & grounded] = C_AL1
+            cat[al2 & grounded] = C_AL2
+            cat[alox & grounded] = C_ALOX
             if emphasise_junc and junc2 is not None:
-                cat[junc2 & keep] = C_JUNC
+                cat[junc2 & grounded] = C_JUNC
         return cat
 
     panels = [
