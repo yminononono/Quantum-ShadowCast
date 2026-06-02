@@ -359,11 +359,12 @@ with _save_box:
         use_container_width=True)
 
 # ─── Tabs ─────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab_scan, tab5 = st.tabs([
     "📐 Cross-section",
     "🗺️ Top View",
     "🔄 φ Junction View",
     "🔍 Break Check",
+    "📈 Parameter Scan",
     "📊 Junction Area",
 ])
 
@@ -595,10 +596,12 @@ with tab4:
     else:
         st.success(f"✅ Junction formed (engine): {ox:.0f} × {oy:.0f} nm")
 
-    st.divider()
+# ═══ TAB: Parameter Scan ═════════════════════════════════════════
+with tab_scan:
     st.subheader("Parameter Scan")
     st.caption("Sweeps the **3D engine** (source of truth) over one or two "
-               "parameters. Pick variables, an output metric, then **Run scan**.")
+               "parameters. Pick variables, then **Run scan** — every metric "
+               "is plotted.")
 
     # Per-mode scan variables: label → (param attr, lo, hi, axis label)
     if mode == "Dolan bridge":
