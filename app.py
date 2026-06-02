@@ -627,8 +627,12 @@ with tab4:
         }
     var_names = list(scan_vars.keys())
 
+    # Every metric is plotted (stacked); colour per metric for the plots.
     metric_opts = ["Junction area [nm²]", "Est. Ic [µA]",
                    "L_J [nH]", "E_J/h [GHz]", "E_J/k_B [K]"]
+    _metric_color = {"Junction area [nm²]": "#CE93D8", "Est. Ic [µA]": "#64B5F6",
+                     "L_J [nH]": "#80CBC4", "E_J/h [GHz]": "#FFB74D",
+                     "E_J/k_B [K]": "#EF9A9A"}
 
     def _metric_from_area(area_nm2, metric):
         ic = area_nm2 * 1e-4
@@ -640,13 +644,12 @@ with tab4:
         if metric == "E_J/h [GHz]":         return jj["Ej_h_GHz"]
         return jj["Ej_kB_K"]
 
-    _SCAN_RES = {"Coarse (fast)": (80, 12.0), "Medium": (110, 9.0)}
-
-    cdim, cmet, cres = st.columns(3)
+    cdim, cres = st.columns(2)
     scan_dim = cdim.radio("Scan type", ["1D", "2D"], horizontal=True)
-    scan_metric = cmet.selectbox("Output metric", metric_opts)
-    scan_res = cres.selectbox("Scan grid resolution", list(_SCAN_RES.keys()))
-    _smc, _smv = _SCAN_RES[scan_res]
+    scan_res = cres.selectbox("Voxel grid density", list(RES_LEVELS.keys()),
+                              help="Same options as the sidebar ray-scan "
+                                   "resolution (finer = slower).")
+    _smc, _smv = RES_LEVELS[scan_res]
 
     def _scan_sig(p):
         return (p.mode, p.t_pmma, p.t_mma, p.undercut, p.angle1, p.phi1,
@@ -688,15 +691,22 @@ with tab4:
                     xs=xs, areas=areas, xattr=xattr, xlabel=xlabel, var=xv)
         sc = st.session_state.get("_scan1d")
         if sc:
-            yvals = np.array([_metric_from_area(a, scan_metric) for a in sc["areas"]])
-            fig_s, ax = plt.subplots(figsize=(8, 4.2))
-            ax.plot(sc["xs"], yvals, lw=2.2, color="#CE93D8", marker="o", ms=3)
-            if scan_metric in ("Junction area [nm²]", "Est. Ic [µA]"):
-                ax.axhline(0, color="red", lw=1, ls="--", label="Open circuit")
-                ax.legend(fontsize=8)
-            ax.set_xlabel(sc["xlabel"]); ax.set_ylabel(scan_metric)
-            ax.set_title(f"{sc['var']} → {scan_metric}  (engine, {scan_res})")
-            ax.grid(alpha=0.3)
+            n = len(metric_opts)
+            fig_s, axes_s = plt.subplots(n, 1, figsize=(8, 2.6 * n),
+                                         sharex=False)
+            for ax, metric in zip(np.atleast_1d(axes_s), metric_opts):
+                yvals = np.array([_metric_from_area(a, metric)
+                                  for a in sc["areas"]])
+                ax.plot(sc["xs"], yvals, lw=2.2, marker="o", ms=3,
+                        color=_metric_color[metric])
+                if metric in ("Junction area [nm²]", "Est. Ic [µA]"):
+                    ax.axhline(0, color="red", lw=1, ls="--", label="Open circuit")
+                    ax.legend(fontsize=8)
+                ax.set_xlabel(sc["xlabel"])   # per-plot x label (not shared)
+                ax.set_ylabel(metric)
+                ax.set_title(f"{sc['var']} → {metric}")
+                ax.grid(alpha=0.3)
+            fig_s.suptitle(f"Engine scan ({scan_res})", y=1.0, fontsize=10)
             fig_s.tight_layout()
             st.pyplot(fig_s, use_container_width=True)
             plt.close(fig_s)
@@ -741,14 +751,16 @@ with tab4:
                 xvar=xv, yvar=yv)
         sc = st.session_state.get("_scan2d")
         if sc:
-            zz = np.vectorize(lambda a: _metric_from_area(a, scan_metric))(sc["areas"])
-            fig_s, ax = plt.subplots(figsize=(7.5, 6))
-            pc = ax.pcolormesh(sc["xs"], sc["ys"], zz, shading="auto",
-                               cmap="viridis")
-            fig_s.colorbar(pc, ax=ax, label=scan_metric)
-            ax.set_xlabel(sc["xlabel"]); ax.set_ylabel(sc["ylabel"])
-            ax.set_title(f"{sc['yvar']} vs {sc['xvar']} → {scan_metric}\n"
-                         f"(engine, {scan_res})")
+            n = len(metric_opts)
+            fig_s, axes_s = plt.subplots(n, 1, figsize=(7.0, 5.2 * n))
+            for ax, metric in zip(np.atleast_1d(axes_s), metric_opts):
+                zz = np.vectorize(lambda a: _metric_from_area(a, metric))(sc["areas"])
+                pc = ax.pcolormesh(sc["xs"], sc["ys"], zz, shading="auto",
+                                   cmap="viridis")
+                fig_s.colorbar(pc, ax=ax, label=metric)
+                ax.set_xlabel(sc["xlabel"]); ax.set_ylabel(sc["ylabel"])
+                ax.set_title(f"{sc['yvar']} vs {sc['xvar']} → {metric}")
+            fig_s.suptitle(f"Engine scan ({scan_res})", y=1.0, fontsize=10)
             fig_s.tight_layout()
             st.pyplot(fig_s, use_container_width=True)
             plt.close(fig_s)
