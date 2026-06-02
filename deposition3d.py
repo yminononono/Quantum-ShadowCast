@@ -353,7 +353,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     z_floor_v = z_floor
     meta = dict(R=R, grid_R=grid_R, z_top=z_top, resist_h=resist_h, vox=vox,
                 d1=d1, d2=d2, z_floor=z_floor_v, z_split=z_split,
-                junc_xmax=junc_xmax, junc_ymax=junc_ymax,
+                junc_xmax=junc_xmax, junc_ymax=junc_ymax, mode=p.mode,
                 max_cells=max_cells, min_vox=min_vox)
     return DepositionResult(xs, ys, zs, vox, lab, al1, al2, alox, z_top, meta)
 
@@ -421,12 +421,23 @@ def junction_footprint(r: DepositionResult, min_cells: int = 2):
     floor = (zs >= 0) & (zs < z_floor)           # metal sitting on the substrate
     al1f = r.al1[:, :, floor].any(axis=2)
     al2f = r.al2[:, :, floor].any(axis=2)
-    junc = al1f & al2f
-    # confine to the device junction region
+    junc = al1f & al2f                            # full Al1∩Al2 contact
+
+    # The junction is EVERY xy cell where Al1 and Al2 stack up (touching through
+    # the thin oxide), whatever its outline — e.g. a Manhattan crossing with a φ
+    # offset is a tilted parallelogram, not an axis-aligned rectangle.  So we do
+    # NOT clip the overlap to a rectangle (that would shrink a tilted junction).
+    # We label the whole overlap into connected blobs and keep each blob in full.
+    #
+    # Manhattan: the two perpendicular line stripes cross exactly once, so every
+    # Al1∩Al2 blob *is* the junction — even a steep-tilt crossing that shifts
+    # into a corner of the cross (well outside wy/2 × wx/2); keep all blobs.
+    # Dolan: the open trench floods both depositions onto the leads, producing
+    # stray pad overlaps far out in x.  The real JJ is the under-bridge overlap,
+    # so keep only blobs whose centroid sits in the bridge junction zone.
     jxm = r.meta.get("junc_xmax", r.meta["R"])
     jym = r.meta.get("junc_ymax", r.meta["R"])
-    reg = (np.abs(r.xs)[:, None] <= jxm) & (np.abs(r.ys)[None, :] <= jym)
-    junc = junc & reg
+    confine = r.meta.get("mode", "") != "Manhattan"
 
     # split into spatially separate junctions (drop sub-`min_cells` specks)
     labels, n = _connected_components(junc)
@@ -437,14 +448,17 @@ def junction_footprint(r: DepositionResult, min_cells: int = 2):
         cnt = int(comp.sum())
         if cnt < min_cells:
             continue
-        clean |= comp
         ci, cj = np.where(comp)
+        cx = float(r.xs[ci].mean())
+        cy = float(r.ys[cj].mean())
+        if confine and (abs(cx) > jxm or abs(cy) > jym):   # stray pad overlap
+            continue
+        clean |= comp
         ox_c = (ci.max() - ci.min() + 1) * r.vox
         oy_c = (cj.max() - cj.min() + 1) * r.vox
         juncs.append(dict(
             mask=comp, cells=cnt, area=cnt * r.vox * r.vox,
-            ox=ox_c, oy=oy_c,
-            cx=float(r.xs[ci].mean()), cy=float(r.ys[cj].mean()),
+            ox=ox_c, oy=oy_c, cx=cx, cy=cy,
         ))
     juncs.sort(key=lambda d: -d["area"])
 

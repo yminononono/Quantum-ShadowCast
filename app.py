@@ -85,6 +85,59 @@ def _apply_loaded_params(pdict, raydict):
     return applied
 
 
+# ─── Josephson-junction electrical quantities ───────────────────────
+_E_CHG = 1.602176634e-19         # elementary charge      [C]
+_H_PL  = 6.62607015e-34          # Planck constant         [J·s]
+_HBAR  = _H_PL / (2 * np.pi)     # reduced Planck constant [J·s]
+_PHI0  = _H_PL / (2 * _E_CHG)    # magnetic flux quantum   [Wb]
+_KB    = 1.380649e-23            # Boltzmann constant      [J/K]
+
+
+def jj_electrical(ic_uA):
+    """Josephson inductance & energy derived from the critical current Ic.
+
+    L_J = ħ / (2e·Ic),   E_J = (Φ₀/2π)·Ic = ħ·Ic/2e.
+    Returns L_J [nH], E_J [J], E_J/h [GHz] and E_J/kB [K].  For Ic ≤ 0
+    (open circuit) L_J is infinite and E_J is zero."""
+    ic = float(ic_uA) * 1e-6                       # A
+    if ic <= 0:
+        return dict(Lj_nH=float("inf"), Ej_J=0.0, Ej_h_GHz=0.0, Ej_kB_K=0.0)
+    Lj = _HBAR / (2 * _E_CHG * ic)                 # H
+    Ej = (_PHI0 / (2 * np.pi)) * ic                # J
+    return dict(Lj_nH=Lj * 1e9, Ej_J=Ej,
+                Ej_h_GHz=Ej / _H_PL / 1e9, Ej_kB_K=Ej / _KB)
+
+
+def _fmt_lj(lj_nH):
+    """Human-readable Josephson inductance (nH / µH, or ∞ for an open junction)."""
+    if not np.isfinite(lj_nH):
+        return "∞ (open)"
+    if lj_nH >= 1000.0:
+        return f"{lj_nH / 1000.0:.3f} µH"
+    return f"{lj_nH:.3f} nH"
+
+
+# Default value of every process-parameter widget key (used by Reset button).
+# Must match the per-widget `setdefault(...)` defaults in the sidebar below.
+_PARAM_DEFAULTS = {
+    "mode": "Dolan bridge",
+    "t_pmma": 250, "t_mma": 900, "undercut": 150,
+    "angle1": -24, "phi1": 0, "t_metal1": 30,
+    "d_angle2": 24, "d_phi2": 0, "d_tmetal2": 30,
+    "d_bridge_len": 250, "d_bridge_w": 250, "d_bridge_pmma_gap": 0,
+    "m_theta": 60, "m_phi2": 90, "m_tmetal2": 30,
+    "m_h": 1800, "m_wx": 600, "m_wy": 600,
+    "res_level": "Standard (fast)",
+}
+
+
+def _reset_defaults():
+    """Restore every process-parameter widget to its default value."""
+    for k, v in _PARAM_DEFAULTS.items():
+        st.session_state[k] = v
+    st.session_state.pop("_imported_sig", None)   # allow re-loading later
+
+
 def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level):
     """Serialise the full process (parameters + ray-scan + junction results)
     to a JSON string that can be re-loaded to restore every parameter."""
@@ -92,6 +145,8 @@ def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level):
                       overlap_y_nm=float(j["oy"]), center_x_nm=float(j["cx"]),
                       center_y_nm=float(j["cy"]), cells=int(j["cells"]))
                  for j in juncs]
+    _jj = jj_electrical(ic)
+    _lj = _jj["Lj_nH"]
     out = {
         "shadowcast": "v6",
         "mode": params.mode,
@@ -103,6 +158,10 @@ def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level):
         "results": {"junction_area_nm2": float(area),
                     "overlap_x_nm": float(ox), "overlap_y_nm": float(oy),
                     "n_junctions": int(njunc), "est_Ic_uA": float(ic),
+                    "L_J_nH": (None if not np.isfinite(_lj) else float(_lj)),
+                    "E_J_J": float(_jj["Ej_J"]),
+                    "E_J_over_h_GHz": float(_jj["Ej_h_GHz"]),
+                    "E_J_over_kB_K": float(_jj["Ej_kB_K"]),
                     "junctions": juncs_out},
     }
     return json.dumps(out, indent=2)
@@ -137,6 +196,11 @@ with st.sidebar:
                 st.error(f"Import failed: {e}")
     # Filled with the export download button after the engine has run.
     _save_box = st.container()
+    if st.button("↺ Reset parameters to defaults", use_container_width=True,
+                 help="Restore every process parameter (and resolution) to its "
+                      "default value."):
+        _reset_defaults()
+        st.rerun()
     st.divider()
 
     st.header("📂 GDS File")
@@ -293,6 +357,8 @@ eng_njunc = len(eng_juncs)
 # Engine-based critical current (jc = 10 kA/cm², Ambegaokar-Baratoff),
 # consistent with junction_area.py:  Ic[µA] = area_nm2 · 1e-4
 eng_ic = eng_area * 1e-4
+# Josephson inductance L_J and energy E_J derived from that critical current.
+eng_jj = jj_electrical(eng_ic)
 
 # Now the engine has run, fill the sidebar Save box with a download button that
 # exports every parameter + the junction results (re-loadable via the uploader).
@@ -385,6 +451,18 @@ with tab1:
     c2.metric("Junction area (engine)", f"{eng_area:.0f} nm²")
     c3.metric("Overlap x (engine)", f"{eng_ox:.0f} nm")
     c4.metric("Overlap y (engine)", f"{eng_oy:.0f} nm")
+    st.caption(
+        "Junction area = the **true Al1∩Al2 overlap** measured by counting "
+        "overlapping voxels (Σ cells × voxel²), so non-rectangular junctions "
+        "are handled exactly; overlap x / y are just the bounding-box extents."
+    )
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Est. critical current Iᶜ", f"{eng_ic:.3f} µA",
+              help="Al, ~4 K: jc = 10 kA/cm² (Ambegaokar–Baratoff)")
+    e2.metric("Josephson inductance L_J", _fmt_lj(eng_jj["Lj_nH"]),
+              help="L_J = ħ / (2e·Iᶜ)")
+    e3.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
+              help=f"E_J = (Φ₀/2π)·Iᶜ = {eng_jj['Ej_kB_K']:.2f} K·k_B")
 
     if eng_area <= 0:
         if mode == "Manhattan":
@@ -500,6 +578,12 @@ with tab4:
     c1.metric("Overlap x × y (engine)", f"{ox:.0f} × {oy:.0f} nm")
     c2.metric("Area (engine)", f"{eng_area:.0f} nm²")
     c3.metric("Est. Ic (engine)", f"{eng_ic:.3f} µA")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Josephson inductance L_J", _fmt_lj(eng_jj["Lj_nH"]),
+              help="L_J = ħ / (2e·Iᶜ)")
+    d2.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
+              help="E_J = (Φ₀/2π)·Iᶜ")
+    d3.metric("E_J / k_B", f"{eng_jj['Ej_kB_K']:.2f} K")
 
     if eng_area <= 0:
         if mode == "Dolan bridge":
@@ -594,8 +678,17 @@ with tab5:
               help="Al, 4K: jc=10 kA/cm² (Ambegaokar-Baratoff)")
     c5.metric("Junctions",           f"{eng_njunc}",
               help="Number of spatially separate Al1∩Al2 overlaps")
-    st.caption(f"Engine voxel size = {eng.vox:.1f} nm "
-               "(area/overlap resolution).")
+    j1, j2, j3 = st.columns(3)
+    j1.metric("Josephson inductance L_J", _fmt_lj(eng_jj["Lj_nH"]),
+              help="L_J = ħ / (2e·Iᶜ)")
+    j2.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
+              help="E_J = (Φ₀/2π)·Iᶜ = ħ·Iᶜ/2e")
+    j3.metric("E_J / k_B", f"{eng_jj['Ej_kB_K']:.2f} K")
+    st.caption(
+        f"Engine voxel size = {eng.vox:.1f} nm.  Junction area is the true "
+        "Al1∩Al2 overlap (Σ overlapping voxels × voxel²), exact for "
+        "non-rectangular junctions."
+    )
     st.divider()
     if mode == "Dolan bridge":
         detail = {
@@ -622,6 +715,9 @@ with tab5:
             "Junction area (engine) [nm²]": eng_area,
             "Junctions (engine)":    eng_njunc,
             "Estimated Ic (engine) [µA]":  eng_ic,
+            "Josephson inductance L_J [nH]": eng_jj["Lj_nH"],
+            "Josephson energy E_J/h [GHz]":  eng_jj["Ej_h_GHz"],
+            "Josephson energy E_J/k_B [K]":  eng_jj["Ej_kB_K"],
             "Engine voxel [nm]":     eng.vox,
         }
     else:
@@ -640,6 +736,9 @@ with tab5:
             "Junction area (engine) [nm²]": eng_area,
             "Junctions (engine)":    eng_njunc,
             "Estimated Ic (engine) [µA]":  eng_ic,
+            "Josephson inductance L_J [nH]": eng_jj["Lj_nH"],
+            "Josephson energy E_J/h [GHz]":  eng_jj["Ej_h_GHz"],
+            "Josephson energy E_J/k_B [K]":  eng_jj["Ej_kB_K"],
             "Engine voxel [nm]":     eng.vox,
         }
     num_detail = {k:v for k,v in detail.items() if isinstance(v, (int,float))}
