@@ -43,8 +43,8 @@ _SHARED_KEYS = ["t_pmma", "t_mma", "undercut", "angle1", "phi1", "t_metal1"]
 _DOLAN_KEYS = {"angle2": "d_angle2", "phi2": "d_phi2", "t_metal2": "d_tmetal2",
                "bridge_len": "d_bridge_len", "bridge_w": "d_bridge_w",
                "bridge_pmma_gap": "d_bridge_pmma_gap"}
-_MANH_KEYS = {"manhattan_theta": "m_theta", "phi2": "m_phi2",
-              "t_metal2": "m_tmetal2", "manhattan_h": "m_h",
+_MANH_KEYS = {"angle2": "m_angle2", "phi2": "m_phi2",
+              "t_metal2": "m_tmetal2",
               "manhattan_wx": "m_wx", "manhattan_wy": "m_wy"}
 # (slider min, max) per widget key — used to clamp loaded values so an
 # out-of-range file can never crash widget creation.
@@ -54,8 +54,8 @@ _KEY_RANGE = {
     "d_angle2": (-60, 60), "d_phi2": (-90, 90), "d_tmetal2": (10, 200),
     "d_bridge_len": (50, 2000), "d_bridge_w": (50, 1000),
     "d_bridge_pmma_gap": (0, 2000),
-    "m_theta": (30, 80), "m_phi2": (-90, 180), "m_tmetal2": (10, 200),
-    "m_h": (500, 3000), "m_wx": (100, 2000), "m_wy": (100, 2000),
+    "m_angle2": (-80, 80), "m_phi2": (-90, 180), "m_tmetal2": (10, 200),
+    "m_wx": (100, 2000), "m_wy": (100, 2000),
 }
 
 
@@ -125,8 +125,8 @@ _PARAM_DEFAULTS = {
     "angle1": -24, "phi1": 0, "t_metal1": 30,
     "d_angle2": 24, "d_phi2": 0, "d_tmetal2": 30,
     "d_bridge_len": 250, "d_bridge_w": 250, "d_bridge_pmma_gap": 0,
-    "m_theta": 60, "m_phi2": 90, "m_tmetal2": 30,
-    "m_h": 1800, "m_wx": 600, "m_wy": 600,
+    "m_angle2": 60, "m_phi2": 90, "m_tmetal2": 30,
+    "m_wx": 600, "m_wy": 600,
     "res_level": "Standard (fast)",
 }
 
@@ -269,28 +269,18 @@ with st.sidebar:
         manhattan_wx = manhattan_wy = bridge_w
         manhattan_theta = 60.0; manhattan_delta = 15.0; manhattan_h = 1800.0
     else:
-        st.subheader("Double-oblique evaporation")
-        st.caption("Recipe arxiv:2605.19590 — θ ≈ 60°, δ ≈ 15–25°, h ≈ 1.8 µm")
-        st.session_state.setdefault("m_theta", 60)
-        manhattan_theta = st.slider("Deposition tilt θ [°]  (from normal, shared)",
-                                    30, 80, step=1, key="m_theta")
-        # Evaporation 1 and 2 are independent beams; default orthogonal (φ₁=0, φ₂=90).
-        # φ₁ comes from the shared Evaporation-1 section above (default 0).
+        st.caption("Recipe arxiv:2605.19590 — two oblique beams (θ ≈ 60°), "
+                   "azimuths ≈ 90° apart (Manhattan crossing).")
+        # Evaporation 1 (θ₁, φ₁, d₁) comes from the shared section above.
         st.subheader("Evaporation 2")
+        st.session_state.setdefault("m_angle2", 60)
+        angle2 = st.slider("Polar θ₂ [°]", -80, 80, step=1, key="m_angle2",
+                           help="Tilt of the second beam from the surface normal.")
         st.session_state.setdefault("m_phi2", 90)
         phi2 = st.slider("Azimuthal φ₂ [°]", -90, 180, step=1, key="m_phi2",
                          help="Default 90° → perpendicular to Evap 1")
         st.session_state.setdefault("m_tmetal2", 30)
         t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="m_tmetal2")
-        # Manhattan beams are tilted by the shared θ; reuse θ₁=θ₂=θ.
-        angle1 = manhattan_theta
-        angle2 = manhattan_theta
-        # δ for Eq A6 = azimuth offset of each beam from its electrode line
-        # (Evap1 line along x → offset |φ₁|; Evap2 line along y → offset |φ₂−90|).
-        manhattan_delta = max(abs(phi1), abs(phi2 - 90.0), 1.0)
-        st.session_state.setdefault("m_h", 1800)
-        manhattan_h = st.slider("Imaging resist h [nm]", 500, 3000,
-                                step=50, key="m_h")
 
         st.subheader("Geometry")
         st.markdown("Designed resist line openings (Manhattan crossing):")
@@ -301,13 +291,11 @@ with st.sidebar:
         manhattan_wy = st.slider("y-arm opening wy [nm]", 100, 2000,
                                  step=10, key="m_wy")
         bridge_len = 700; bridge_w = 300; bridge_pmma_gap = 0.0
-        _tan = np.tan(np.radians(manhattan_theta))
-        _shrink = manhattan_h * np.sin(np.radians(manhattan_delta)) / _tan if _tan > 1e-9 else 0.0
-        st.caption(
-            f"Eq A6: w_narrow = w_open − h·sin δ / tan θ  \n"
-            f"shrink = {_shrink:.0f} nm → w_narrow = "
-            f"{max(manhattan_wx-_shrink,0):.0f} × {max(manhattan_wy-_shrink,0):.0f} nm"
-        )
+        # Derived quantities for the analytic estimate / status messages only
+        # (the 3D engine is the source of truth and uses θ₁/φ₁/θ₂/φ₂ directly).
+        manhattan_theta = (abs(angle1) + abs(angle2)) / 2.0
+        manhattan_delta = max(abs(phi1), abs(phi2 - 90.0), 1.0)
+        manhattan_h = float(t_pmma + t_mma)
 
     st.divider()
     st.subheader("Ray-scan resolution")
@@ -609,63 +597,161 @@ with tab4:
 
     st.divider()
     st.subheader("Parameter Scan")
-    st.caption("Fast analytic estimate for exploring trends. The headline "
-               "open/short judgment above uses the 3D engine.")
-    if mode == "Dolan bridge":
-        scan_opts = ["θ₁", "θ₂", "φ₁", "φ₂",
-                     "bridge_len", "bridge_w",
-                     "MMA height", "Bridge↔PMMA gap",
-                     "Undercut u", "PMMA thickness"]
-    else:
-        scan_opts = ["θ tilt", "δ offset", "h resist",
-                     "x-arm width", "y-arm width"]
-    scan_p = st.selectbox("Scan parameter", scan_opts)
-    scan_map = {
-        "θ₁":           ("angle1",      np.linspace(-55,55,100),    "θ₁ [°]"),
-        "θ₂":           ("angle2",      np.linspace(-55,55,100),    "θ₂ [°]"),
-        "φ₁":           ("phi1",        np.linspace(-90,90,100),    "φ₁ [°]"),
-        "φ₂":           ("phi2",        np.linspace(-90,90,100),    "φ₂ [°]"),
-        "bridge_len":   ("bridge_len",  np.linspace(100,2000,100),  "bridge_len [nm]"),
-        "bridge_w":     ("bridge_w",    np.linspace(50,800,100),    "bridge_w [nm]"),
-        "MMA height":   ("t_mma",       np.linspace(100,1500,100),  "MMA height [nm]"),
-        "Bridge↔PMMA gap":("bridge_pmma_gap", np.linspace(0,2000,100),"bridge↔PMMA gap [nm]"),
-        "Undercut u":   ("undercut",    np.linspace(0,400,100),     "u [nm]"),
-        "PMMA thickness":("t_pmma",     np.linspace(100,800,100),   "PMMA [nm]"),
-        "θ tilt":       ("manhattan_theta", np.linspace(30,80,100),  "θ [°]"),
-        "δ offset":     ("manhattan_delta", np.linspace(0,45,100),   "δ [°]"),
-        "h resist":     ("manhattan_h",     np.linspace(500,3000,100),"h [nm]"),
-        "x-arm width":  ("manhattan_wx",np.linspace(100,2000,100),   "wx [nm]"),
-        "y-arm width":  ("manhattan_wy",np.linspace(100,2000,100),   "wy [nm]"),
-    }
-    attr, vals, xlabel = scan_map[scan_p]
-    areas_s, tilts_s, ox_s, oy_s = [], [], [], []
-    for v in vals:
-        p2 = copy.copy(params); setattr(p2, attr, float(v))
-        r2 = compute_junction_area(p2)
-        areas_s.append(r2["area_nm2"])
-        tilts_s.append(r2["junction_tilt_deg"])
-        ox_s.append(r2["overlap_x_nm"])
-        oy_s.append(r2["overlap_y_nm"])
-    areas_s = np.array(areas_s)
+    st.caption("Sweeps the **3D engine** (source of truth) over one or two "
+               "parameters. Pick variables, an output metric, then **Run scan**.")
 
-    fig_s, axes_s = plt.subplots(3,1, figsize=(8,7), sharex=True)
-    axes_s[0].plot(vals, areas_s, lw=2.2, color="#CE93D8")
-    axes_s[0].fill_between(vals, areas_s, 0, where=areas_s>0, alpha=0.15, color="#CE93D8")
-    axes_s[0].axhline(0, color="red", lw=1, ls="--", label="Open circuit")
-    axes_s[0].set_ylabel("Area [nm²]"); axes_s[0].legend(fontsize=8); axes_s[0].grid(alpha=0.3)
-    axes_s[0].set_title(f"{scan_p} → Junction Area")
-    axes_s[1].plot(vals, ox_s, lw=2, color="#64B5F6", label="overlap x")
-    axes_s[1].plot(vals, oy_s, lw=2, color="#EF9A9A", label="overlap y")
-    axes_s[1].axhline(0, color="red", lw=1, ls="--")
-    axes_s[1].set_ylabel("Overlap [nm]"); axes_s[1].legend(fontsize=8); axes_s[1].grid(alpha=0.3)
-    axes_s[1].set_title(f"{scan_p} → Overlaps")
-    axes_s[2].plot(vals, tilts_s, lw=2, color="#80CBC4")
-    axes_s[2].axhline(0, color="#aaa", lw=0.8, ls=":")
-    axes_s[2].set_ylabel("Tilt α [°]"); axes_s[2].set_xlabel(xlabel); axes_s[2].grid(alpha=0.3)
-    axes_s[2].set_title(f"{scan_p} → Junction Tilt")
-    fig_s.tight_layout()
-    st.pyplot(fig_s, use_container_width=True)
-    plt.close(fig_s)
+    # Per-mode scan variables: label → (param attr, lo, hi, axis label)
+    if mode == "Dolan bridge":
+        scan_vars = {
+            "θ₁":            ("angle1",          -55,  55,  "θ₁ [°]"),
+            "θ₂":            ("angle2",          -55,  55,  "θ₂ [°]"),
+            "φ₁":            ("phi1",            -90,  90,  "φ₁ [°]"),
+            "φ₂":            ("phi2",            -90,  90,  "φ₂ [°]"),
+            "bridge_len":    ("bridge_len",      100,  2000,"bridge_len [nm]"),
+            "bridge_w":      ("bridge_w",        50,   800, "bridge_w [nm]"),
+            "MMA height":    ("t_mma",           100,  1500,"MMA height [nm]"),
+            "Bridge↔PMMA gap":("bridge_pmma_gap", 0,   2000,"bridge↔PMMA gap [nm]"),
+            "Undercut u":    ("undercut",        0,    400, "u [nm]"),
+            "PMMA thickness":("t_pmma",          100,  800, "PMMA [nm]"),
+        }
+    else:
+        scan_vars = {
+            "θ₁":         ("angle1",       -80, 80,  "θ₁ [°]"),
+            "φ₁":         ("phi1",         -90, 90,  "φ₁ [°]"),
+            "θ₂":         ("angle2",       -80, 80,  "θ₂ [°]"),
+            "φ₂":         ("phi2",         -90, 180, "φ₂ [°]"),
+            "x-arm wx":   ("manhattan_wx", 100, 2000,"wx [nm]"),
+            "y-arm wy":   ("manhattan_wy", 100, 2000,"wy [nm]"),
+            "MMA height": ("t_mma",        100, 1500,"MMA height [nm]"),
+            "Undercut u": ("undercut",     0,   400, "u [nm]"),
+        }
+    var_names = list(scan_vars.keys())
+
+    metric_opts = ["Junction area [nm²]", "Est. Ic [µA]",
+                   "L_J [nH]", "E_J/h [GHz]", "E_J/k_B [K]"]
+
+    def _metric_from_area(area_nm2, metric):
+        ic = area_nm2 * 1e-4
+        jj = jj_electrical(ic)
+        if metric == "Junction area [nm²]": return area_nm2
+        if metric == "Est. Ic [µA]":        return ic
+        if metric == "L_J [nH]":
+            return jj["Lj_nH"] if np.isfinite(jj["Lj_nH"]) else np.nan
+        if metric == "E_J/h [GHz]":         return jj["Ej_h_GHz"]
+        return jj["Ej_kB_K"]
+
+    _SCAN_RES = {"Coarse (fast)": (80, 12.0), "Medium": (110, 9.0)}
+
+    cdim, cmet, cres = st.columns(3)
+    scan_dim = cdim.radio("Scan type", ["1D", "2D"], horizontal=True)
+    scan_metric = cmet.selectbox("Output metric", metric_opts)
+    scan_res = cres.selectbox("Scan grid resolution", list(_SCAN_RES.keys()))
+    _smc, _smv = _SCAN_RES[scan_res]
+
+    def _scan_sig(p):
+        return (p.mode, p.t_pmma, p.t_mma, p.undercut, p.angle1, p.phi1,
+                p.t_metal1, p.angle2, p.phi2, p.t_metal2, p.bridge_len,
+                p.bridge_w, p.bridge_pmma_gap, p.manhattan_wx, p.manhattan_wy,
+                p.manhattan_theta, p.manhattan_delta, p.manhattan_h, _smc, _smv)
+
+    @st.cache_data(show_spinner=False)
+    def _scan_area(sig, _p):
+        r = simulate(_p, max_cells=_smc, min_vox=_smv)
+        _, area, _, _, _ = junction_footprint(r)
+        return float(area)
+
+    if scan_dim == "1D":
+        xv = st.selectbox("Scan variable", var_names, key="scan_x1d")
+        xattr, xlo, xhi, xlabel = scan_vars[xv]
+        cx, cy, cn = st.columns(3)
+        # Range/step keyed per variable → each remembers its own bounds.
+        vmin = cx.number_input("Min", value=float(xlo), step=1.0,
+                               key=f"s1lo_{xv}")
+        vmax = cy.number_input("Max", value=float(xhi), step=1.0,
+                               key=f"s1hi_{xv}")
+        npts = cn.number_input("Points", min_value=2, max_value=201, value=31,
+                               step=1, key="scan_n1d")
+        if st.button("▶ Run scan", key="run_scan_1d", use_container_width=True):
+            if vmax <= vmin:
+                st.warning("Max must be greater than Min.")
+            else:
+                xs = np.linspace(vmin, vmax, int(npts))
+                areas = np.zeros(len(xs))
+                prog = st.progress(0.0, text="Scanning…")
+                for i, vx in enumerate(xs):
+                    p2 = copy.copy(params); setattr(p2, xattr, float(vx))
+                    areas[i] = _scan_area(_scan_sig(p2), p2)
+                    prog.progress((i + 1) / len(xs),
+                                  text=f"Scanning… {i+1}/{len(xs)}")
+                prog.empty()
+                st.session_state["_scan1d"] = dict(
+                    xs=xs, areas=areas, xattr=xattr, xlabel=xlabel, var=xv)
+        sc = st.session_state.get("_scan1d")
+        if sc:
+            yvals = np.array([_metric_from_area(a, scan_metric) for a in sc["areas"]])
+            fig_s, ax = plt.subplots(figsize=(8, 4.2))
+            ax.plot(sc["xs"], yvals, lw=2.2, color="#CE93D8", marker="o", ms=3)
+            if scan_metric in ("Junction area [nm²]", "Est. Ic [µA]"):
+                ax.axhline(0, color="red", lw=1, ls="--", label="Open circuit")
+                ax.legend(fontsize=8)
+            ax.set_xlabel(sc["xlabel"]); ax.set_ylabel(scan_metric)
+            ax.set_title(f"{sc['var']} → {scan_metric}  (engine, {scan_res})")
+            ax.grid(alpha=0.3)
+            fig_s.tight_layout()
+            st.pyplot(fig_s, use_container_width=True)
+            plt.close(fig_s)
+    else:
+        cxx, cyy = st.columns(2)
+        xv = cxx.selectbox("X variable", var_names, key="scan_x2d")
+        yv = cyy.selectbox("Y variable", var_names,
+                           index=min(1, len(var_names) - 1), key="scan_y2d")
+        xattr, xlo, xhi, xlabel = scan_vars[xv]
+        yattr, ylo, yhi, ylabel = scan_vars[yv]
+        rx1, rx2, rxn = st.columns(3)
+        xmin = rx1.number_input("X min", value=float(xlo), step=1.0, key=f"s2xlo_{xv}")
+        xmax = rx2.number_input("X max", value=float(xhi), step=1.0, key=f"s2xhi_{xv}")
+        nx = rxn.number_input("X points", min_value=2, max_value=81, value=15,
+                              step=1, key="scan_nx2d")
+        ry1, ry2, ryn = st.columns(3)
+        ymin = ry1.number_input("Y min", value=float(ylo), step=1.0, key=f"s2ylo_{yv}")
+        ymax = ry2.number_input("Y max", value=float(yhi), step=1.0, key=f"s2yhi_{yv}")
+        ny = ryn.number_input("Y points", min_value=2, max_value=81, value=15,
+                              step=1, key="scan_ny2d")
+        st.caption(f"{int(nx)}×{int(ny)} = {int(nx)*int(ny)} engine runs")
+        if xv == yv:
+            st.warning("Choose two different variables for a 2D scan.")
+        elif xmax <= xmin or ymax <= ymin:
+            st.warning("Each Max must be greater than its Min.")
+        elif st.button("▶ Run scan", key="run_scan_2d", use_container_width=True):
+            xs = np.linspace(xmin, xmax, int(nx))
+            ys = np.linspace(ymin, ymax, int(ny))
+            areas = np.zeros((len(ys), len(xs)))
+            total = len(xs) * len(ys); done = 0
+            prog = st.progress(0.0, text="Scanning…")
+            for iy, vy in enumerate(ys):
+                for ix, vx in enumerate(xs):
+                    p2 = copy.copy(params)
+                    setattr(p2, xattr, float(vx)); setattr(p2, yattr, float(vy))
+                    areas[iy, ix] = _scan_area(_scan_sig(p2), p2)
+                    done += 1
+                    prog.progress(done / total, text=f"Scanning… {done}/{total}")
+            prog.empty()
+            st.session_state["_scan2d"] = dict(
+                xs=xs, ys=ys, areas=areas, xlabel=xlabel, ylabel=ylabel,
+                xvar=xv, yvar=yv)
+        sc = st.session_state.get("_scan2d")
+        if sc:
+            zz = np.vectorize(lambda a: _metric_from_area(a, scan_metric))(sc["areas"])
+            fig_s, ax = plt.subplots(figsize=(7.5, 6))
+            pc = ax.pcolormesh(sc["xs"], sc["ys"], zz, shading="auto",
+                               cmap="viridis")
+            fig_s.colorbar(pc, ax=ax, label=scan_metric)
+            ax.set_xlabel(sc["xlabel"]); ax.set_ylabel(sc["ylabel"])
+            ax.set_title(f"{sc['yvar']} vs {sc['xvar']} → {scan_metric}\n"
+                         f"(engine, {scan_res})")
+            fig_s.tight_layout()
+            st.pyplot(fig_s, use_container_width=True)
+            plt.close(fig_s)
 
 # ═══ TAB 5: Junction Area ════════════════════════════════════════
 with tab5:
@@ -723,14 +809,14 @@ with tab5:
     else:
         detail = {
             "Mode":                  params.mode,
-            "Deposition tilt θ [°]": params.manhattan_theta,
-            "In-plane offset δ [°]": params.manhattan_delta,
-            "Imaging resist h [nm]": params.manhattan_h,
+            "θ₁ [°]":                params.angle1,
+            "φ₁ [°]":                params.phi1,
+            "Metal d₁ [nm]":         params.t_metal1,
+            "θ₂ [°]":                params.angle2,
+            "φ₂ [°]":                params.phi2,
+            "Metal d₂ [nm]":         params.t_metal2,
             "x-arm opening wx [nm]": params.manhattan_wx,
             "y-arm opening wy [nm]": params.manhattan_wy,
-            "φ₁ [°]":                params.phi1,
-            "φ₂ [°]":                params.phi2,
-            "shrink h·sinδ/tanθ [nm]": res.get("shrink_nm", 0.0),
             "Overlap x (engine) [nm]":   eng_ox,
             "Overlap y (engine) [nm]":   eng_oy,
             "Junction area (engine) [nm²]": eng_area,
