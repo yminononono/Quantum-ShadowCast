@@ -21,6 +21,14 @@ is the **source of truth** — all on-screen views and judgments are based on it
     under the suspended bridge.
   - **Manhattan**: two evaporation beams (with independently configurable
     θ₁/φ₁ and θ₂/φ₂) that cross each other.
+- **Bilayer or trilayer deposition stack** (works in either mode)
+  - **Bilayer**: evap 1 → oxidation → evap 2 (the classic two-electrode setup).
+  - **Trilayer**: Nb→Al → oxidation → Al→Nb (Nb/Al/Al/Nb). The oxide forms on
+    the exposed Nb *and* Al of the bottom electrode, and the junction barrier is
+    classified by the metal pair across the oxide — **Nb-Al / Al-Al / Nb-Nb** —
+    each reported and coloured separately. Per-sublayer thicknesses and the
+    evap-2 / evap-4 tilt angles are configurable (defaulting to their
+    electrode's primary angle).
 - **3D shadow-evaporation engine**: voxel ray-casting that reproduces the metal
   films, the oxide, and the resist undercut.
 - **Arbitrary junction shape**: the junction is not assumed to be square — it is
@@ -133,6 +141,9 @@ results update in real time.
 | θ₂ / φ₂ / d₂ | Polar angle / azimuth / metal thickness of evaporation 2 |
 | `bridge_len` / `bridge_w` | (Dolan) bridge length / width [nm] |
 | `manhattan_wx` / `manhattan_wy` | (Manhattan) x / y arm opening widths [nm] |
+| `stack` | `Bilayer` or `Trilayer` (Nb/Al/Al/Nb) |
+| `tri_t1…tri_t4` | (Trilayer) Nb/Al/Al/Nb sublayer thicknesses [nm] |
+| `tri_angle2` / `tri_angle4` | (Trilayer) evap-2 (Al) / evap-4 (Nb) tilt angles [°] |
 
 Beam direction: `beam = (sinθcosφ, sinθsinφ, −cosθ)` (θ measured from the normal).
 

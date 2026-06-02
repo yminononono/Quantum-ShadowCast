@@ -185,11 +185,13 @@ class DepositionResult:
     zs: np.ndarray
     vox: float                # voxel edge [nm]
     solid: np.ndarray         # int8 label grid (Nx,Ny,Nz): EMPTY/RESIST/SUBSTRATE
-    al1: np.ndarray           # bool: Al from evaporation 1
-    al2: np.ndarray           # bool: Al from evaporation 2
-    alox: np.ndarray          # bool: AlOx layer
+    al1: np.ndarray           # bool: electrode 1 metal (bilayer: evap1; trilayer: Nb+Al)
+    al2: np.ndarray           # bool: electrode 2 metal (bilayer: evap2; trilayer: Al+Nb)
+    alox: np.ndarray          # bool: oxide skin on electrode 1
     z_top: float
     meta: dict
+    stack: str = "Bilayer"    # "Bilayer" | "Trilayer"
+    films: dict = None        # trilayer sub-films: {"nb1","al2","al3","nb4"} → bool grid
 
     def idx_x(self, x):  return int(np.clip(np.searchsorted(self.xs, x), 0, len(self.xs) - 1))
     def idx_y(self, y):  return int(np.clip(np.searchsorted(self.ys, y), 0, len(self.ys) - 1))
@@ -296,7 +298,13 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     voxel grid — more accurate metal/junction edges at the cost of speed/memory.
     """
     boxes, R, z_top, resist_h, z_split = build_occluders(p)
-    t_tot_metal = p.t_metal1 + p.t_metal2 + max(p.t_metal1 * 0.1, 3)
+    trilayer = getattr(p, "stack", "Bilayer") == "Trilayer"
+    if trilayer:
+        metal_sum = p.tri_t1 + p.tri_t2 + p.tri_t3 + p.tri_t4
+        t_tot_metal = metal_sum + max(p.tri_t1 * 0.1, 3)
+    else:
+        metal_sum = p.t_metal1 + p.t_metal2
+        t_tot_metal = metal_sum + max(p.t_metal1 * 0.1, 3)
 
     # The voxel grid only needs to resolve the region we actually observe
     # (the junction and the nearby leads).  Occluder boxes are analytic AABBs
@@ -315,31 +323,60 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
                                        max_cells=max_cells, min_vox=min_vox)
     lab = _label_solid(xs, ys, zs, boxes)
 
-    # Both modes drive the two evaporations from their own (θ, φ).  Dolan
-    # defaults to a uniaxial ±θ tilt at φ=0; Manhattan defaults to two beams at
-    # the same tilt but orthogonal azimuth (φ₁=0, φ₂=90).  All four are free.
-    d1 = beam_direction(p.angle1, p.phi1)
-    d2 = beam_direction(p.angle2, p.phi2)
+    def _oxide_skin(metal):
+        """One-cell conformal oxide skin on all exposed faces of `metal`."""
+        neigh = np.zeros_like(metal)
+        neigh[1:, :, :] |= metal[:-1, :, :]; neigh[:-1, :, :] |= metal[1:, :, :]
+        neigh[:, 1:, :] |= metal[:, :-1, :]; neigh[:, :-1, :] |= metal[:, 1:, :]
+        neigh[:, :, 1:] |= metal[:, :, :-1]; neigh[:, :, :-1] |= metal[:, :, 1:]
+        return neigh & (~metal) & (lab == EMPTY)
 
-    al1 = _deposit(lab, xs, ys, zs, vox, d1, p.t_metal1, boxes)
+    # Both modes drive the evaporations from their own (θ, φ).  Dolan
+    # defaults to a uniaxial ±θ tilt at φ=0; Manhattan defaults to orthogonal
+    # azimuths (φ₁=0, φ₂=90).  All angles are free.
+    films = None
+    tri_dirs = None
+    if not trilayer:
+        # ── Bilayer: evap1 → oxidation → evap2 ────────────────────
+        d1 = beam_direction(p.angle1, p.phi1)
+        d2 = beam_direction(p.angle2, p.phi2)
+        al1 = _deposit(lab, xs, ys, zs, vox, d1, p.t_metal1, boxes)
+        # Oxide: thin conformal skin on al1; NOT geometry (does not occlude).
+        alox = _oxide_skin(al1)
+        lab2 = lab.copy()
+        lab2[al1] = RESIST
+        al2 = _deposit(lab2, xs, ys, zs, vox, d2, p.t_metal2, boxes)
+        meta_d1, meta_d2 = d1, d2
+    else:
+        # ── Trilayer: Nb1 → Al2 → oxidation → Al3 → Nb4 ───────────
+        # Electrode 1 (bottom) = Nb(evap1) + Al(evap2) at the Evap-1 angle;
+        # electrode 2 (top)    = Al(evap3) + Nb(evap4) at the Evap-2 angle.
+        d1 = beam_direction(p.angle1, p.phi1)        # evap1  Nb
+        d2 = beam_direction(p.tri_angle2, p.tri_phi2)  # evap2  Al
+        d3 = beam_direction(p.angle2, p.phi2)        # evap3  Al
+        d4 = beam_direction(p.tri_angle4, p.tri_phi4)  # evap4  Nb
 
-    # Oxide: a thin (~few-nm) conformal skin coating ALL exposed faces of al1
-    # — top and sides.  Physically it is far thinner than a voxel, so it is
-    # drawn one cell thick for visibility but is NOT treated as geometry: it
-    # does not shadow or block evaporation 2.
-    neigh = np.zeros_like(al1)
-    neigh[1:, :, :] |= al1[:-1, :, :]; neigh[:-1, :, :] |= al1[1:, :, :]
-    neigh[:, 1:, :] |= al1[:, :-1, :]; neigh[:, :-1, :] |= al1[:, 1:, :]
-    neigh[:, :, 1:] |= al1[:, :, :-1]; neigh[:, :, :-1] |= al1[:, :, 1:]
-    alox = neigh & (~al1) & (lab == EMPTY)
+        nb1 = _deposit(lab, xs, ys, zs, vox, d1, p.tri_t1, boxes)
+        lab_b = lab.copy(); lab_b[nb1] = RESIST
+        al2f = _deposit(lab_b, xs, ys, zs, vox, d2, p.tri_t2, boxes)
+        elec1 = nb1 | al2f                            # bottom electrode
 
-    # evaporation 2 sees only the al1 metal as additional solid (oxide is
-    # geometrically negligible and does not occlude the beam)
-    lab2 = lab.copy()
-    lab2[al1] = RESIST
-    al2 = _deposit(lab2, xs, ys, zs, vox, d2, p.t_metal2, boxes)
+        # Oxidation after evap1+evap2: skin on ALL exposed faces of the bottom
+        # electrode — i.e. on both the Nb and the Al that face free space.
+        alox = _oxide_skin(elec1)
 
-    z_floor = p.t_metal1 + p.t_metal2 + max(p.t_metal1 * 0.1, 3) + 2 * vox
+        lab_c = lab.copy(); lab_c[elec1] = RESIST     # electrode 2 sees elec1 solid
+        al3 = _deposit(lab_c, xs, ys, zs, vox, d3, p.tri_t3, boxes)
+        lab_d = lab_c.copy(); lab_d[al3] = RESIST
+        nb4 = _deposit(lab_d, xs, ys, zs, vox, d4, p.tri_t4, boxes)
+        elec2 = al3 | nb4                             # top electrode
+
+        al1, al2 = elec1, elec2                       # keep al1/al2 = the two electrodes
+        films = dict(nb1=nb1, al2=al2f, al3=al3, nb4=nb4)
+        meta_d1, meta_d2 = d1, d3                     # arrows: the two electrode beams
+        tri_dirs = dict(nb1=d1, al2=d2, al3=d3, nb4=d4)  # per-evaporation beams
+
+    z_floor = metal_sum + max(p.tri_t1 * 0.1 if trilayer else p.t_metal1 * 0.1, 3) + 2 * vox
     # Junction region: where the device tunnel junction is expected.  In Dolan
     # the open trench floods both depositions onto the leads; the actual JJ is
     # the under-bridge overlap, so confine the measurement to the bridge zone.
@@ -352,10 +389,14 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         junc_ymax = p.manhattan_wx / 2 + 4 * vox
     z_floor_v = z_floor
     meta = dict(R=R, grid_R=grid_R, z_top=z_top, resist_h=resist_h, vox=vox,
-                d1=d1, d2=d2, z_floor=z_floor_v, z_split=z_split,
+                d1=meta_d1, d2=meta_d2, z_floor=z_floor_v, z_split=z_split,
                 junc_xmax=junc_xmax, junc_ymax=junc_ymax, mode=p.mode,
+                stack="Trilayer" if trilayer else "Bilayer",
+                tri_dirs=tri_dirs,
                 max_cells=max_cells, min_vox=min_vox)
-    return DepositionResult(xs, ys, zs, vox, lab, al1, al2, alox, z_top, meta)
+    return DepositionResult(xs, ys, zs, vox, lab, al1, al2, alox, z_top, meta,
+                            stack="Trilayer" if trilayer else "Bilayer",
+                            films=films)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -469,3 +510,52 @@ def junction_footprint(r: DepositionResult, min_cells: int = 2):
     else:
         ox = oy = 0.0
     return junc, area, ox, oy, juncs
+
+
+# combination codes for the trilayer junction map
+COMBO_NONE, COMBO_NBAL, COMBO_ALAL, COMBO_NBNB = 0, 1, 2, 3
+_COMBO_NAMES = {COMBO_NBAL: "Nb-Al", COMBO_ALAL: "Al-Al", COMBO_NBNB: "Nb-Nb"}
+
+
+def junction_combos(r: DepositionResult, min_cells: int = 2):
+    """Classify each junction floor cell by the metal pair across the oxide.
+
+    For a trilayer (Nb/Al–AlOx–Al/Nb) the barrier separates electrode-1's TOP
+    metal (Al where the evap-2 Al sublayer is present, else Nb) from electrode-2's
+    BOTTOM metal (Al where the evap-3 Al sublayer is present, else Nb).  The pair
+    is binned (order-independent) into Nb-Al / Al-Al / Nb-Nb.
+
+    Returns ``(combos, combo_map)`` where ``combos`` maps name → {mask, cells,
+    area} and ``combo_map`` is an (Nx,Ny) int grid (COMBO_* codes).  For a
+    bilayer result returns ``({}, None)``.
+    """
+    if getattr(r, "stack", "Bilayer") != "Trilayer" or not r.films:
+        return {}, None
+    zs = r.zs
+    z_floor = r.meta.get("z_floor", r.z_top)
+    floor = (zs >= 0) & (zs < z_floor)
+    nb1f = r.films["nb1"][:, :, floor].any(axis=2)
+    al2f = r.films["al2"][:, :, floor].any(axis=2)
+    al3f = r.films["al3"][:, :, floor].any(axis=2)
+    nb4f = r.films["nb4"][:, :, floor].any(axis=2)
+
+    junc = (nb1f | al2f) & (al3f | nb4f)       # = electrode1 ∩ electrode2 (= al1f & al2f)
+    top1_is_al = al2f                           # electrode-1 top metal
+    bot2_is_al = al3f                           # electrode-2 bottom metal
+
+    combo_map = np.zeros(junc.shape, np.int8)
+    both_al = junc & top1_is_al & bot2_is_al
+    both_nb = junc & (~top1_is_al) & (~bot2_is_al)
+    mixed = junc & ~both_al & ~both_nb
+    combo_map[mixed] = COMBO_NBAL
+    combo_map[both_al] = COMBO_ALAL
+    combo_map[both_nb] = COMBO_NBNB
+
+    combos = {}
+    for code, name in _COMBO_NAMES.items():
+        m = combo_map == code
+        cnt = int(m.sum())
+        if cnt < min_cells:
+            continue
+        combos[name] = dict(mask=m, cells=cnt, area=cnt * r.vox * r.vox)
+    return combos, combo_map

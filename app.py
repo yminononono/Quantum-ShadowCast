@@ -25,7 +25,7 @@ from phi_cross_section import draw_junction_topview, draw_phi_scan
 from manhattan_check import manhattan_break_check
 from top_view import draw_top_view
 from junction_area import compute_junction_area
-from deposition3d import simulate, junction_footprint
+from deposition3d import simulate, junction_footprint, junction_combos
 import voxel_view as vv
 
 # ─── Ray-scan resolution presets:  name → (max_cells_per_axis, min_voxel_nm) ──
@@ -46,6 +46,11 @@ _DOLAN_KEYS = {"angle2": "d_angle2", "phi2": "d_phi2", "t_metal2": "d_tmetal2",
 _MANH_KEYS = {"angle2": "m_angle2", "phi2": "m_phi2",
               "t_metal2": "m_tmetal2",
               "manhattan_wx": "m_wx", "manhattan_wy": "m_wy"}
+# Trilayer sublayer params → widget keys (orthogonal to mode; applies to both).
+_TRI_KEYS = {"tri_t1": "tri_t1", "tri_t2": "tri_t2",
+             "tri_t3": "tri_t3", "tri_t4": "tri_t4",
+             "tri_angle2": "tri_a2", "tri_phi2": "tri_p2",
+             "tri_angle4": "tri_a4", "tri_phi4": "tri_p4"}
 # (slider min, max) per widget key — used to clamp loaded values so an
 # out-of-range file can never crash widget creation.
 _KEY_RANGE = {
@@ -56,6 +61,9 @@ _KEY_RANGE = {
     "d_bridge_pmma_gap": (0, 2000),
     "m_angle2": (-80, 80), "m_phi2": (-90, 180), "m_tmetal2": (10, 200),
     "m_wx": (100, 2000), "m_wy": (100, 2000),
+    "tri_t1": (10, 300), "tri_t2": (1, 100), "tri_t3": (1, 100),
+    "tri_t4": (10, 400), "tri_a2": (-80, 80), "tri_p2": (-90, 180),
+    "tri_a4": (-80, 80), "tri_p4": (-90, 180),
 }
 
 
@@ -72,6 +80,10 @@ def _apply_loaded_params(pdict, raydict):
     if mode_in in ("Dolan bridge", "Manhattan"):
         st.session_state["mode"] = mode_in
         applied += 1
+    stack_in = pdict.get("stack")
+    if stack_in in ("Bilayer", "Trilayer"):
+        st.session_state["stack"] = stack_in
+        applied += 1
     for fld in _SHARED_KEYS:
         if pdict.get(fld) is not None:
             _set_clamped_int(fld, pdict[fld]); applied += 1
@@ -80,6 +92,17 @@ def _apply_loaded_params(pdict, raydict):
     for fld, key in keymap.items():
         if pdict.get(fld) is not None:
             _set_clamped_int(key, pdict[fld]); applied += 1
+    tri_loaded = False
+    for fld, key in _TRI_KEYS.items():
+        if pdict.get(fld) is not None:
+            _set_clamped_int(key, pdict[fld]); applied += 1
+            if fld in ("tri_angle2", "tri_phi2", "tri_angle4", "tri_phi4"):
+                tri_loaded = True
+    if tri_loaded:
+        # Reproduce the saved evap-2 / evap-4 angles exactly: unlink them from
+        # the primary tilt so the loaded θ/φ are used as-is.
+        st.session_state["tri_link2"] = False
+        st.session_state["tri_link4"] = False
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -117,16 +140,66 @@ def _fmt_lj(lj_nH):
     return f"{lj_nH:.3f} nH"
 
 
+# Trilayer junction barrier composition (metal pair across the oxide).
+_COMBO_ORDER = ["Nb-Al", "Al-Al", "Nb-Nb"]
+
+
+def _combo_metrics(combos):
+    """Show a 3-column row of per-pair junction areas (Nb-Al / Al-Al / Nb-Nb)."""
+    st.markdown("**Junction barrier composition** — area by metal pair across the oxide")
+    cols = st.columns(3)
+    for col, name in zip(cols, _COMBO_ORDER):
+        area = combos.get(name, {}).get("area", 0.0) if combos else 0.0
+        col.metric(name, f"{area:.0f} nm²")
+
+
+# Subscript digits for the per-evaporation angle labels (θ₁ … φ₄).
+_SUB = {1: "₁", 2: "₂", 3: "₃", 4: "₄"}
+
+
+def _tri_thickness(label, key, default, lo, hi, step):
+    """Render one trilayer sublayer-thickness slider; return its value [nm]."""
+    st.session_state.setdefault(key, default)
+    return float(st.slider(label, lo, hi, step=step, key=key))
+
+
+def _tri_linked_tilt(idx, src_idx, prim_angle, prim_phi,
+                     a_key, p_key, a_range, p_range):
+    """Tilt control for evaporation 2 / 4 (the second sublayer of an electrode).
+
+    A "Same tilt as evap {src_idx}" checkbox (on by default) makes θ/φ follow
+    the electrode's primary tilt; unchecking it reveals independent θ/φ sliders
+    so each evaporation angle can be set freely.  Returns ``(angle, phi)``."""
+    link_key = f"tri_link{idx}"
+    st.session_state.setdefault(link_key, True)
+    linked = st.checkbox(f"Same tilt as evap {src_idx}", key=link_key,
+                         help=f"On → evap {idx} θ/φ follow evap {src_idx}.  "
+                              f"Off → set evap {idx} θ/φ independently.")
+    if linked:
+        st.caption(f"θ{_SUB[idx]} = {prim_angle:.0f}°  ·  φ{_SUB[idx]} = "
+                   f"{prim_phi:.0f}°   (following evap {src_idx})")
+        return float(prim_angle), float(prim_phi)
+    st.session_state.setdefault(a_key, int(round(prim_angle)))
+    angle = st.slider(f"Polar θ{_SUB[idx]} [°]", *a_range, step=1, key=a_key)
+    st.session_state.setdefault(p_key, int(round(prim_phi)))
+    phi = st.slider(f"Azimuthal φ{_SUB[idx]} [°]", *p_range, step=1, key=p_key)
+    return float(angle), float(phi)
+
+
 # Default value of every process-parameter widget key (used by Reset button).
 # Must match the per-widget `setdefault(...)` defaults in the sidebar below.
 _PARAM_DEFAULTS = {
     "mode": "Dolan bridge",
+    "stack": "Bilayer",
     "t_pmma": 250, "t_mma": 900, "undercut": 150,
     "angle1": -24, "phi1": 0, "t_metal1": 30,
     "d_angle2": 24, "d_phi2": 0, "d_tmetal2": 30,
     "d_bridge_len": 250, "d_bridge_w": 250, "d_bridge_pmma_gap": 0,
     "m_angle2": 60, "m_phi2": 90, "m_tmetal2": 30,
     "m_wx": 600, "m_wy": 600,
+    "tri_t1": 80, "tri_t2": 10, "tri_t3": 10, "tri_t4": 150,
+    "tri_a2": -24, "tri_p2": 0, "tri_a4": 24, "tri_p4": 0,
+    "tri_link2": True, "tri_link4": True,
     "res_level": "Standard (fast)",
 }
 
@@ -138,7 +211,8 @@ def _reset_defaults():
     st.session_state.pop("_imported_sig", None)   # allow re-loading later
 
 
-def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level):
+def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level,
+                  combos=None):
     """Serialise the full process (parameters + ray-scan + junction results)
     to a JSON string that can be re-loaded to restore every parameter."""
     juncs_out = [dict(area_nm2=float(j["area"]), overlap_x_nm=float(j["ox"]),
@@ -147,22 +221,27 @@ def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level):
                  for j in juncs]
     _jj = jj_electrical(ic)
     _lj = _jj["Lj_nH"]
+    results = {"junction_area_nm2": float(area),
+               "overlap_x_nm": float(ox), "overlap_y_nm": float(oy),
+               "n_junctions": int(njunc), "est_Ic_uA": float(ic),
+               "L_J_nH": (None if not np.isfinite(_lj) else float(_lj)),
+               "E_J_J": float(_jj["Ej_J"]),
+               "E_J_over_h_GHz": float(_jj["Ej_h_GHz"]),
+               "E_J_over_kB_K": float(_jj["Ej_kB_K"]),
+               "junctions": juncs_out}
+    if combos:
+        results["barrier_composition_nm2"] = {
+            name: float(d["area"]) for name, d in combos.items()}
     out = {
         "shadowcast": "v6",
         "mode": params.mode,
+        "stack": params.stack,
         "parameters": asdict(params),
         "ray_scan": {"resolution": res_level,
                      "max_cells": int(eng.meta.get("max_cells", 0)),
                      "min_vox_nm": float(eng.meta.get("min_vox", 0.0)),
                      "voxel_nm": float(eng.vox)},
-        "results": {"junction_area_nm2": float(area),
-                    "overlap_x_nm": float(ox), "overlap_y_nm": float(oy),
-                    "n_junctions": int(njunc), "est_Ic_uA": float(ic),
-                    "L_J_nH": (None if not np.isfinite(_lj) else float(_lj)),
-                    "E_J_J": float(_jj["Ej_J"]),
-                    "E_J_over_h_GHz": float(_jj["Ej_h_GHz"]),
-                    "E_J_over_kB_K": float(_jj["Ej_kB_K"]),
-                    "junctions": juncs_out},
+        "results": results,
     }
     return json.dumps(out, indent=2)
 
@@ -210,6 +289,19 @@ with st.sidebar:
     st.session_state.setdefault("mode", "Dolan bridge")
     mode = st.radio("Junction type", ["Dolan bridge", "Manhattan"],
                     horizontal=True, key="mode")
+    st.session_state.setdefault("stack", "Bilayer")
+    stack = st.radio(
+        "Deposition stack", ["Bilayer", "Trilayer"], horizontal=True,
+        key="stack",
+        help="Bilayer: evap 1 → oxidation → evap 2.  "
+             "Trilayer: Nb→Al → oxidation → Al→Nb (Nb/Al/Al/Nb), forming a "
+             "junction whose barrier metals are reported as Nb-Al / Al-Al / Nb-Nb.")
+
+    # Trilayer sublayer values.  The engine reads these only when
+    # stack == "Trilayer"; in that case the per-evaporation blocks below set
+    # them.  Bilayer leaves them at these inert defaults.
+    tri_t1, tri_t2, tri_t3, tri_t4 = 80.0, 10.0, 10.0, 150.0
+    tri_angle2 = tri_phi2 = tri_angle4 = tri_phi4 = 0.0
 
     st.subheader("Bilayer resist")
     st.caption("Recipe arxiv:2101.01453 — PMMA A-4 ≈250 nm / MMA EL-13 ≈900 nm")
@@ -227,23 +319,50 @@ with st.sidebar:
                          step=10, key="undercut")
     st.caption(f"Total resist: {t_pmma+t_mma} nm  ·  vertical shadow gap = MMA = {t_mma} nm")
 
-    st.subheader("Evaporation 1")
+    st.subheader("Evaporation 1" + (" — Nb" if stack == "Trilayer" else ""))
+    if stack == "Trilayer":
+        st.caption("Electrode-1 primary tilt θ₁/φ₁ (drives evap 1 Nb; evap 2 Al "
+                   "follows it unless you unlink it below).")
     st.session_state.setdefault("angle1", -24)
     angle1 = st.slider("Polar θ₁ [°]", -60, 60, step=1, key="angle1")
     st.session_state.setdefault("phi1", 0)
     phi1 = st.slider("Azimuthal φ₁ [°]", -90, 90, step=1, key="phi1")
     st.session_state.setdefault("t_metal1", 30)
-    t_metal1 = st.slider("Metal d₁ [nm]", 10, 200, step=5, key="t_metal1")
+    if stack == "Bilayer":
+        t_metal1 = st.slider("Metal d₁ [nm]", 10, 200, step=5, key="t_metal1")
+    else:
+        t_metal1 = float(st.session_state["t_metal1"])  # unused by trilayer engine
+        tri_t1 = _tri_thickness("Nb d₁ [nm]  (evap 1)", "tri_t1", 80, 10, 300, 5)
+
+        st.subheader("Evaporation 2 — Al")
+        tri_t2 = _tri_thickness("Al d₂ [nm]  (evap 2)", "tri_t2", 10, 1, 100, 1)
+        tri_angle2, tri_phi2 = _tri_linked_tilt(
+            2, 1, angle1, phi1, "tri_a2", "tri_p2", (-80, 80), (-90, 180))
 
     if mode == "Dolan bridge":
-        st.subheader("Evaporation 2")
+        _tri = stack == "Trilayer"
+        st.subheader("Evaporation 3 — Al" if _tri else "Evaporation 2")
+        if _tri:
+            st.caption("Electrode-2 primary tilt θ₃/φ₃ (drives evap 3 Al; evap 4 "
+                       "Nb follows it unless you unlink it below).")
         st.session_state.setdefault("d_angle2", 24)
-        angle2 = st.slider("Polar θ₂ [°]", -60, 60, step=1, key="d_angle2",
-                           help="Dolan = uniaxial tilt: φ₂=φ₁, θ₂=−θ₁")
+        angle2 = st.slider(f"Polar θ{'₃' if _tri else '₂'} [°]", -60, 60, step=1,
+                           key="d_angle2",
+                           help=("Electrode-2 tilt." if _tri else
+                                 "Dolan = uniaxial tilt: φ₂=φ₁, θ₂=−θ₁"))
         st.session_state.setdefault("d_phi2", 0)
-        phi2 = st.slider("Azimuthal φ₂ [°]", -90, 90, step=1, key="d_phi2")
+        phi2 = st.slider(f"Azimuthal φ{'₃' if _tri else '₂'} [°]", -90, 90,
+                         step=1, key="d_phi2")
         st.session_state.setdefault("d_tmetal2", 30)
-        t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="d_tmetal2")
+        if not _tri:
+            t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="d_tmetal2")
+        else:
+            t_metal2 = float(st.session_state["d_tmetal2"])  # unused by trilayer
+            tri_t3 = _tri_thickness("Al d₃ [nm]  (evap 3)", "tri_t3", 10, 1, 100, 1)
+            st.subheader("Evaporation 4 — Nb")
+            tri_t4 = _tri_thickness("Nb d₄ [nm]  (evap 4)", "tri_t4", 150, 10, 400, 5)
+            tri_angle4, tri_phi4 = _tri_linked_tilt(
+                4, 3, angle2, phi2, "tri_a4", "tri_p4", (-80, 80), (-90, 180))
 
         st.subheader("Geometry")
         st.markdown("Bridge slab dimensions:")
@@ -272,15 +391,29 @@ with st.sidebar:
         st.caption("Recipe arxiv:2605.19590 — two oblique beams (θ ≈ 60°), "
                    "azimuths ≈ 90° apart (Manhattan crossing).")
         # Evaporation 1 (θ₁, φ₁, d₁) comes from the shared section above.
-        st.subheader("Evaporation 2")
+        _tri = stack == "Trilayer"
+        st.subheader("Evaporation 3 — Al" if _tri else "Evaporation 2")
+        if _tri:
+            st.caption("Electrode-2 primary tilt θ₃/φ₃ (drives evap 3 Al; evap 4 "
+                       "Nb follows it unless you unlink it below).")
         st.session_state.setdefault("m_angle2", 60)
-        angle2 = st.slider("Polar θ₂ [°]", -80, 80, step=1, key="m_angle2",
+        angle2 = st.slider(f"Polar θ{'₃' if _tri else '₂'} [°]", -80, 80, step=1,
+                           key="m_angle2",
                            help="Tilt of the second beam from the surface normal.")
         st.session_state.setdefault("m_phi2", 90)
-        phi2 = st.slider("Azimuthal φ₂ [°]", -90, 180, step=1, key="m_phi2",
+        phi2 = st.slider(f"Azimuthal φ{'₃' if _tri else '₂'} [°]", -90, 180,
+                         step=1, key="m_phi2",
                          help="Default 90° → perpendicular to Evap 1")
         st.session_state.setdefault("m_tmetal2", 30)
-        t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="m_tmetal2")
+        if not _tri:
+            t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="m_tmetal2")
+        else:
+            t_metal2 = float(st.session_state["m_tmetal2"])  # unused by trilayer
+            tri_t3 = _tri_thickness("Al d₃ [nm]  (evap 3)", "tri_t3", 10, 1, 100, 1)
+            st.subheader("Evaporation 4 — Nb")
+            tri_t4 = _tri_thickness("Nb d₄ [nm]  (evap 4)", "tri_t4", 150, 10, 400, 5)
+            tri_angle4, tri_phi4 = _tri_linked_tilt(
+                4, 3, angle2, phi2, "tri_a4", "tri_p4", (-80, 80), (-90, 180))
 
         st.subheader("Geometry")
         st.markdown("Designed resist line openings (Manhattan crossing):")
@@ -321,6 +454,10 @@ params = ProcessParams(
     manhattan_theta=manhattan_theta, manhattan_delta=manhattan_delta,
     manhattan_h=manhattan_h,
     mode=mode,
+    stack=stack,
+    tri_t1=tri_t1, tri_t2=tri_t2, tri_t3=tri_t3, tri_t4=tri_t4,
+    tri_angle2=tri_angle2, tri_phi2=tri_phi2,
+    tri_angle4=tri_angle4, tri_phi4=tri_phi4,
 )
 res = compute_junction_area(params)
 
@@ -329,7 +466,8 @@ res = compute_junction_area(params)
 def _run_engine(ekey, _params, max_cells, min_vox):
     r = simulate(_params, max_cells=max_cells, min_vox=min_vox)
     jm, area, ox, oy, juncs = junction_footprint(r)
-    return r, jm, area, ox, oy, juncs
+    combos, combo_map = junction_combos(r)
+    return r, jm, area, ox, oy, juncs, combos, combo_map
 
 ekey = (params.mode, params.t_pmma, params.t_mma, params.undercut,
         params.angle1, params.phi1, params.t_metal1,
@@ -337,9 +475,12 @@ ekey = (params.mode, params.t_pmma, params.t_mma, params.undercut,
         params.bridge_len, params.bridge_w, params.bridge_pmma_gap,
         params.manhattan_wx, params.manhattan_wy,
         params.manhattan_theta, params.manhattan_delta, params.manhattan_h,
-        _max_cells, _min_vox)
+        _max_cells, _min_vox,
+        params.stack, params.tri_t1, params.tri_t2, params.tri_t3, params.tri_t4,
+        params.tri_angle2, params.tri_phi2, params.tri_angle4, params.tri_phi4)
 with st.spinner("Running 3D shadow-evaporation engine..."):
-    eng, eng_jm, eng_area, eng_ox, eng_oy, eng_juncs = _run_engine(
+    (eng, eng_jm, eng_area, eng_ox, eng_oy, eng_juncs,
+     eng_combos, eng_combo_map) = _run_engine(
         ekey, params, _max_cells, _min_vox)
 eng_njunc = len(eng_juncs)
 # Engine-based critical current (jc = 10 kA/cm², Ambegaokar-Baratoff),
@@ -354,7 +495,8 @@ with _save_box:
     st.download_button(
         "💾 Save parameters + results",
         data=_build_export(params, eng, eng_area, eng_ox, eng_oy,
-                           eng_njunc, eng_ic, eng_juncs, res_level),
+                           eng_njunc, eng_ic, eng_juncs, res_level,
+                           combos=eng_combos),
         file_name="shadowcast_params.json", mime="application/json",
         use_container_width=True)
 
@@ -418,7 +560,8 @@ with tab1:
         with st.spinner("Locating slice..."):
             figloc = vv.render_top_view(eng, eng_jm, view_half=cs_half,
                                         juncs=eng_juncs,
-                                        slice_line=(slice_angle, slice_pos))
+                                        slice_line=(slice_angle, slice_pos),
+                                        combo_map=eng_combo_map)
             st.pyplot(figloc, use_container_width=True)
             plt.close(figloc)
 
@@ -453,6 +596,9 @@ with tab1:
     e3.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
               help=f"E_J = (Φ₀/2π)·Iᶜ = {eng_jj['Ej_kB_K']:.2f} K·k_B")
 
+    if params.stack == "Trilayer":
+        _combo_metrics(eng_combos)
+
     if eng_area <= 0:
         if mode == "Manhattan":
             _t = np.tan(np.radians(params.manhattan_theta))
@@ -472,10 +618,17 @@ with tab1:
     else:
         st.success(f"✅ Junction formed: {eng_ox:.0f} × {eng_oy:.0f} nm (engine)")
 
-    st.info(
-        "**Colour guide:**  grey = substrate · tan = resist (PMMA/MMA) · "
-        "blue = Al #1 · red = Al #2 · purple = AlOx · teal = junction (Al1∩Al2)"
-    )
+    if params.stack == "Trilayer":
+        st.info(
+            "**Colour guide (trilayer):**  grey = substrate · tan = resist · "
+            "amber = Nb · light-blue = Al · purple = AlOx.  Junction barrier: "
+            "gold = Nb-Al · teal = Al-Al · raspberry = Nb-Nb."
+        )
+    else:
+        st.info(
+            "**Colour guide:**  grey = substrate · tan = resist (PMMA/MMA) · "
+            "blue = Al #1 · red = Al #2 · purple = AlOx · teal = junction (Al1∩Al2)"
+        )
 
 # ═══ TAB 2: Top View ═════════════════════════════════════════════
 with tab2:
@@ -494,14 +647,14 @@ with tab2:
 
     with st.spinner("Rendering staged top view..."):
         figts = vv.render_top_stages(eng, eng_jm, view_half=top_half,
-                                     juncs=eng_juncs)
+                                     juncs=eng_juncs, combo_map=eng_combo_map)
         st.pyplot(figts, use_container_width=True)
         plt.close(figts)
 
     st.markdown("**Final floor deposit** (combined)")
     with st.spinner("Rendering floor map..."):
         figt = vv.render_top_view(eng, eng_jm, view_half=top_half,
-                                  juncs=eng_juncs)
+                                  juncs=eng_juncs, combo_map=eng_combo_map)
         st.pyplot(figt, use_container_width=True)
         plt.close(figt)
 
@@ -526,7 +679,8 @@ with tab3:
     with col1:
         st.markdown("**Engine junction map** (floor deposit, JJ highlighted)")
         with st.spinner("Rendering..."):
-            fig3 = vv.render_top_view(eng, eng_jm, juncs=eng_juncs)
+            fig3 = vv.render_top_view(eng, eng_jm, juncs=eng_juncs,
+                                      combo_map=eng_combo_map)
             st.pyplot(fig3, use_container_width=True)
             plt.close(fig3)
     with col2:
@@ -658,7 +812,9 @@ with tab_scan:
         return (p.mode, p.t_pmma, p.t_mma, p.undercut, p.angle1, p.phi1,
                 p.t_metal1, p.angle2, p.phi2, p.t_metal2, p.bridge_len,
                 p.bridge_w, p.bridge_pmma_gap, p.manhattan_wx, p.manhattan_wy,
-                p.manhattan_theta, p.manhattan_delta, p.manhattan_h, _smc, _smv)
+                p.manhattan_theta, p.manhattan_delta, p.manhattan_h, _smc, _smv,
+                p.stack, p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4,
+                p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4)
 
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
@@ -785,6 +941,8 @@ with tab5:
     j2.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
               help="E_J = (Φ₀/2π)·Iᶜ = ħ·Iᶜ/2e")
     j3.metric("E_J / k_B", f"{eng_jj['Ej_kB_K']:.2f} K")
+    if params.stack == "Trilayer":
+        _combo_metrics(eng_combos)
     st.caption(
         f"Engine voxel size = {eng.vox:.1f} nm.  Junction area is the true "
         "Al1∩Al2 overlap (Σ overlapping voxels × voxel²), exact for "
@@ -842,6 +1000,19 @@ with tab5:
             "Josephson energy E_J/k_B [K]":  eng_jj["Ej_kB_K"],
             "Engine voxel [nm]":     eng.vox,
         }
+    if params.stack == "Trilayer":
+        detail["Stack"] = "Trilayer (Nb/Al/Al/Nb)"
+        detail["Nb d₁ [nm] (evap1)"] = params.tri_t1
+        detail["Al d₂ [nm] (evap2)"] = params.tri_t2
+        detail["Al d₃ [nm] (evap3)"] = params.tri_t3
+        detail["Nb d₄ [nm] (evap4)"] = params.tri_t4
+        detail["Evap2 θ₂ [°]"] = params.tri_angle2
+        detail["Evap2 φ₂ [°]"] = params.tri_phi2
+        detail["Evap4 θ₄ [°]"] = params.tri_angle4
+        detail["Evap4 φ₄ [°]"] = params.tri_phi4
+        for name in _COMBO_ORDER:
+            detail[f"Barrier {name} area [nm²]"] = float(
+                eng_combos.get(name, {}).get("area", 0.0))
     num_detail = {k:v for k,v in detail.items() if isinstance(v, (int,float))}
     str_detail = {k:v for k,v in detail.items() if isinstance(v, str)}
     rows = [(k, v) for k,v in str_detail.items()]
@@ -853,7 +1024,8 @@ with tab5:
     st.download_button(
         "💾 Export parameters + results (re-loadable)",
         data=_build_export(params, eng, eng_area, eng_ox, eng_oy,
-                           eng_njunc, eng_ic, eng_juncs, res_level),
+                           eng_njunc, eng_ic, eng_juncs, res_level,
+                           combos=eng_combos),
         file_name="shadowcast_params.json", mime="application/json",
         help="Re-load this file with the sidebar uploader to restore every "
              "parameter.")

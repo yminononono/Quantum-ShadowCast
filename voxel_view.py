@@ -24,7 +24,8 @@ from matplotlib.colors import ListedColormap, BoundaryNorm, to_rgba
 from matplotlib.patches import Rectangle
 from matplotlib.collections import PatchCollection
 
-from deposition3d import EMPTY, RESIST, SUBSTRATE, DepositionResult
+from deposition3d import (EMPTY, RESIST, SUBSTRATE, DepositionResult,
+                          COMBO_NBAL, COMBO_ALAL, COMBO_NBNB)
 
 # ── global look & feel ─────────────────────────────────────────
 plt.rcParams.update({
@@ -58,6 +59,12 @@ C_AL1 = 4
 C_AL2 = 5
 C_ALOX = 6
 C_JUNC = 7
+# ── trilayer extras ───────────────────────────────────────────────
+C_NB = 8            # Nb sublayer (trilayer cross-section, by material)
+C_AL = 9            # Al sublayer (trilayer cross-section, by material)
+C_JUNC_NBAL = 10    # junction barrier between Nb and Al
+C_JUNC_ALAL = 11    # junction barrier between Al and Al
+C_JUNC_NBNB = 12    # junction barrier between Nb and Nb
 
 _COLORS = {
     C_EMPTY:     "#0e1117",   # = background (invisible)
@@ -68,6 +75,11 @@ _COLORS = {
     C_AL2:       "#f72585",
     C_ALOX:      _OX_LINE,
     C_JUNC:      "#2ce0b3",
+    C_NB:        "#ffb703",   # niobium (amber)
+    C_AL:        "#8ecae6",   # aluminium (light blue)
+    C_JUNC_NBAL: "#ffd166",   # Nb–Al overlap (gold)
+    C_JUNC_ALAL: "#2ce0b3",   # Al–Al overlap (teal)
+    C_JUNC_NBNB: "#ef476f",   # Nb–Nb overlap (raspberry)
 }
 _LABELS = {
     C_EMPTY:     "empty",
@@ -78,9 +90,18 @@ _LABELS = {
     C_AL2:       "Al #2",
     C_ALOX:      "AlOx",
     C_JUNC:      "junction (Al1∩Al2)",
+    C_NB:        "Nb",
+    C_AL:        "Al",
+    C_JUNC_NBAL: "junction Nb–Al",
+    C_JUNC_ALAL: "junction Al–Al",
+    C_JUNC_NBNB: "junction Nb–Nb",
 }
 
-_N = 8
+# combo-code → junction category, for trilayer overlay colouring
+_COMBO_CAT = {COMBO_NBAL: C_JUNC_NBAL, COMBO_ALAL: C_JUNC_ALAL,
+              COMBO_NBNB: C_JUNC_NBNB}
+
+_N = 13
 _CMAP = ListedColormap([_COLORS[i] for i in range(_N)])
 _NORM = BoundaryNorm(np.arange(-0.5, _N + 0.5, 1.0), _CMAP.N)
 
@@ -321,8 +342,12 @@ def _oblique_columns(r, angle_deg, offset):
 
 
 def _slice_planes(r, angle_deg, offset):
-    """Return (solid2d, al1, al2, alox, h_axis, h_label, ix, iy) for an oblique
-    slice at azimuth ``angle_deg`` and perpendicular ``offset`` [nm]."""
+    """Return (solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d) for an
+    oblique slice at azimuth ``angle_deg`` and perpendicular ``offset`` [nm].
+
+    ``films2d`` is a dict {nb1, al2, al3, nb4} of (n_h, Nz) bool slices for a
+    trilayer result (so the cross section can be coloured by material), else
+    ``None`` for a bilayer."""
     ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
     solid2d = r.solid[ix, iy, :].copy()
     al1 = r.al1[ix, iy, :].copy()
@@ -334,8 +359,27 @@ def _slice_planes(r, angle_deg, offset):
         al1[out, :] = False
         al2[out, :] = False
         alox[out, :] = False
+    films2d = None
+    if getattr(r, "stack", "Bilayer") == "Trilayer" and r.films:
+        films2d = {}
+        for k, g in r.films.items():
+            sl = g[ix, iy, :].copy()
+            if out.any():
+                sl[out, :] = False
+            films2d[k] = sl
     label = f"distance along slice  [nm]   (α = {angle_deg:.0f}°)"
-    return solid2d, al1, al2, alox, s, label, ix, iy
+    return solid2d, al1, al2, alox, s, label, ix, iy, films2d
+
+
+def _paint_trilayer_metal(cat, films2d):
+    """Colour trilayer metal cells by material (Nb / Al), deposition order.
+
+    Later sublayers overwrite earlier ones where they share a cell, so the
+    physically-upper film wins (matches the deposition sequence)."""
+    cat[films2d["nb1"]] = C_NB     # electrode-1 lower (Nb)
+    cat[films2d["al2"]] = C_AL     # electrode-1 upper (Al)
+    cat[films2d["al3"]] = C_AL     # electrode-2 lower (Al)
+    cat[films2d["nb4"]] = C_NB     # electrode-2 upper (Nb)
 
 
 def _resist_cat_cross(cat, solid2d, zs, z_split):
@@ -355,15 +399,21 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
     z_split = r.meta.get("z_split", r.z_top)
-    solid2d, al1, al2, alox, h_axis, h_label, ix, iy = _slice_planes(
+    solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d = _slice_planes(
         r, angle_deg, offset)
 
     cat = np.full(solid2d.shape, C_EMPTY, np.int8)
     cat[solid2d == SUBSTRATE] = C_SUBSTRATE
     _resist_cat_cross(cat, solid2d, zs, z_split)
-    cat[al1] = C_AL1
-    cat[al2] = C_AL2
-    if junc_mask is not None:
+    if films2d is not None:               # trilayer: colour by material (Nb/Al)
+        _paint_trilayer_metal(cat, films2d)
+    else:
+        cat[al1] = C_AL1
+        cat[al2] = C_AL2
+    if junc_mask is not None and films2d is None:
+        # Bilayer: highlight the Al1∩Al2 overlap column.  For trilayer the
+        # material colouring + oxide barrier already show the junction stack,
+        # and the Nb-Al/Al-Al/Nb-Nb split lives in the top / junction views.
         jc = junc_mask[ix, iy]
         junc2 = jc[:, None] & (zs[None, :] >= 0) & (zs[None, :] < zf)
         cat[junc2] = C_JUNC
@@ -379,9 +429,11 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     # interface (so Al2 sits on top of the barrier) and the metal corners.
     _oxide_edges_cs(ax, al1, (solid2d == RESIST) | (solid2d == SUBSTRATE),
                     h_axis, zs)
-    _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), hlim, vtop, _COLORS[C_AL1],
+    c_e1 = _COLORS[C_NB] if films2d is not None else _COLORS[C_AL1]
+    c_e2 = _COLORS[C_AL] if films2d is not None else _COLORS[C_AL2]
+    _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), hlim, vtop, c_e1,
                    "evap 1", side=-1)
-    _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), hlim, vtop, _COLORS[C_AL2],
+    _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), hlim, vtop, c_e2,
                    "evap 2", side=+1)
     present = [c for c in sorted(np.unique(cat).tolist()) if c != C_EMPTY]
     _legend(fig, present)
@@ -391,15 +443,21 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
 
 def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None,
                   view_half=None, zmax=None):
-    """5-panel staged cross section: resist → evap1 → oxidation → evap2 → lift-off.
+    """Staged cross section sliced at in-plane azimuth ``angle_deg`` with
+    perpendicular ``offset`` [nm].
 
-    Sliced at in-plane azimuth ``angle_deg`` with perpendicular ``offset`` [nm]."""
+    Bilayer → 5 panels: resist → evap1 → oxidation → evap2 → lift-off.
+    Trilayer → 7 panels: resist → evap1 (Nb) → evap2 (Al) → oxidation →
+    evap3 (Al) → evap4 (Nb) → lift-off."""
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
     z_split = r.meta.get("z_split", r.z_top)
-    solid2d, al1, al2, alox, h_axis, h_label, ix, iy = _slice_planes(
+    solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d = _slice_planes(
         r, angle_deg, offset)
     (ux, uy), _ = _slice_dirs(angle_deg)
+    tri = films2d is not None
+    c_e1 = _COLORS[C_NB] if tri else _COLORS[C_AL1]
+    c_e2 = _COLORS[C_AL] if tri else _COLORS[C_AL2]
 
     if junc_mask is not None:
         jc = junc_mask[ix, iy]
@@ -416,27 +474,95 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
     grounded[:, z0:] = np.cumprod(metal_any[:, z0:].astype(np.int8),
                                   axis=1).astype(bool)
 
+    def _paint_metal(cat, inc_al1, inc_al2, mask=None):
+        """Paint electrode metal — by material (Nb/Al) for trilayer, else
+        per-electrode (Al #1 / Al #2).  ``mask`` (e.g. grounded) gates cells."""
+        def g(m):
+            return m if mask is None else (m & mask)
+        if tri:
+            if inc_al1:
+                cat[g(films2d["nb1"])] = C_NB
+                cat[g(films2d["al2"])] = C_AL
+            if inc_al2:
+                cat[g(films2d["al3"])] = C_AL
+                cat[g(films2d["nb4"])] = C_NB
+        else:
+            if inc_al1: cat[g(al1)] = C_AL1
+            if inc_al2: cat[g(al2)] = C_AL2
+
     def cat_build(inc_al1=False, inc_al2=False,
                   liftoff=False, emphasise_junc=False):
         cat = np.full(solid2d.shape, C_EMPTY, np.int8)
         cat[sub] = C_SUBSTRATE
         if not liftoff:
             _resist_cat_cross(cat, solid2d, zs, z_split)
-            if inc_al1: cat[al1] = C_AL1
-            if inc_al2: cat[al2] = C_AL2
+            _paint_metal(cat, inc_al1, inc_al2)
         else:
             # Lift-off: strip the resist; only grounded metal survives.
-            cat[al1 & grounded] = C_AL1
-            cat[al2 & grounded] = C_AL2
-            if emphasise_junc and junc2 is not None:
+            _paint_metal(cat, True, True, mask=grounded)
+            if emphasise_junc and junc2 is not None and not tri:
                 cat[junc2 & grounded] = C_JUNC
         return cat
 
+    ox_excl_pre = (solid2d == RESIST) | sub
+    hlim = _zoom_half(r, view_half)
+    vlim = (zs[0], zmax) if zmax is not None else None
+    vtop = zmax if zmax is not None else float(zs[-1])
+
+    # ── trilayer: 7-panel sequence (Evap1→Evap2→Ox→Evap3→Evap4→Lift-off) ──
+    if tri:
+        td = r.meta.get("tri_dirs", {})
+        order = ["nb1", "al2", "al3", "nb4"]      # deposition order
+        cols = {"nb1": C_NB, "al2": C_AL, "al3": C_AL, "nb4": C_NB}
+
+        def cat_tri(inc, liftoff=False):
+            cat = np.full(solid2d.shape, C_EMPTY, np.int8)
+            cat[sub] = C_SUBSTRATE
+            if liftoff:                            # resist stripped → grounded metal only
+                for name in order:
+                    cat[films2d[name] & grounded] = cols[name]
+            else:
+                _resist_cat_cross(cat, solid2d, zs, z_split)
+                for name in order:                 # later films overwrite earlier
+                    if name in inc:
+                        cat[films2d[name]] = cols[name]
+            return cat
+
+        # (title, category grid, oxide phase, arrow=(film, colour, label, side))
+        panels = [
+            ("1. Resist only",   cat_tri([]),                           None,   None),
+            ("2. Evap 1 (Nb)",   cat_tri(["nb1"]),                      None,   ("nb1", c_e1, "evap 1", -1)),
+            ("3. Evap 2 (Al)",   cat_tri(["nb1", "al2"]),               None,   ("al2", c_e2, "evap 2", -1)),
+            ("4. Oxidation",     cat_tri(["nb1", "al2"]),               "pre",  None),
+            ("5. Evap 3 (Al)",   cat_tri(["nb1", "al2", "al3"]),        "pre",  ("al3", c_e2, "evap 3", +1)),
+            ("6. Evap 4 (Nb)",   cat_tri(["nb1", "al2", "al3", "nb4"]), "pre",  ("nb4", c_e1, "evap 4", +1)),
+            ("7. Lift-off (JJ)", cat_tri(order, liftoff=True),          "post", None),
+        ]
+        fig, axes = plt.subplots(2, 4, figsize=(17.5, 8.0),
+                                 sharex=True, sharey=True)
+        axes = axes.ravel()
+        for ax, (title, cat, ox, arrow) in zip(axes, panels):
+            _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title,
+                  hlim=hlim, vlim=vlim)
+            if ox == "pre":       # resist still blocks oxidation
+                _oxide_edges_cs(ax, al1, ox_excl_pre, h_axis, zs)
+            elif ox == "post":    # lift-off: only grounded electrode-1 oxidises
+                _oxide_edges_cs(ax, al1 & grounded, sub, h_axis, zs)
+            if arrow is not None:
+                name, col, lbl, side = arrow
+                d = td.get(name, r.meta["d1"])
+                _beam_arrow_cs(ax, d, (ux, uy), hlim, vtop, col, lbl, side=side)
+        for ax in axes[len(panels):]:
+            ax.axis("off")       # unused cells (7 stages in a 2×4 grid)
+        _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP, C_NB, C_AL])
+        fig.tight_layout(rect=[0, 0.05, 1, 1])
+        return fig
+
+    # ── bilayer: 5-panel sequence (Evap1→Ox→Evap2→Lift-off) ──
     # oxide appears once Al1 is present and stays through evap-2 / lift-off.
     # Drawn as a thin skin on the exposed Al1 faces: before lift-off the resist
     # (and substrate) block oxidation; at lift-off the resist is gone so only
     # the surviving (grounded) Al1 oxidises against air / Al2.
-    ox_excl_pre = (solid2d == RESIST) | sub
     panels = [
         ("1. Resist only",   cat_build(),                                False),
         ("2. Evaporation 1", cat_build(inc_al1=True),                    False),
@@ -444,10 +570,6 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
         ("4. Evaporation 2", cat_build(inc_al1=True, inc_al2=True),      True),
         ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True), True),
     ]
-
-    hlim = _zoom_half(r, view_half)
-    vlim = (zs[0], zmax) if zmax is not None else None
-    vtop = zmax if zmax is not None else float(zs[-1])
     fig, axes = plt.subplots(2, 3, figsize=(13.5, 8.0), sharex=True, sharey=True)
     axes = axes.ravel()
     for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
@@ -459,10 +581,10 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
                 _oxide_edges_cs(ax, al1, ox_excl_pre, h_axis, zs)
         if k in (1, 2):       # evap-1 related panels
             _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), hlim, vtop,
-                           _COLORS[C_AL1], "evap 1", side=-1)
+                           c_e1, "evap 1", side=-1)
         if k == 3:            # evap-2 panel
             _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), hlim, vtop,
-                           _COLORS[C_AL2], "evap 2", side=+1)
+                           c_e2, "evap 2", side=+1)
     axes[-1].axis("off")      # 6th cell unused (5 stages)
     _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP,
                   C_AL1, C_AL2, C_JUNC])
@@ -490,6 +612,17 @@ def _floor_maps(r):
     return al1f, al2f, aloxf, upper_resist, lower_resist
 
 
+def _film_floor_maps(r):
+    """Per-film floor footprints {nb1f, al2f, al3f, nb4f} as (Nx,Ny) bools for a
+    trilayer result, else ``None`` (bilayer)."""
+    if getattr(r, "stack", "Bilayer") != "Trilayer" or not r.films:
+        return None
+    zs = r.zs
+    zf = r.meta.get("z_floor", r.z_top)
+    floor = (zs >= 0) & (zs < zf)
+    return {k: g[:, :, floor].any(axis=2) for k, g in r.films.items()}
+
+
 def _resist_cat_top(cat, upper_resist, lower_resist):
     """Paint the resist opening pattern (incl. undercut shelf) from above."""
     # solid resist (both layers) = upper imaging colour
@@ -500,27 +633,86 @@ def _resist_cat_top(cat, upper_resist, lower_resist):
 
 
 def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
-                      juncs=None):
-    """5-panel staged top view: resist (with undercut) → evap1 → ox → evap2 → lift-off.
+                      juncs=None, combo_map=None):
+    """Staged top view (resist with undercut → … → lift-off).
 
     The resist / undercut pattern is drawn opaque underneath, then the deposited
     metal is layered on top semi-transparently so the resist mask stays visible.
     The AlOx barrier is filled (as squares) on top of the Al1 footprint, and any
     separate Josephson junctions are labelled J1, J2, … in the lift-off panel.
+    For a trilayer, pass ``combo_map`` to colour the junction by Nb-Al / Al-Al /
+    Nb-Nb in the lift-off panel.  A trilayer expands to 7 panels:
+    resist → evap1 (Nb) → evap2 (Al) → oxidation → evap3 (Al) → evap4 (Nb) →
+    lift-off.
     """
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
+    films2d = _film_floor_maps(r)
 
     # Opaque resist base (substrate visible through the open holes).
     resist_base = np.full(al1f.shape, C_EMPTY, np.int8)
     _resist_cat_top(resist_base, upper_resist, lower_resist)
     empty_base = np.full(al1f.shape, C_EMPTY, np.int8)
 
+    # ── trilayer: 7-panel top-view sequence ──
+    if films2d is not None:
+        td = r.meta.get("tri_dirs", {})
+        order = ["nb1", "al2", "al3", "nb4"]
+        cols = {"nb1": C_NB, "al2": C_AL, "al3": C_AL, "nb4": C_NB}
+        elec2f = films2d["al3"] | films2d["nb4"]      # electrode-2 floor footprint
+
+        def metal_tri(inc, emphasise_junc=False):
+            cat = np.full(al1f.shape, C_EMPTY, np.int8)
+            for name in order:                         # later films overwrite earlier
+                if name in inc:
+                    cat[films2d[name]] = cols[name]
+            if emphasise_junc:
+                _paint_junction_top(cat, junc_mask, combo_map)
+            return cat
+
+        ox_post = aloxf & ~elec2f          # electrode-2 sits over the barrier
+        # (title, base, metal grid, alpha, oxide mask, label junctions, arrow)
+        panels = [
+            ("1. Resist only", resist_base, metal_tri([]),                            0.62, None,    False, None),
+            ("2. Evap 1 (Nb)", resist_base, metal_tri(["nb1"]),                       0.62, None,    False, ("nb1", C_NB, "evap 1")),
+            ("3. Evap 2 (Al)", resist_base, metal_tri(["nb1", "al2"]),                0.62, None,    False, ("al2", C_AL, "evap 2")),
+            ("4. Oxidation",   resist_base, metal_tri(["nb1", "al2"]),                0.62, aloxf,   False, None),
+            ("5. Evap 3 (Al)", resist_base, metal_tri(["nb1", "al2", "al3"]),         0.62, ox_post, False, ("al3", C_AL, "evap 3")),
+            ("6. Evap 4 (Nb)", resist_base, metal_tri(["nb1", "al2", "al3", "nb4"]),  0.62, ox_post, False, ("nb4", C_NB, "evap 4")),
+            ("7. Lift-off (JJ)", empty_base,
+             metal_tri(order, emphasise_junc=True),                                  1.00, ox_post, True,  None),
+        ]
+        hw = _top_half(r, view_half)
+        fig, axes = plt.subplots(2, 4, figsize=(17.5, 9.0),
+                                 sharex=True, sharey=True)
+        axes = axes.ravel()
+        for ax, (title, base, mcat, malpha, ox_mask, lbl, arrow) in zip(axes, panels):
+            _draw(ax, base, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
+            _overlay_cats(ax, mcat, r.xs, r.ys, _TRI_METAL_CATS,
+                          alpha=malpha, zorder=3)
+            if ox_mask is not None:
+                _oxide_fill(ax, ox_mask, r.xs, r.ys, alpha=0.5, zorder=4)
+            ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
+            ax.set_aspect("equal")
+            if lbl:
+                _junc_labels(ax, juncs)
+            if arrow is not None:
+                name, col, albl = arrow
+                d = td.get(name, r.meta["d1"])
+                _beam_arrow_top(ax, d, hw, _COLORS[col], albl)
+        for ax in axes[len(panels):]:
+            ax.axis("off")
+        _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_NB, C_AL,
+                      C_JUNC_NBAL, C_JUNC_ALAL, C_JUNC_NBNB])
+        fig.tight_layout(rect=[0, 0.05, 1, 1])
+        return fig
+
+    # ── bilayer: 5-panel top-view sequence ──
     def metal_cat(inc_al1=False, inc_al2=False, emphasise_junc=False):
         cat = np.full(al1f.shape, C_EMPTY, np.int8)
         if inc_al1: cat[al1f] = C_AL1
         if inc_al2: cat[al2f] = C_AL2
-        if emphasise_junc and junc_mask is not None:
-            cat[junc_mask] = C_JUNC
+        if emphasise_junc:
+            _paint_junction_top(cat, junc_mask, combo_map)
         return cat
 
     ox_pre = aloxf                       # oxidation: oxide over all Al1
@@ -540,8 +732,7 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
     axes = axes.ravel()
     for k, (ax, (title, base, mcat, malpha, ox_mask, lbl)) in enumerate(zip(axes, panels)):
         _draw(ax, base, r.xs, r.ys, "x  [nm]", "y  [nm]", title)
-        _overlay_cats(ax, mcat, r.xs, r.ys,
-                      [C_AL1, C_AL2, C_JUNC], alpha=malpha, zorder=3)
+        _overlay_cats(ax, mcat, r.xs, r.ys, _METAL_CATS, alpha=malpha, zorder=3)
         if ox_mask is not None:
             _oxide_fill(ax, ox_mask, r.xs, r.ys, alpha=0.5, zorder=4)
         ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
@@ -553,7 +744,11 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
         if k == 3:
             _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
     axes[-1].axis("off")      # 6th cell unused (5 stages)
-    _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_AL1, C_AL2, C_JUNC])
+    if combo_map is not None:
+        _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_AL1, C_AL2,
+                      C_JUNC_NBAL, C_JUNC_ALAL, C_JUNC_NBNB])
+    else:
+        _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_AL1, C_AL2, C_JUNC])
     fig.tight_layout(rect=[0, 0.05, 1, 1])
     return fig
 
@@ -582,13 +777,29 @@ def _slice_marker(ax, slice_line, hw):
             rotation_mode="anchor", fontweight="bold", zorder=10)
 
 
+_METAL_CATS = [C_AL1, C_AL2, C_JUNC, C_JUNC_NBAL, C_JUNC_ALAL, C_JUNC_NBNB]
+# trilayer top-view metals (by material) + junction-combo overlays
+_TRI_METAL_CATS = [C_NB, C_AL, C_JUNC_NBAL, C_JUNC_ALAL, C_JUNC_NBNB]
+
+
+def _paint_junction_top(mcat, junc_mask, combo_map):
+    """Colour the junction footprint: by Nb-Al/Al-Al/Nb-Nb combo for a trilayer
+    (``combo_map`` given), else a single junction colour."""
+    if combo_map is not None:
+        for code, cat in _COMBO_CAT.items():
+            mcat[combo_map == code] = cat
+    elif junc_mask is not None:
+        mcat[junc_mask] = C_JUNC
+
+
 def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
-                    juncs=None, slice_line=None):
+                    juncs=None, slice_line=None, combo_map=None):
     """Single top-down floor map: resist/undercut (opaque) with Al1 / Al2 /
     junction layered on top semi-transparently so the resist mask stays visible.
     The AlOx barrier is filled on top of Al1 and separate junctions are labelled.
     When ``slice_line=(angle_deg, offset)`` is given, the (possibly rotated)
-    cross-section cut is marked with a dashed line."""
+    cross-section cut is marked with a dashed line.  For a trilayer, pass
+    ``combo_map`` to colour the junction by Nb-Al / Al-Al / Nb-Nb."""
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
     base = np.full(al1f.shape, C_EMPTY, np.int8)
     _resist_cat_top(base, upper_resist, lower_resist)
@@ -596,14 +807,12 @@ def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
     mcat = np.full(al1f.shape, C_EMPTY, np.int8)
     mcat[al1f] = C_AL1
     mcat[al2f] = C_AL2
-    if junc_mask is not None:
-        mcat[junc_mask] = C_JUNC
+    _paint_junction_top(mcat, junc_mask, combo_map)
 
     hw = _top_half(r, view_half)
     fig, ax = plt.subplots(figsize=(6.0, 5.4))
     _draw(ax, base, r.xs, r.ys, "x  [nm]", "y  [nm]", "Top view (floor deposit)")
-    _overlay_cats(ax, mcat, r.xs, r.ys, [C_AL1, C_AL2, C_JUNC],
-                  alpha=0.62, zorder=3)
+    _overlay_cats(ax, mcat, r.xs, r.ys, _METAL_CATS, alpha=0.62, zorder=3)
     _oxide_fill(ax, aloxf & ~al2f, r.xs, r.ys, alpha=0.5, zorder=4)
     ax.set_xlim(-hw, hw); ax.set_ylim(-hw, hw)
     ax.set_aspect("equal")
@@ -612,7 +821,8 @@ def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
     _beam_arrow_top(ax, r.meta["d1"], hw, _COLORS[C_AL1], "evap 1")
     _beam_arrow_top(ax, r.meta["d2"], hw, _COLORS[C_AL2], "evap 2")
     present = [c for c in (C_RESIST_LO, C_RESIST_UP) if (base == c).any()]
-    present += [c for c in (C_AL1, C_AL2, C_JUNC) if (mcat == c).any()]
+    present += [c for c in (C_AL1, C_AL2) + tuple(_COMBO_CAT.values()) + (C_JUNC,)
+                if (mcat == c).any()]
     if present:
         _legend(fig, present)
     fig.tight_layout(rect=[0, 0.08, 1, 1])

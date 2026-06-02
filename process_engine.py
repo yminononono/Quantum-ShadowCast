@@ -90,6 +90,23 @@ class ProcessParams:
     # ── Mode ──────────────────────────────────────────────────
     mode: str = "Dolan bridge"    # "Dolan bridge" | "Manhattan"
 
+    # ── Deposition stack ──────────────────────────────────────
+    # "Bilayer"  : evap1 → oxidation → evap2  (the classic setup).
+    # "Trilayer" : evap1(Nb)→evap2(Al)→oxidation→evap3(Al)→evap4(Nb).
+    #   Electrode 1 (bottom) = Nb(evap1) + Al(evap2) at the Evaporation-1 angle;
+    #   Electrode 2 (top)    = Al(evap3) + Nb(evap4) at the Evaporation-2 angle.
+    #   evap1 reuses (angle1, phi1); evap3 reuses (angle2, phi2).  The two upper
+    #   sublayers (evap2, evap4) default to their electrode angle but are free.
+    stack: str = "Bilayer"        # "Bilayer" | "Trilayer"
+    tri_t1: float =  80.0         # Nb (electrode-1 lower) thickness [nm]
+    tri_t2: float =  10.0         # Al (electrode-1 upper) thickness [nm]
+    tri_t3: float =  10.0         # Al (electrode-2 lower) thickness [nm]
+    tri_t4: float = 150.0         # Nb (electrode-2 upper) thickness [nm]
+    tri_angle2: float = -24.0     # evap2 (Al, electrode-1 upper) tilt [°]
+    tri_phi2:   float =   0.0     # evap2 azimuth [°]
+    tri_angle4: float =  24.0     # evap4 (Nb, electrode-2 upper) tilt [°]
+    tri_phi4:   float =   0.0     # evap4 azimuth [°]
+
     @property
     def t_resist(self) -> float:
         return self.t_pmma + self.t_mma
