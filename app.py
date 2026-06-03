@@ -996,7 +996,7 @@ with tab_wafer:
 
     # Per-evaporation schematic of the fixed source + tilted wafer (always on).
     with st.spinner("Drawing source / wafer-tilt schematic…"):
-        figgeo = vv.render_wafer_geometry(params, waf_L)
+        figgeo = vv.render_wafer_geometry(params, waf_L, c_flat / R_mm)
         st.pyplot(figgeo, use_container_width=True)
         plt.close(figgeo)
 
@@ -1084,9 +1084,12 @@ with tab_wafer:
         cdf = pd.DataFrame(cdata)
         cdf = cdf.assign(x0=cdf["x"] - h / 2, x1=cdf["x"] + h / 2,
                          y0=cdf["y"] - h / 2, y1=cdf["y"] + h / 2)
+        Rd = wm["R"] * 1.05                              # equal, symmetric domain
         heat = alt.Chart(cdf).mark_rect().encode(
-            x=alt.X("x0:Q", title="wafer x  [mm]"), x2="x1:Q",
-            y=alt.Y("y0:Q", title="wafer y  [mm]"), y2="y1:Q",
+            x=alt.X("x0:Q", title="wafer x  [mm]",
+                    scale=alt.Scale(domain=[-Rd, Rd], nice=False)), x2="x1:Q",
+            y=alt.Y("y0:Q", title="wafer y  [mm]",
+                    scale=alt.Scale(domain=[-Rd, Rd], nice=False)), y2="y1:Q",
             color=alt.Color("area:Q", title="area [nm²]",
                             scale=alt.Scale(scheme="viridis")),
             tooltip=tips)
