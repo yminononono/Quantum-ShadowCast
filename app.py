@@ -13,13 +13,16 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import altair as alt
+import pandas as pd
 import json, copy, os, sys
 from dataclasses import asdict
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from gds_parser import load_gds_polygons, list_layers
-from process_engine import ProcessParams, shadow_vector, wafer_params, evap_beams
+from process_engine import (ProcessParams, shadow_vector, wafer_params,
+                            evap_beams, wafer_local_angles)
 from cross_section import draw_cross_section
 from phi_cross_section import draw_junction_topview, draw_phi_scan
 from manhattan_check import manhattan_break_check
@@ -35,6 +38,15 @@ RES_LEVELS = {
     "Ultra-fine (slow)":   (260, 3.0),
     "Extra-fine (slower)": (340, 2.5),
     "Maximum (slowest)":   (420, 2.0),
+}
+
+# ─── Wafer sizes (SEMI primary-flat specs):  label → (radius_mm, flat_chord_mm) ──
+# The primary flat (オリフラ) chord sits at y = −d, d = sqrt(R² − (chord/2)²).
+WAFER_SPECS = {
+    "2 inch": (25.4, 15.88),
+    "3 inch": (38.1, 22.22),
+    "4 inch": (50.0, 32.50),
+    "6 inch": (75.0, 57.50),
 }
 
 # Sidebar widget keys.  Mode-specific widgets get DISTINCT keys (prefixed) so
@@ -950,8 +962,9 @@ with tab_wafer:
         "**wafer tilted** to the nominal (θ, φ) at the wafer centre. Because the "
         "source is at a finite throw distance, an off-centre device sees a "
         "slightly different local angle, so the **junction area drifts with "
-        "wafer position**. The wafer centre reproduces the single-JJ result; the "
-        "same device is replicated at every grid position.")
+        "wafer position**. The device is replicated across a real wafer disk "
+        "(with its primary flat / オリフラ); the centre reproduces the "
+        "single-JJ result.")
 
     wc1, wc2, wc3, wc4 = st.columns(4)
     waf_L = wc1.number_input(
@@ -959,10 +972,12 @@ with tab_wafer:
         value=200.0, step=10.0, key="waf_L",
         help="Source→wafer-centre distance. Smaller L ⇒ stronger position "
              "dependence (deviation ≈ r/L).")
-    waf_ext = wc2.number_input(
-        "Wafer half-extent [mm]", min_value=1.0, max_value=150.0,
-        value=25.0, step=1.0, key="waf_ext",
-        help="Grid spans −ext…+ext in x and y (25 mm ≈ a 2-inch-wafer radius).")
+    waf_size = wc2.selectbox(
+        "Wafer size", list(WAFER_SPECS.keys()), index=2, key="waf_size",
+        help="Real wafer disk with its primary flat (オリフラ) at the bottom; "
+             "the grid spans the whole wafer and off-wafer cells are skipped.")
+    R_mm, c_flat = WAFER_SPECS[waf_size]
+    d_flat = float(np.sqrt(R_mm ** 2 - (c_flat / 2.0) ** 2))
     waf_n = int(wc3.number_input(
         "Grid N (N×N)", min_value=2, max_value=11, value=5, step=1,
         key="waf_n"))
@@ -970,8 +985,14 @@ with tab_wafer:
         "Voxel grid density", list(RES_LEVELS.keys()), key="waf_res",
         help="Finer = slower; each grid cell is a full engine run.")
     _wsmc, _wsmv = RES_LEVELS[waf_res]
-    st.caption(f"{waf_n}×{waf_n} = {waf_n * waf_n} engine runs at "
-               f"'{waf_res}' density.")
+    # Grid spans the whole wafer; cells outside the disk or below the primary
+    # flat are skipped.  Reused by the run loop and the maps below.
+    wcoords = np.linspace(-R_mm, R_mm, waf_n)
+    Xg, Yg = np.meshgrid(wcoords, wcoords)
+    wmask = (Xg ** 2 + Yg ** 2 <= R_mm ** 2) & (Yg >= -d_flat)
+    n_on = int(wmask.sum())
+    st.caption(f"{waf_size} wafer (R = {R_mm:.1f} mm) • {n_on}/"
+               f"{waf_n * waf_n} on-wafer cells at '{waf_res}' density.")
 
     # Per-evaporation schematic of the fixed source + tilted wafer (always on).
     with st.spinner("Drawing source / wafer-tilt schematic…"):
@@ -997,49 +1018,110 @@ with tab_wafer:
 
     if st.button("▶ Run wafer map", key="run_wafer",
                  use_container_width=True):
-        wcoords = np.linspace(-waf_ext, waf_ext, waf_n)
-        warea = np.zeros((waf_n, waf_n))                  # [iy, ix]
-        total = waf_n * waf_n; done = 0
-        prog = st.progress(0.0, text="Simulating wafer positions…")
-        for iy, Y in enumerate(wcoords):
-            for ix, X in enumerate(wcoords):
-                q = wafer_params(params, float(X), float(Y), waf_L)
-                warea[iy, ix] = _wafer_area(_wafer_sig(q), q)
-                done += 1
-                prog.progress(done / total, text=f"Simulating… {done}/{total}")
-        prog.empty()
-        st.session_state["_wafermap"] = dict(
-            coords=wcoords, areas=warea, L=waf_L, ext=waf_ext, n=waf_n,
-            res=waf_res, mode=params.mode, stack=params.stack)
+        if n_on == 0:
+            st.warning("No grid cell lands on the wafer at this N — "
+                       "increase **Grid N (N×N)**.")
+        else:
+            # Per-evaporation effective (θ′, φ′) over the whole grid — pure math,
+            # vectorised, computed once (the engine still runs per on-wafer cell).
+            theta_grids, phi_grids = {}, {}
+            for lbl, _ta, _pa, th, ph in evap_beams(params):
+                tg, pg = wafer_local_angles(th, ph, Xg, Yg, waf_L)
+                theta_grids[lbl], phi_grids[lbl] = tg, pg
+
+            warea = np.full((waf_n, waf_n), np.nan)       # [iy, ix]; off-wafer NaN
+            done = 0
+            prog = st.progress(0.0, text="Simulating wafer positions…")
+            for iy in range(waf_n):
+                for ix in range(waf_n):
+                    if not wmask[iy, ix]:
+                        continue                          # skip off-wafer cells
+                    q = wafer_params(params, float(Xg[iy, ix]),
+                                     float(Yg[iy, ix]), waf_L)
+                    warea[iy, ix] = _wafer_area(_wafer_sig(q), q)
+                    done += 1
+                    prog.progress(done / n_on,
+                                  text=f"Simulating… {done}/{n_on}")
+            prog.empty()
+            st.session_state["_wafermap"] = dict(
+                coords=wcoords, areas=warea, theta=theta_grids, phi=phi_grids,
+                L=waf_L, R=R_mm, c=c_flat, d=d_flat, size=waf_size, n=waf_n,
+                res=waf_res, mode=params.mode, stack=params.stack)
 
     wm = st.session_state.get("_wafermap")
-    if wm:
-        wcoords = wm["coords"]; warea = wm["areas"]; wic = warea * 1e-4
-        figw, (axa, axi) = plt.subplots(1, 2, figsize=(11.5, 4.8))
-        pca = axa.pcolormesh(wcoords, wcoords, warea, shading="auto",
-                             cmap="viridis")
-        figw.colorbar(pca, ax=axa, label="Junction area  [nm²]")
-        axa.set_title("Junction area vs wafer position")
-        pci = axi.pcolormesh(wcoords, wcoords, wic, shading="auto",
-                             cmap="magma")
-        figw.colorbar(pci, ax=axi, label="Est. Ic  [µA]")
-        axi.set_title("Critical current vs wafer position")
-        for ax in (axa, axi):
-            ax.set_xlabel("wafer x  [mm]"); ax.set_ylabel("wafer y  [mm]")
-            ax.set_aspect("equal")
-            ax.plot(0, 0, marker="+", color="w", ms=11, mew=1.6)  # centre=nominal
-        figw.suptitle(
-            f"Wafer map — {wm['stack']} / {wm['mode']}  "
-            f"(L={wm['L']:.0f} mm, ±{wm['ext']:.0f} mm, "
-            f"{wm['n']}×{wm['n']}, {wm['res']})", fontsize=10)
-        figw.tight_layout()
+    if wm and "theta" in wm:                              # new-format result
+        warea = wm["areas"]
+
+        # (a) Drawn wafer (matplotlib): area + Ic clipped to the disk + flat.
+        figw = vv.render_wafer_map_2d(
+            wm["coords"], warea, warea * 1e-4, wm["R"], wm["c"], wm["d"],
+            title=(f"{wm['size']} wafer — {wm['stack']}/{wm['mode']}  "
+                   f"(L={wm['L']:.0f} mm, {wm['n']}×{wm['n']}, {wm['res']})"))
         st.pyplot(figw, use_container_width=True); plt.close(figw)
 
-        a = warea.ravel(); amean = float(a.mean())
-        amin, amax, astd = float(a.min()), float(a.max()), float(a.std())
+        # On-wafer cell mask (finite area), shared by the chart + table.
+        Xg, Yg = np.meshgrid(wm["coords"], wm["coords"])
+        on = ((Xg ** 2 + Yg ** 2 <= wm["R"] ** 2) & (Yg >= -wm["d"])
+              & np.isfinite(warea))
+
+        # (b) Interactive hover heatmap (Altair).  ASCII column keys avoid
+        # Vega-Lite field-name escaping; pretty labels live in tooltip titles.
+        h = (wm["coords"][1] - wm["coords"][0]) if wm["n"] > 1 else wm["R"]
+        cdata = {"x": Xg[on], "y": Yg[on], "area": warea[on],
+                 "Ic": warea[on] * 1e-4}
+        tips = [alt.Tooltip("x:Q", title="x [mm]", format=".1f"),
+                alt.Tooltip("y:Q", title="y [mm]", format=".1f"),
+                alt.Tooltip("area:Q", title="area [nm²]", format=".0f"),
+                alt.Tooltip("Ic:Q", title="Ic [µA]", format=".4f")]
+        for lbl in wm["theta"]:
+            key = lbl.replace(" ", "_")
+            cdata[f"{key}_th"] = wm["theta"][lbl][on]
+            cdata[f"{key}_ph"] = wm["phi"][lbl][on]
+            tips.append(alt.Tooltip(f"{key}_th:Q", title=f"{lbl} θ′ [°]",
+                                    format=".2f"))
+            tips.append(alt.Tooltip(f"{key}_ph:Q", title=f"{lbl} φ′ [°]",
+                                    format=".2f"))
+        cdf = pd.DataFrame(cdata)
+        cdf = cdf.assign(x0=cdf["x"] - h / 2, x1=cdf["x"] + h / 2,
+                         y0=cdf["y"] - h / 2, y1=cdf["y"] + h / 2)
+        heat = alt.Chart(cdf).mark_rect().encode(
+            x=alt.X("x0:Q", title="wafer x  [mm]"), x2="x1:Q",
+            y=alt.Y("y0:Q", title="wafer y  [mm]"), y2="y1:Q",
+            color=alt.Color("area:Q", title="area [nm²]",
+                            scale=alt.Scale(scheme="viridis")),
+            tooltip=tips)
+        tt = np.linspace(np.arctan2(-wm["d"], wm["c"] / 2),
+                         np.arctan2(-wm["d"], -wm["c"] / 2) + 2 * np.pi, 200)
+        out = pd.DataFrame({
+            "x": np.r_[wm["R"] * np.cos(tt), -wm["c"] / 2, wm["c"] / 2],
+            "y": np.r_[wm["R"] * np.sin(tt), -wm["d"], -wm["d"]],
+            "o": np.arange(202)})
+        outline = alt.Chart(out).mark_line(color="#90A4AE").encode(
+            x="x:Q", y="y:Q", order="o:O")
+        st.altair_chart((heat + outline).properties(width=480, height=480),
+                        use_container_width=False)
+        st.caption("Hover any cell for its area, Ic, and per-evaporation "
+                   "effective (θ′, φ′).")
+
+        # (c) Sortable table of every on-wafer cell (pretty column names).
+        rows = {"x [mm]": Xg[on].round(2), "y [mm]": Yg[on].round(2),
+                "area [nm²]": warea[on].round(0),
+                "Ic [µA]": (warea[on] * 1e-4).round(4)}
+        for lbl in wm["theta"]:
+            rows[f"{lbl} θ′ [°]"] = wm["theta"][lbl][on].round(2)
+            rows[f"{lbl} φ′ [°]"] = wm["phi"][lbl][on].round(2)
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "💾 Download wafer-map table (CSV)", data=df.to_csv(index=False),
+            file_name="wafer_map.csv", mime="text/csv")
+
+        # (d) Spread statistics (NaN-safe; over on-wafer cells only).
+        amin = float(np.nanmin(warea)); amax = float(np.nanmax(warea))
+        amean = float(np.nanmean(warea)); astd = float(np.nanstd(warea))
         rel = (amax - amin) / amean * 100.0 if amean else float("nan")
         cv = astd / amean * 100.0 if amean else float("nan")
-        ci = int(np.argmin(np.abs(wcoords)))              # centre-most cell
+        ci = int(np.argmin(np.abs(wm["coords"])))         # centre-most index
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("Area min", f"{amin:.0f} nm²")
         s2.metric("Area max", f"{amax:.0f} nm²")
@@ -1047,10 +1129,11 @@ with tab_wafer:
         s4.metric("Area spread", f"{rel:.1f} %",
                   help="(max − min) / mean across the wafer — the JJ-area "
                        "‘ふらつき’.")
+        wic = warea * 1e-4
         st.caption(
             f"Centre cell (nominal single-JJ) = {warea[ci, ci]:.0f} nm²  •  "
             f"std/mean = {cv:.1f} %  •  Ic range "
-            f"{wic.min():.3f}–{wic.max():.3f} µA.")
+            f"{np.nanmin(wic):.3f}–{np.nanmax(wic):.3f} µA.")
     else:
         st.info("Set the source/grid configuration above and press "
                 "**Run wafer map**.")

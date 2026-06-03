@@ -21,7 +21,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm, to_rgba
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, PathPatch
+from matplotlib.path import Path
 from matplotlib.collections import PatchCollection
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
 
@@ -963,5 +964,52 @@ def render_wafer_geometry(p, L):
         ax.set_zlabel("z  [mm]")
     fig.suptitle("Fixed point source (red) + tilted wafer per evaporation",
                  fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def _wafer_path(R, c, d, npts=200):
+    """matplotlib ``Path`` of the wafer boundary: the circular arc plus the
+    bottom primary flat (オリフラ).
+
+    ``R`` = wafer radius, ``c`` = primary-flat chord length, ``d`` = distance of
+    the flat chord from the centre (= sqrt(R² − (c/2)²)); the flat sits at y = −d.
+    """
+    a0 = np.arctan2(-d,  c / 2.0)                 # right flat endpoint
+    a1 = np.arctan2(-d, -c / 2.0) + 2 * np.pi     # left endpoint, the long way (top)
+    t = np.linspace(a0, a1, npts)
+    verts = np.column_stack([R * np.cos(t), R * np.sin(t)]).tolist()
+    verts += [[-c / 2.0, -d], [c / 2.0, -d]]      # close across the flat
+    return Path(verts)
+
+
+def render_wafer_map_2d(coords, area, ic, R, c, d, title=""):
+    """Draw the wafer-position maps on an actual wafer disk + primary flat.
+
+    Two side-by-side panels (junction area, est. Ic), each a ``pcolormesh`` over
+    ``meshgrid(coords, coords)`` clipped to the wafer outline so it reads as a
+    real wafer; off-wafer (NaN) cells are masked out, the wafer boundary + flat
+    are drawn, grid-cell centres are dotted, and the centre cross marks the
+    nominal (single-JJ) position.
+    """
+    fig, (axa, axi) = plt.subplots(1, 2, figsize=(11.5, 5.2))
+    Xg, Yg = np.meshgrid(coords, coords)
+    for ax, Z, cmap, lbl in ((axa, area, "viridis", "Junction area  [nm²]"),
+                             (axi, ic,   "magma",   "Est. Ic  [µA]")):
+        pcm = ax.pcolormesh(coords, coords, np.ma.masked_invalid(Z),
+                            shading="auto", cmap=cmap)
+        patch = PathPatch(_wafer_path(R, c, d), transform=ax.transData,
+                          fc="none", ec="none")
+        ax.add_patch(patch); pcm.set_clip_path(patch)           # confine fill to wafer
+        ax.add_patch(PathPatch(_wafer_path(R, c, d), transform=ax.transData,
+                               fc="none", ec="#90A4AE", lw=1.6))  # wafer outline + flat
+        ax.scatter(Xg, Yg, s=5, c="#455A64", alpha=0.5)         # grid-cell dots
+        ax.plot(0, 0, "+", color="w", ms=12, mew=1.8)           # centre = nominal
+        fig.colorbar(pcm, ax=ax, label=lbl)
+        ax.set_xlabel("wafer x  [mm]"); ax.set_ylabel("wafer y  [mm]")
+        ax.set_aspect("equal")
+        ax.set_xlim(-R * 1.05, R * 1.05); ax.set_ylim(-R * 1.05, R * 1.05)
+    if title:
+        fig.suptitle(title, fontsize=10)
     fig.tight_layout()
     return fig
