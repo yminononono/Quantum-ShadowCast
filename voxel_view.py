@@ -27,6 +27,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' proje
 
 from deposition3d import (EMPTY, RESIST, SUBSTRATE, DepositionResult,
                           COMBO_NBAL, COMBO_ALAL, COMBO_NBNB)
+import process_engine as pe
 
 # ── global look & feel ─────────────────────────────────────────
 plt.rcParams.update({
@@ -920,5 +921,47 @@ def render_thickness_surface(r: DepositionResult, view_half=None):
     # dark-theme the 3D panes (rcParams styling does not reach the 3D panes)
     for a in (ax.xaxis, ax.yaxis, ax.zaxis):
         a.set_pane_color((0.05, 0.07, 0.09, 1.0))
+    fig.tight_layout()
+    return fig
+
+
+# ── Plassys source / tilted-wafer schematic ────────────────────────
+def render_wafer_geometry(p, L):
+    """Per-evaporation schematic of the fixed point source + the tilted wafer.
+
+    One 3-D mini-panel per active evaporation (2 for bilayer/Manhattan, 4 for
+    trilayer).  The fixed point source sits at the lab origin (red dot); the
+    wafer (blue square) is held centre-down at z = −L and tilted by the Plassys
+    rotation ``R = Ry(θ)·Rz(−φ)`` for that evaporation's nominal (θ, φ); the
+    orange arrow is the wafer normal and the dashed red line is the (vertical)
+    beam from the source to the wafer centre.
+    """
+    beams = pe.evap_beams(p)
+    n = len(beams)
+    fig = plt.figure(figsize=(3.4 * n, 3.8))
+    C = np.array([0.0, 0.0, -float(L)])
+    s = 0.4 * float(L)
+    sq = np.array([[1, 1], [-1, 1], [-1, -1], [1, -1], [1, 1]], float)
+    for k, (lbl, _ta, _pa, th, ph) in enumerate(beams, 1):
+        ax = fig.add_subplot(1, n, k, projection="3d")
+        R = pe._wafer_rot(th, ph)
+        eX, eY, nrm = R[:, 0], R[:, 1], R[:, 2]
+        corners = np.array([C + s * u * eX + s * v * eY for u, v in sq])
+        ax.plot(corners[:, 0], corners[:, 1], corners[:, 2],
+                color="#64B5F6", lw=1.8)
+        ax.plot_trisurf(corners[:-1, 0], corners[:-1, 1], corners[:-1, 2],
+                        color="#64B5F6", alpha=0.22, linewidth=0)
+        ax.quiver(C[0], C[1], C[2], 0.5 * s * nrm[0], 0.5 * s * nrm[1],
+                  0.5 * s * nrm[2], color="#FFB74D", lw=2)         # wafer normal
+        ax.plot([0, C[0]], [0, C[1]], [0, C[2]],
+                color="#EF9A9A", ls="--", lw=1.5)                  # beam S→centre
+        ax.scatter([0], [0], [0], color="#EF9A9A", s=45)           # fixed source
+        ax.set_title(f"{lbl}\nθ={th:.0f}°  φ={ph:.0f}°", fontsize=9)
+        for a in (ax.xaxis, ax.yaxis, ax.zaxis):
+            a.set_pane_color((0.05, 0.07, 0.09, 1.0))
+        ax.set_xlabel("x  [mm]"); ax.set_ylabel("y  [mm]")
+        ax.set_zlabel("z  [mm]")
+    fig.suptitle("Fixed point source (red) + tilted wafer per evaporation",
+                 fontsize=11)
     fig.tight_layout()
     return fig

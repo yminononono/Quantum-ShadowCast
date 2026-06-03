@@ -19,7 +19,7 @@ from dataclasses import asdict
 sys.path.insert(0, os.path.dirname(__file__))
 
 from gds_parser import load_gds_polygons, list_layers
-from process_engine import ProcessParams, shadow_vector
+from process_engine import ProcessParams, shadow_vector, wafer_params, evap_beams
 from cross_section import draw_cross_section
 from phi_cross_section import draw_junction_topview, draw_phi_scan
 from manhattan_check import manhattan_break_check
@@ -501,12 +501,13 @@ with _save_box:
         use_container_width=True)
 
 # ─── Tabs ─────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab_scan, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab_scan, tab_wafer, tab5 = st.tabs([
     "📐 Cross-section",
     "🗺️ Top View",
     "🔄 φ Junction View",
     "🔍 Break Check",
     "📈 Parameter Scan",
+    "🌐 Wafer Map",
     "📊 Junction Area",
 ])
 
@@ -940,6 +941,119 @@ with tab_scan:
             fig_s.tight_layout()
             st.pyplot(fig_s, use_container_width=True)
             plt.close(fig_s)
+
+# ═══ TAB: Wafer Map (Plassys point-source / tilted-wafer) ════════
+with tab_wafer:
+    st.subheader("Wafer Map — JJ-area variation across the wafer")
+    st.caption(
+        "Plassys-style oblique evaporation: a **fixed point source** with the "
+        "**wafer tilted** to the nominal (θ, φ) at the wafer centre. Because the "
+        "source is at a finite throw distance, an off-centre device sees a "
+        "slightly different local angle, so the **junction area drifts with "
+        "wafer position**. The wafer centre reproduces the single-JJ result; the "
+        "same device is replicated at every grid position.")
+
+    wc1, wc2, wc3, wc4 = st.columns(4)
+    waf_L = wc1.number_input(
+        "Throw distance L [mm]", min_value=20.0, max_value=2000.0,
+        value=200.0, step=10.0, key="waf_L",
+        help="Source→wafer-centre distance. Smaller L ⇒ stronger position "
+             "dependence (deviation ≈ r/L).")
+    waf_ext = wc2.number_input(
+        "Wafer half-extent [mm]", min_value=1.0, max_value=150.0,
+        value=25.0, step=1.0, key="waf_ext",
+        help="Grid spans −ext…+ext in x and y (25 mm ≈ a 2-inch-wafer radius).")
+    waf_n = int(wc3.number_input(
+        "Grid N (N×N)", min_value=2, max_value=11, value=5, step=1,
+        key="waf_n"))
+    waf_res = wc4.selectbox(
+        "Voxel grid density", list(RES_LEVELS.keys()), key="waf_res",
+        help="Finer = slower; each grid cell is a full engine run.")
+    _wsmc, _wsmv = RES_LEVELS[waf_res]
+    st.caption(f"{waf_n}×{waf_n} = {waf_n * waf_n} engine runs at "
+               f"'{waf_res}' density.")
+
+    # Per-evaporation schematic of the fixed source + tilted wafer (always on).
+    with st.spinner("Drawing source / wafer-tilt schematic…"):
+        figgeo = vv.render_wafer_geometry(params, waf_L)
+        st.pyplot(figgeo, use_container_width=True)
+        plt.close(figgeo)
+
+    # Cache helpers — mirror _scan_sig / _scan_area; defined locally so the tab
+    # is self-contained (no reliance on tab-order name leakage).
+    def _wafer_sig(p):
+        return (p.mode, p.stack, p.angle1, p.phi1, p.angle2, p.phi2,
+                p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4,
+                p.bridge_len, p.bridge_w, p.bridge_pmma_gap, p.undercut,
+                p.t_mma, p.t_pmma, p.manhattan_wx, p.manhattan_wy,
+                p.manhattan_theta, p.manhattan_delta, p.manhattan_h,
+                _wsmc, _wsmv)
+
+    @st.cache_data(show_spinner=False)
+    def _wafer_area(sig, _p):
+        r = simulate(_p, max_cells=_wsmc, min_vox=_wsmv)
+        _, area, _, _, _ = junction_footprint(r)
+        return float(area)
+
+    if st.button("▶ Run wafer map", key="run_wafer",
+                 use_container_width=True):
+        wcoords = np.linspace(-waf_ext, waf_ext, waf_n)
+        warea = np.zeros((waf_n, waf_n))                  # [iy, ix]
+        total = waf_n * waf_n; done = 0
+        prog = st.progress(0.0, text="Simulating wafer positions…")
+        for iy, Y in enumerate(wcoords):
+            for ix, X in enumerate(wcoords):
+                q = wafer_params(params, float(X), float(Y), waf_L)
+                warea[iy, ix] = _wafer_area(_wafer_sig(q), q)
+                done += 1
+                prog.progress(done / total, text=f"Simulating… {done}/{total}")
+        prog.empty()
+        st.session_state["_wafermap"] = dict(
+            coords=wcoords, areas=warea, L=waf_L, ext=waf_ext, n=waf_n,
+            res=waf_res, mode=params.mode, stack=params.stack)
+
+    wm = st.session_state.get("_wafermap")
+    if wm:
+        wcoords = wm["coords"]; warea = wm["areas"]; wic = warea * 1e-4
+        figw, (axa, axi) = plt.subplots(1, 2, figsize=(11.5, 4.8))
+        pca = axa.pcolormesh(wcoords, wcoords, warea, shading="auto",
+                             cmap="viridis")
+        figw.colorbar(pca, ax=axa, label="Junction area  [nm²]")
+        axa.set_title("Junction area vs wafer position")
+        pci = axi.pcolormesh(wcoords, wcoords, wic, shading="auto",
+                             cmap="magma")
+        figw.colorbar(pci, ax=axi, label="Est. Ic  [µA]")
+        axi.set_title("Critical current vs wafer position")
+        for ax in (axa, axi):
+            ax.set_xlabel("wafer x  [mm]"); ax.set_ylabel("wafer y  [mm]")
+            ax.set_aspect("equal")
+            ax.plot(0, 0, marker="+", color="w", ms=11, mew=1.6)  # centre=nominal
+        figw.suptitle(
+            f"Wafer map — {wm['stack']} / {wm['mode']}  "
+            f"(L={wm['L']:.0f} mm, ±{wm['ext']:.0f} mm, "
+            f"{wm['n']}×{wm['n']}, {wm['res']})", fontsize=10)
+        figw.tight_layout()
+        st.pyplot(figw, use_container_width=True); plt.close(figw)
+
+        a = warea.ravel(); amean = float(a.mean())
+        amin, amax, astd = float(a.min()), float(a.max()), float(a.std())
+        rel = (amax - amin) / amean * 100.0 if amean else float("nan")
+        cv = astd / amean * 100.0 if amean else float("nan")
+        ci = int(np.argmin(np.abs(wcoords)))              # centre-most cell
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Area min", f"{amin:.0f} nm²")
+        s2.metric("Area max", f"{amax:.0f} nm²")
+        s3.metric("Area mean", f"{amean:.0f} nm²")
+        s4.metric("Area spread", f"{rel:.1f} %",
+                  help="(max − min) / mean across the wafer — the JJ-area "
+                       "‘ふらつき’.")
+        st.caption(
+            f"Centre cell (nominal single-JJ) = {warea[ci, ci]:.0f} nm²  •  "
+            f"std/mean = {cv:.1f} %  •  Ic range "
+            f"{wic.min():.3f}–{wic.max():.3f} µA.")
+    else:
+        st.info("Set the source/grid configuration above and press "
+                "**Run wafer map**.")
 
 # ═══ TAB 5: Junction Area ════════════════════════════════════════
 with tab5:

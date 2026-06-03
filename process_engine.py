@@ -40,6 +40,7 @@ Manhattan cross (unchanged):
 """
 
 from dataclasses import dataclass
+import copy
 import numpy as np
 
 
@@ -168,3 +169,88 @@ def shadow_vector(t_resist: float, theta_deg: float, phi_deg: float):
 def shadow_offset(t_resist: float, angle_deg: float, phi_deg: float = 0.0) -> float:
     sx, _ = shadow_vector(t_resist, angle_deg, phi_deg)
     return sx
+
+
+# ════════════════════════════════════════════════════════════════
+# Plassys point-source / tilted-wafer geometry
+# ════════════════════════════════════════════════════════════════
+# A real oblique evaporator has a point source at a FIXED lab location and
+# tilts/rotates the WAFER so the beam meets the wafer normal at the nominal
+# (θ, φ) AT THE WAFER CENTRE.  Because the source is at finite throw distance L,
+# a device sitting off-centre on the wafer sees the beam arrive at a slightly
+# different local angle (θ′, φ′) relative to the tilted wafer normal — which
+# shifts each electrode's shadow offset and so makes the junction area drift
+# with wafer position.  These helpers compute that localised (θ′, φ′); the voxel
+# engine itself is unchanged (it just receives the localised angles).
+
+
+def evap_beams(p: "ProcessParams"):
+    """Active evaporations as (label, theta_attr, phi_attr, theta_nom, phi_nom).
+
+    Mirrors exactly which (θ, φ) fields ``deposition3d.simulate`` feeds to
+    ``beam_direction`` — bilayer/Manhattan use (angle1, phi1) & (angle2, phi2);
+    trilayer additionally uses (tri_angle2, tri_phi2) & (tri_angle4, tri_phi4).
+    """
+    if getattr(p, "stack", "Bilayer") == "Trilayer":
+        return [("evap1 Nb", "angle1",     "phi1",     p.angle1,     p.phi1),
+                ("evap2 Al", "tri_angle2", "tri_phi2", p.tri_angle2, p.tri_phi2),
+                ("evap3 Al", "angle2",     "phi2",     p.angle2,     p.phi2),
+                ("evap4 Nb", "tri_angle4", "tri_phi4", p.tri_angle4, p.tri_phi4)]
+    return [("evap1", "angle1", "phi1", p.angle1, p.phi1),
+            ("evap2", "angle2", "phi2", p.angle2, p.phi2)]
+
+
+def _wafer_rot(theta_deg: float, phi_deg: float) -> np.ndarray:
+    """Wafer→lab rotation ``R = Ry(θ)·Rz(−φ)`` (right-handed lab-axis rotations).
+
+    Columns are the wafer in-plane X, Y axes and the wafer normal, in lab coords.
+    Chosen so the fixed vertical beam ``b0 = (0,0,−1)`` expressed in the wafer
+    frame equals ``beam_direction(θ, φ)`` at the wafer centre:
+        Rᵀ·b0 = (sinθcosφ, sinθsinφ, −cosθ).
+    Physically: a fixed tilt axis (lab-y, normal leans toward lab +x by θ) plus a
+    wafer spin φ about its own normal that sets the azimuth — the Plassys stage.
+    """
+    th = np.radians(theta_deg); ph = np.radians(phi_deg)
+    Ry = np.array([[ np.cos(th), 0.0, np.sin(th)],
+                   [        0.0, 1.0,        0.0],
+                   [-np.sin(th), 0.0, np.cos(th)]])
+    Rzm = np.array([[ np.cos(ph), np.sin(ph), 0.0],   # Rz(−φ)
+                    [-np.sin(ph), np.cos(ph), 0.0],
+                    [        0.0,        0.0, 1.0]])
+    return Ry @ Rzm
+
+
+def wafer_local_angles(theta_deg, phi_deg, X, Y, L):
+    """Local (θ′, φ′) [deg] a device at wafer-frame (X, Y) sees under the Plassys
+    fixed-source / tilted-wafer model.
+
+    Source at lab origin; wafer centre at (0, 0, −L) facing the source; wafer
+    tilted by ``R = Ry(θ)·Rz(−φ)``.  ``X``, ``Y``, ``L`` share length units (mm).
+    Vectorised over array ``X``/``Y``.  Returns the nominal-equivalent angle at
+    X = Y = 0 (for a negative nominal θ the physically-identical positive-θ /
+    flipped-φ pair is returned; the engine is angle-convention-agnostic).
+    """
+    R = _wafer_rot(theta_deg, phi_deg)
+    eX, eY = R[:, 0], R[:, 1]
+    C = np.array([0.0, 0.0, -float(L)])
+    X = np.asarray(X, float); Y = np.asarray(Y, float)
+    P = C + X[..., None] * eX + Y[..., None] * eY        # lab positions (..., 3)
+    d = P / np.linalg.norm(P, axis=-1, keepdims=True)     # source at origin
+    dloc = d @ R                                          # == Rᵀ·d  (per row)
+    th = np.degrees(np.arccos(np.clip(-dloc[..., 2], -1.0, 1.0)))
+    ph = np.degrees(np.arctan2(dloc[..., 1], dloc[..., 0]))
+    return th, ph
+
+
+def wafer_params(p: "ProcessParams", X, Y, L) -> "ProcessParams":
+    """``copy.copy(p)`` with every active evaporation's (θ, φ) replaced by its
+    local angle for scalar wafer position (X, Y).
+
+    Only the beam-angle fields are touched, so the single-JJ ProcessParams and
+    every other geometry/resist parameter are left untouched.
+    """
+    q = copy.copy(p)
+    for _lbl, ta, pa, th, ph in evap_beams(p):
+        lth, lph = wafer_local_angles(th, ph, float(X), float(Y), L)
+        setattr(q, ta, float(lth)); setattr(q, pa, float(lph))
+    return q
