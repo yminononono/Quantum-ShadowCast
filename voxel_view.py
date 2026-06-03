@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm, to_rgba
 from matplotlib.patches import Rectangle
 from matplotlib.collections import PatchCollection
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
 
 from deposition3d import (EMPTY, RESIST, SUBSTRATE, DepositionResult,
                           COMBO_NBAL, COMBO_ALAL, COMBO_NBNB)
@@ -60,11 +61,18 @@ C_AL2 = 5
 C_ALOX = 6
 C_JUNC = 7
 # ── trilayer extras ───────────────────────────────────────────────
-C_NB = 8            # Nb sublayer (trilayer cross-section, by material)
-C_AL = 9            # Al sublayer (trilayer cross-section, by material)
+C_NB = 8            # legacy by-material Nb (superseded by C_E1_NB/C_E4_NB)
+C_AL = 9            # legacy by-material Al (superseded by C_E2_AL/C_E3_AL)
 C_JUNC_NBAL = 10    # junction barrier between Nb and Al
 C_JUNC_ALAL = 11    # junction barrier between Al and Al
 C_JUNC_NBNB = 12    # junction barrier between Nb and Nb
+# per-evaporation metal shades: the film-level views distinguish the SAME metal
+# by which evaporation deposited it, via brightness — evap1 Nb (dark amber) →
+# evap4 Nb (bright amber); evap2 Al (dark blue) → evap3 Al (light blue).
+C_E1_NB = 13        # evaporation 1 — Nb (electrode 1, lower)
+C_E2_AL = 14        # evaporation 2 — Al (electrode 1, upper)
+C_E3_AL = 15        # evaporation 3 — Al (electrode 2, lower)
+C_E4_NB = 16        # evaporation 4 — Nb (electrode 2, upper)
 
 _COLORS = {
     C_EMPTY:     "#0e1117",   # = background (invisible)
@@ -80,6 +88,10 @@ _COLORS = {
     C_JUNC_NBAL: "#ffd166",   # Nb–Al overlap (gold)
     C_JUNC_ALAL: "#2ce0b3",   # Al–Al overlap (teal)
     C_JUNC_NBNB: "#ef476f",   # Nb–Nb overlap (raspberry)
+    C_E1_NB:     "#a06e0a",   # evap-1 Nb (dark amber)
+    C_E2_AL:     "#3c8cb4",   # evap-2 Al (dark blue)
+    C_E3_AL:     "#bee4f5",   # evap-3 Al (light blue)
+    C_E4_NB:     "#ffcd5a",   # evap-4 Nb (bright amber)
 }
 _LABELS = {
     C_EMPTY:     "empty",
@@ -95,13 +107,17 @@ _LABELS = {
     C_JUNC_NBAL: "junction Nb–Al",
     C_JUNC_ALAL: "junction Al–Al",
     C_JUNC_NBNB: "junction Nb–Nb",
+    C_E1_NB:     "Nb (evap 1)",
+    C_E2_AL:     "Al (evap 2)",
+    C_E3_AL:     "Al (evap 3)",
+    C_E4_NB:     "Nb (evap 4)",
 }
 
 # combo-code → junction category, for trilayer overlay colouring
 _COMBO_CAT = {COMBO_NBAL: C_JUNC_NBAL, COMBO_ALAL: C_JUNC_ALAL,
               COMBO_NBNB: C_JUNC_NBNB}
 
-_N = 13
+_N = 17
 _CMAP = ListedColormap([_COLORS[i] for i in range(_N)])
 _NORM = BoundaryNorm(np.arange(-0.5, _N + 0.5, 1.0), _CMAP.N)
 
@@ -372,14 +388,16 @@ def _slice_planes(r, angle_deg, offset):
 
 
 def _paint_trilayer_metal(cat, films2d):
-    """Colour trilayer metal cells by material (Nb / Al), deposition order.
+    """Colour trilayer metal cells by evaporation (per-film brightness shade).
 
-    Later sublayers overwrite earlier ones where they share a cell, so the
+    The same metal is distinguished by which evaporation laid it down: evap1 Nb
+    (dark) vs evap4 Nb (bright); evap2 Al (dark) vs evap3 Al (light).  Later
+    sublayers overwrite earlier ones where they share a cell, so the
     physically-upper film wins (matches the deposition sequence)."""
-    cat[films2d["nb1"]] = C_NB     # electrode-1 lower (Nb)
-    cat[films2d["al2"]] = C_AL     # electrode-1 upper (Al)
-    cat[films2d["al3"]] = C_AL     # electrode-2 lower (Al)
-    cat[films2d["nb4"]] = C_NB     # electrode-2 upper (Nb)
+    cat[films2d["nb1"]] = C_E1_NB    # electrode-1 lower (evap 1, Nb)
+    cat[films2d["al2"]] = C_E2_AL  # electrode-1 upper (evap 2, Al)
+    cat[films2d["al3"]] = C_E3_AL    # electrode-2 lower (evap 3, Al)
+    cat[films2d["nb4"]] = C_E4_NB    # electrode-2 upper (evap 4, Nb)
 
 
 def _resist_cat_cross(cat, solid2d, zs, z_split):
@@ -429,12 +447,15 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     # interface (so Al2 sits on top of the barrier) and the metal corners.
     _oxide_edges_cs(ax, al1, (solid2d == RESIST) | (solid2d == SUBSTRATE),
                     h_axis, zs)
-    c_e1 = _COLORS[C_NB] if films2d is not None else _COLORS[C_AL1]
-    c_e2 = _COLORS[C_AL] if films2d is not None else _COLORS[C_AL2]
+    # The two arrows are the two electrode beams: evap 1 (Nb) and evap 3 (Al)
+    # for a trilayer, evap 1 / evap 2 for a bilayer.
+    c_e1 = _COLORS[C_E1_NB] if films2d is not None else _COLORS[C_AL1]
+    c_e2 = _COLORS[C_E3_AL] if films2d is not None else _COLORS[C_AL2]
+    lbl_e2 = "evap 3" if films2d is not None else "evap 2"
     _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), hlim, vtop, c_e1,
                    "evap 1", side=-1)
     _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), hlim, vtop, c_e2,
-                   "evap 2", side=+1)
+                   lbl_e2, side=+1)
     present = [c for c in sorted(np.unique(cat).tolist()) if c != C_EMPTY]
     _legend(fig, present)
     fig.tight_layout(rect=[0, 0.08, 1, 1])
@@ -456,8 +477,10 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
         r, angle_deg, offset)
     (ux, uy), _ = _slice_dirs(angle_deg)
     tri = films2d is not None
-    c_e1 = _COLORS[C_NB] if tri else _COLORS[C_AL1]
-    c_e2 = _COLORS[C_AL] if tri else _COLORS[C_AL2]
+    # Bilayer evap-beam arrow colours; the trilayer branch below uses its own
+    # per-evaporation colours (C_E1_NB … C_E4_NB) for each of the 4 arrows.
+    c_e1 = _COLORS[C_AL1]
+    c_e2 = _COLORS[C_AL2]
 
     if junc_mask is not None:
         jc = junc_mask[ix, iy]
@@ -475,20 +498,12 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
                                   axis=1).astype(bool)
 
     def _paint_metal(cat, inc_al1, inc_al2, mask=None):
-        """Paint electrode metal — by material (Nb/Al) for trilayer, else
-        per-electrode (Al #1 / Al #2).  ``mask`` (e.g. grounded) gates cells."""
+        """Paint bilayer electrode metal (Al #1 / Al #2); ``mask`` (e.g.
+        grounded) gates cells.  Trilayer panels use ``cat_tri`` (per-evap)."""
         def g(m):
             return m if mask is None else (m & mask)
-        if tri:
-            if inc_al1:
-                cat[g(films2d["nb1"])] = C_NB
-                cat[g(films2d["al2"])] = C_AL
-            if inc_al2:
-                cat[g(films2d["al3"])] = C_AL
-                cat[g(films2d["nb4"])] = C_NB
-        else:
-            if inc_al1: cat[g(al1)] = C_AL1
-            if inc_al2: cat[g(al2)] = C_AL2
+        if inc_al1: cat[g(al1)] = C_AL1
+        if inc_al2: cat[g(al2)] = C_AL2
 
     def cat_build(inc_al1=False, inc_al2=False,
                   liftoff=False, emphasise_junc=False):
@@ -513,7 +528,7 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
     if tri:
         td = r.meta.get("tri_dirs", {})
         order = ["nb1", "al2", "al3", "nb4"]      # deposition order
-        cols = {"nb1": C_NB, "al2": C_AL, "al3": C_AL, "nb4": C_NB}
+        cols = {"nb1": C_E1_NB, "al2": C_E2_AL, "al3": C_E3_AL, "nb4": C_E4_NB}
 
         def cat_tri(inc, liftoff=False):
             cat = np.full(solid2d.shape, C_EMPTY, np.int8)
@@ -531,11 +546,11 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
         # (title, category grid, oxide phase, arrow=(film, colour, label, side))
         panels = [
             ("1. Resist only",   cat_tri([]),                           None,   None),
-            ("2. Evap 1 (Nb)",   cat_tri(["nb1"]),                      None,   ("nb1", c_e1, "evap 1", -1)),
-            ("3. Evap 2 (Al)",   cat_tri(["nb1", "al2"]),               None,   ("al2", c_e2, "evap 2", -1)),
+            ("2. Evap 1 (Nb)",   cat_tri(["nb1"]),                      None,   ("nb1", _COLORS[C_E1_NB], "evap 1", -1)),
+            ("3. Evap 2 (Al)",   cat_tri(["nb1", "al2"]),               None,   ("al2", _COLORS[C_E2_AL], "evap 2", -1)),
             ("4. Oxidation",     cat_tri(["nb1", "al2"]),               "pre",  None),
-            ("5. Evap 3 (Al)",   cat_tri(["nb1", "al2", "al3"]),        "pre",  ("al3", c_e2, "evap 3", +1)),
-            ("6. Evap 4 (Nb)",   cat_tri(["nb1", "al2", "al3", "nb4"]), "pre",  ("nb4", c_e1, "evap 4", +1)),
+            ("5. Evap 3 (Al)",   cat_tri(["nb1", "al2", "al3"]),        "pre",  ("al3", _COLORS[C_E3_AL], "evap 3", +1)),
+            ("6. Evap 4 (Nb)",   cat_tri(["nb1", "al2", "al3", "nb4"]), "pre",  ("nb4", _COLORS[C_E4_NB], "evap 4", +1)),
             ("7. Lift-off (JJ)", cat_tri(order, liftoff=True),          "post", None),
         ]
         fig, axes = plt.subplots(2, 4, figsize=(17.5, 8.0),
@@ -554,7 +569,8 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
                 _beam_arrow_cs(ax, d, (ux, uy), hlim, vtop, col, lbl, side=side)
         for ax in axes[len(panels):]:
             ax.axis("off")       # unused cells (7 stages in a 2×4 grid)
-        _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP, C_NB, C_AL])
+        _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP,
+                      C_E1_NB, C_E2_AL, C_E3_AL, C_E4_NB])
         fig.tight_layout(rect=[0, 0.05, 1, 1])
         return fig
 
@@ -657,7 +673,7 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
     if films2d is not None:
         td = r.meta.get("tri_dirs", {})
         order = ["nb1", "al2", "al3", "nb4"]
-        cols = {"nb1": C_NB, "al2": C_AL, "al3": C_AL, "nb4": C_NB}
+        cols = {"nb1": C_E1_NB, "al2": C_E2_AL, "al3": C_E3_AL, "nb4": C_E4_NB}
         elec2f = films2d["al3"] | films2d["nb4"]      # electrode-2 floor footprint
 
         def metal_tri(inc, emphasise_junc=False):
@@ -673,11 +689,11 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
         # (title, base, metal grid, alpha, oxide mask, label junctions, arrow)
         panels = [
             ("1. Resist only", resist_base, metal_tri([]),                            0.62, None,    False, None),
-            ("2. Evap 1 (Nb)", resist_base, metal_tri(["nb1"]),                       0.62, None,    False, ("nb1", C_NB, "evap 1")),
-            ("3. Evap 2 (Al)", resist_base, metal_tri(["nb1", "al2"]),                0.62, None,    False, ("al2", C_AL, "evap 2")),
+            ("2. Evap 1 (Nb)", resist_base, metal_tri(["nb1"]),                       0.62, None,    False, ("nb1", C_E1_NB, "evap 1")),
+            ("3. Evap 2 (Al)", resist_base, metal_tri(["nb1", "al2"]),                0.62, None,    False, ("al2", C_E2_AL, "evap 2")),
             ("4. Oxidation",   resist_base, metal_tri(["nb1", "al2"]),                0.62, aloxf,   False, None),
-            ("5. Evap 3 (Al)", resist_base, metal_tri(["nb1", "al2", "al3"]),         0.62, ox_post, False, ("al3", C_AL, "evap 3")),
-            ("6. Evap 4 (Nb)", resist_base, metal_tri(["nb1", "al2", "al3", "nb4"]),  0.62, ox_post, False, ("nb4", C_NB, "evap 4")),
+            ("5. Evap 3 (Al)", resist_base, metal_tri(["nb1", "al2", "al3"]),         0.62, ox_post, False, ("al3", C_E3_AL, "evap 3")),
+            ("6. Evap 4 (Nb)", resist_base, metal_tri(["nb1", "al2", "al3", "nb4"]),  0.62, ox_post, False, ("nb4", C_E4_NB, "evap 4")),
             ("7. Lift-off (JJ)", empty_base,
              metal_tri(order, emphasise_junc=True),                                  1.00, ox_post, True,  None),
         ]
@@ -701,7 +717,7 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
                 _beam_arrow_top(ax, d, hw, _COLORS[col], albl)
         for ax in axes[len(panels):]:
             ax.axis("off")
-        _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_NB, C_AL,
+        _legend(fig, [C_RESIST_LO, C_RESIST_UP, C_E1_NB, C_E2_AL, C_E3_AL, C_E4_NB,
                       C_JUNC_NBAL, C_JUNC_ALAL, C_JUNC_NBNB])
         fig.tight_layout(rect=[0, 0.05, 1, 1])
         return fig
@@ -778,8 +794,9 @@ def _slice_marker(ax, slice_line, hw):
 
 
 _METAL_CATS = [C_AL1, C_AL2, C_JUNC, C_JUNC_NBAL, C_JUNC_ALAL, C_JUNC_NBNB]
-# trilayer top-view metals (by material) + junction-combo overlays
-_TRI_METAL_CATS = [C_NB, C_AL, C_JUNC_NBAL, C_JUNC_ALAL, C_JUNC_NBNB]
+# trilayer top-view metals (per evaporation) + junction-combo overlays
+_TRI_METAL_CATS = [C_E1_NB, C_E2_AL, C_E3_AL, C_E4_NB,
+                   C_JUNC_NBAL, C_JUNC_ALAL, C_JUNC_NBNB]
 
 
 def _paint_junction_top(mcat, junc_mask, combo_map):
@@ -826,4 +843,82 @@ def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
     if present:
         _legend(fig, present)
     fig.tight_layout(rect=[0, 0.08, 1, 1])
+    return fig
+
+
+# ════════════════════════════════════════════════════════════════
+# lift-off film-thickness maps
+# ════════════════════════════════════════════════════════════════
+
+def _thickness_field(r: DepositionResult):
+    """Per-(x,y) lift-off metal-film thickness [nm] as an (Nx,Ny) float grid.
+
+    After lift-off only the in-trench metal survives (the same band used by
+    ``_floor_maps`` / ``_junction_cells_3d``: 0 ≤ z < z_floor).  At each column
+    the thickness is the count of stacked metal voxels (either electrode) times
+    the voxel edge, so where the two electrodes overlap — the junction — the
+    stack is thicker, and single-electrode regions are thinner."""
+    zs = r.zs
+    zf = r.meta.get("z_floor", r.z_top)
+    floor = (zs >= 0) & (zs < zf)
+    metal = (r.al1 | r.al2)[:, :, floor]
+    return metal.sum(axis=2).astype(float) * r.vox          # (Nx, Ny) [nm]
+
+
+def render_thickness_map(r: DepositionResult, view_half=None):
+    """Top-down heat map of the lift-off metal-film thickness.
+
+    Colour encodes the stacked-metal thickness [nm] at each (x, y); the
+    electrode overlap (junction) reads as a thicker ridge.  Cells with no metal
+    are left blank (background)."""
+    thick = _thickness_field(r)
+    masked = np.ma.masked_where(thick <= 0, thick)
+
+    hw = _top_half(r, view_half)
+    fig, ax = plt.subplots(figsize=(6.4, 5.4))
+    cmap = matplotlib.colormaps["viridis"].copy()
+    cmap.set_bad(plt.rcParams["axes.facecolor"])            # no-metal = background
+    im = ax.imshow(masked.T, origin="lower", extent=_extent(r.xs, r.ys),
+                   aspect="equal", cmap=cmap, interpolation="nearest", zorder=1)
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label("metal thickness  [nm]")
+    ax.set_xlabel("x  [nm]")
+    ax.set_ylabel("y  [nm]")
+    ax.set_title("Lift-off metal thickness (heat map)")
+    ax.set_xlim(-hw, hw)
+    ax.set_ylim(-hw, hw)
+    fig.tight_layout()
+    return fig
+
+
+def render_thickness_surface(r: DepositionResult, view_half=None):
+    """3-D surface of the lift-off metal-film thickness (height = thickness).
+
+    Same thickness field as :func:`render_thickness_map`, drawn as a surface
+    z = thickness(x, y) over the view window.  No-metal regions sit at z = 0
+    (substrate level)."""
+    thick = _thickness_field(r)
+
+    hw = _top_half(r, view_half)
+    xsel = np.abs(r.xs) <= hw
+    ysel = np.abs(r.ys) <= hw
+    if not xsel.any():
+        xsel[:] = True                                      # degenerate-window guard
+    if not ysel.any():
+        ysel[:] = True
+    X, Y = np.meshgrid(r.xs[xsel], r.ys[ysel], indexing="ij")
+    Z = thick[np.ix_(xsel, ysel)]
+
+    fig = plt.figure(figsize=(6.8, 5.6))
+    ax = fig.add_subplot(projection="3d")
+    surf = ax.plot_surface(X, Y, Z, cmap="viridis", linewidth=0, antialiased=True)
+    fig.colorbar(surf, ax=ax, fraction=0.04, pad=0.08, label="thickness  [nm]")
+    ax.set_xlabel("x  [nm]")
+    ax.set_ylabel("y  [nm]")
+    ax.set_zlabel("thickness  [nm]")
+    ax.set_title("Lift-off metal thickness (3D)")
+    # dark-theme the 3D panes (rcParams styling does not reach the 3D panes)
+    for a in (ax.xaxis, ax.yaxis, ax.zaxis):
+        a.set_pane_color((0.05, 0.07, 0.09, 1.0))
+    fig.tight_layout()
     return fig

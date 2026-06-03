@@ -525,13 +525,15 @@ with tab1:
     # Slice orientation: azimuth angle α (0° = x–z cut, 90° = y–z cut) and a
     # perpendicular offset.  Persist both across reruns (key-only sliders).
     st.session_state.setdefault("slice_angle", 0.0)
+    st.session_state["slice_angle"] = float(
+        np.clip(st.session_state["slice_angle"], -90.0, 90.0))
     st.session_state.setdefault("slice_off", 0.0)
     st.session_state["slice_off"] = float(
         np.clip(st.session_state["slice_off"], -_gR, _gR))
     cc1, cc2 = st.columns([1, 1])
     with cc1:
-        slice_angle = st.slider("Slice angle α [°]  (0 = x–z, 90 = y–z)",
-                                0.0, 180.0, step=1.0, key="slice_angle")
+        slice_angle = st.slider("Slice angle α [°]  (0 = x–z, ±90 = y–z)",
+                                -90.0, 90.0, step=1.0, key="slice_angle")
     with cc2:
         slice_pos = st.slider("Perpendicular offset [nm]", -_gR, _gR,
                               step=eng.vox, key="slice_off")
@@ -657,6 +659,21 @@ with tab2:
                                   juncs=eng_juncs, combo_map=eng_combo_map)
         st.pyplot(figt, use_container_width=True)
         plt.close(figt)
+
+    st.divider()
+    st.markdown("**Lift-off film thickness** — z value = stacked metal thickness "
+                "(electrode overlap = thicker)")
+    tc1, tc2 = st.columns(2)
+    with tc1:
+        with st.spinner("Rendering thickness heat map..."):
+            figth = vv.render_thickness_map(eng, view_half=top_half)
+            st.pyplot(figth, use_container_width=True)
+            plt.close(figth)
+    with tc2:
+        with st.spinner("Rendering 3D thickness surface..."):
+            figth3 = vv.render_thickness_surface(eng, view_half=top_half)
+            st.pyplot(figth3, use_container_width=True)
+            plt.close(figth3)
 
     if eng_njunc >= 2:
         st.warning(f"⚠️ {eng_njunc} separate Josephson junctions detected "

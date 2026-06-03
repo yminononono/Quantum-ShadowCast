@@ -445,65 +445,89 @@ def _connected_components(mask):
     return labels, len(uniq)
 
 
-def junction_footprint(r: DepositionResult, min_cells: int = 2):
-    """xy cells (on the substrate floor) where Al1 and Al2 stack up.
+def _dilate6(m):
+    """6-neighbour (face) dilation of a 3-D boolean mask."""
+    out = np.zeros_like(m)
+    out[1:, :, :] |= m[:-1, :, :]; out[:-1, :, :] |= m[1:, :, :]
+    out[:, 1:, :] |= m[:, :-1, :]; out[:, :-1, :] |= m[:, 1:, :]
+    out[:, :, 1:] |= m[:, :, :-1]; out[:, :, :-1] |= m[:, :, 1:]
+    return out
 
-    Returns ``(mask_xy, area_nm2, ox_nm, oy_nm, juncs)``.  A single device can
-    contain several distinct Josephson junctions (e.g. one on each side of a
-    Dolan bridge for some tilt angles); each spatially separate Al1∩Al2 overlap
-    is reported as its own entry in ``juncs`` — a list of dicts with keys
-    ``mask, area, ox, oy, cx, cy, cells`` (sorted largest-area first).
 
-    ``area`` is the total over all junctions; the headline ``ox/oy`` are those
-    of the largest junction (not a bounding box merging separate junctions).
+def _junction_cells_3d(r: DepositionResult, min_cells: int = 2):
+    """Cleaned 3-D Josephson-junction mask + per-junction list.
+
+    The tunnel barrier is the thin oxide between the two electrodes.  In the
+    voxel model that is every oxide-skin cell of electrode 1 that electrode-2
+    metal actually reaches (``alox & al2``) — which happens on the substrate
+    FLOOR *and* on the vertical metal SIDEWALLS wherever the second beam coats
+    them.  Restricted to the in-trench metal stack (0 ≤ z < z_floor) so stray
+    metal on top of the resist is not mistaken for a junction.
+
+    Separate *devices* are grouped by xy-footprint connectivity — a junction and
+    its sidewalls share one footprint (a wall sits one cell outside the floor
+    edge, so it is 4-connected to it), so the floor + its walls count as ONE
+    junction — while the area is measured in full 3-D (floor + walls).
+
+    Returns ``(clean3d, juncs)``: ``clean3d`` the 3-D boolean junction mask, and
+    ``juncs`` a list (largest-area first) of per-junction dicts with keys
+    ``mask`` (xy footprint), ``mask3d``, ``cells``, ``area`` (= cells·vox²,
+    INCLUDING walls), ``ox``, ``oy``, ``cx``, ``cy``.
     """
     zs = r.zs
     z_floor = r.meta.get("z_floor", r.z_top)
-    floor = (zs >= 0) & (zs < z_floor)           # metal sitting on the substrate
-    al1f = r.al1[:, :, floor].any(axis=2)
-    al2f = r.al2[:, :, floor].any(axis=2)
-    junc = al1f & al2f                            # full Al1∩Al2 contact
+    zsel = (zs >= 0) & (zs < z_floor)
+    j3 = r.alox & r.al2 & zsel[None, None, :]    # oxide cells reached by elec 2
+    j2 = j3.any(axis=2)                           # xy footprint of the junction
 
-    # The junction is EVERY xy cell where Al1 and Al2 stack up (touching through
-    # the thin oxide), whatever its outline — e.g. a Manhattan crossing with a φ
-    # offset is a tilted parallelogram, not an axis-aligned rectangle.  So we do
-    # NOT clip the overlap to a rectangle (that would shrink a tilted junction).
-    # We label the whole overlap into connected blobs and keep each blob in full.
-    #
-    # Manhattan: the two perpendicular line stripes cross exactly once, so every
-    # Al1∩Al2 blob *is* the junction — even a steep-tilt crossing that shifts
-    # into a corner of the cross (well outside wy/2 × wx/2); keep all blobs.
-    # Dolan: the open trench floods both depositions onto the leads, producing
-    # stray pad overlaps far out in x.  The real JJ is the under-bridge overlap,
-    # so keep only blobs whose centroid sits in the bridge junction zone.
+    # Dolan's open trench floods both depositions onto the leads, leaving stray
+    # pad overlaps far out in x; keep only blobs whose centroid sits in the
+    # bridge junction zone.  Manhattan crosses exactly once → keep every blob.
     jxm = r.meta.get("junc_xmax", r.meta["R"])
     jym = r.meta.get("junc_ymax", r.meta["R"])
     confine = r.meta.get("mode", "") != "Manhattan"
 
-    # split into spatially separate junctions (drop sub-`min_cells` specks)
-    labels, n = _connected_components(junc)
+    labels, n = _connected_components(j2)         # device-level (xy) grouping
     juncs = []
-    clean = np.zeros_like(junc)
+    clean = np.zeros_like(j3)
     for lab_id in range(1, n + 1):
-        comp = labels == lab_id
-        cnt = int(comp.sum())
-        if cnt < min_cells:
-            continue
-        ci, cj = np.where(comp)
+        comp2 = labels == lab_id                  # xy footprint of this junction
+        ci, cj = np.where(comp2)
         cx = float(r.xs[ci].mean())
         cy = float(r.ys[cj].mean())
         if confine and (abs(cx) > jxm or abs(cy) > jym):   # stray pad overlap
             continue
-        clean |= comp
+        cells3d = j3 & comp2[:, :, None]          # floor + walls of this device
+        cnt = int(cells3d.sum())
+        if cnt < min_cells:
+            continue
+        clean |= cells3d
         ox_c = (ci.max() - ci.min() + 1) * r.vox
         oy_c = (cj.max() - cj.min() + 1) * r.vox
         juncs.append(dict(
-            mask=comp, cells=cnt, area=cnt * r.vox * r.vox,
+            mask=comp2, mask3d=cells3d, cells=cnt, area=cnt * r.vox * r.vox,
             ox=ox_c, oy=oy_c, cx=cx, cy=cy,
         ))
     juncs.sort(key=lambda d: -d["area"])
+    return clean, juncs
 
-    junc = clean
+
+def junction_footprint(r: DepositionResult, min_cells: int = 2):
+    """Full 3-D Josephson-junction barrier: substrate floor *and* metal walls.
+
+    The barrier is every oxide cell electrode 2 reaches across the oxide skin of
+    electrode 1 — on the floor and on the vertical sidewalls of the lower
+    electrode (see ``_junction_cells_3d``).  A device can contain several
+    spatially separate junctions (e.g. one on each side of a Dolan bridge for
+    some tilt angles); each is its own entry in ``juncs`` (largest-area first).
+
+    Returns ``(mask_xy, area_nm2, ox_nm, oy_nm, juncs)``.  ``mask_xy`` is the xy
+    projection of the 3-D junction (for the top-view map); ``area_nm2`` is the
+    full 3-D barrier area (floor + walls); ``ox/oy`` are the xy footprint of the
+    largest junction (not a bounding box merging separate junctions).
+    """
+    clean, juncs = _junction_cells_3d(r, min_cells)
+    junc = clean.any(axis=2)                       # xy projection for the map
     area = sum(d["area"] for d in juncs)
     if juncs:
         ox, oy = juncs[0]["ox"], juncs[0]["oy"]
@@ -518,44 +542,57 @@ _COMBO_NAMES = {COMBO_NBAL: "Nb-Al", COMBO_ALAL: "Al-Al", COMBO_NBNB: "Nb-Nb"}
 
 
 def junction_combos(r: DepositionResult, min_cells: int = 2):
-    """Classify each junction floor cell by the metal pair across the oxide.
+    """Classify every 3-D junction cell by the metal pair across the oxide.
 
-    For a trilayer (Nb/Al–AlOx–Al/Nb) the barrier separates electrode-1's TOP
-    metal (Al where the evap-2 Al sublayer is present, else Nb) from electrode-2's
-    BOTTOM metal (Al where the evap-3 Al sublayer is present, else Nb).  The pair
-    is binned (order-independent) into Nb-Al / Al-Al / Nb-Nb.
+    For a trilayer (Nb/Al–AlOx–Al/Nb) each barrier cell separates electrode-1's
+    metal (Al where the evap-2 Al sublayer borders the cell, else the evap-1 Nb)
+    from electrode-2's metal (Al where the evap-3 Al fills the cell, else the
+    evap-4 Nb).  The pair is binned (order-independent) into Nb-Al / Al-Al /
+    Nb-Nb.  Classification runs over the SAME 3-D junction cells measured by
+    ``junction_footprint`` (floor + walls), so the per-pair areas sum to the
+    headline area.
 
     Returns ``(combos, combo_map)`` where ``combos`` maps name → {mask, cells,
-    area} and ``combo_map`` is an (Nx,Ny) int grid (COMBO_* codes).  For a
+    area} (area = 3-D, incl. walls) and ``combo_map`` is an (Nx,Ny) int grid of
+    COMBO_* codes (per-column dominant pair, for the top-view map).  For a
     bilayer result returns ``({}, None)``.
     """
     if getattr(r, "stack", "Bilayer") != "Trilayer" or not r.films:
         return {}, None
-    zs = r.zs
-    z_floor = r.meta.get("z_floor", r.z_top)
-    floor = (zs >= 0) & (zs < z_floor)
-    nb1f = r.films["nb1"][:, :, floor].any(axis=2)
-    al2f = r.films["al2"][:, :, floor].any(axis=2)
-    al3f = r.films["al3"][:, :, floor].any(axis=2)
-    nb4f = r.films["nb4"][:, :, floor].any(axis=2)
+    clean, _ = _junction_cells_3d(r, min_cells)
 
-    junc = (nb1f | al2f) & (al3f | nb4f)       # = electrode1 ∩ electrode2 (= al1f & al2f)
-    top1_is_al = al2f                           # electrode-1 top metal
-    bot2_is_al = al3f                           # electrode-2 bottom metal
+    # electrode-1 side: Al where the evap-2 Al sublayer borders the oxide cell,
+    # else Nb (every barrier cell is an oxide-skin cell of electrode 1, so the
+    # non-Al cells necessarily border the evap-1 Nb).
+    e1_al = clean & _dilate6(r.films["al2"])
+    # electrode-2 side: Al where the evap-3 Al fills the cell, else evap-4 Nb.
+    e2_al = clean & r.films["al3"]
 
-    combo_map = np.zeros(junc.shape, np.int8)
-    both_al = junc & top1_is_al & bot2_is_al
-    both_nb = junc & (~top1_is_al) & (~bot2_is_al)
-    mixed = junc & ~both_al & ~both_nb
-    combo_map[mixed] = COMBO_NBAL
-    combo_map[both_al] = COMBO_ALAL
-    combo_map[both_nb] = COMBO_NBNB
+    alal = e1_al & e2_al
+    nbnb = clean & (~e1_al) & (~e2_al)
+    nbal = clean & (~alal) & (~nbnb)            # one Al + one Nb
+
+    combo3d = np.zeros(clean.shape, np.int8)
+    combo3d[nbal] = COMBO_NBAL
+    combo3d[alal] = COMBO_ALAL
+    combo3d[nbnb] = COMBO_NBNB
+
+    # 2-D map for the top view: per xy column take the most-represented pair.
+    counts = np.stack([(combo3d == COMBO_NBAL).sum(axis=2),
+                       (combo3d == COMBO_ALAL).sum(axis=2),
+                       (combo3d == COMBO_NBNB).sum(axis=2)], axis=-1)
+    codes = np.array([COMBO_NBAL, COMBO_ALAL, COMBO_NBNB], np.int8)
+    combo_map = np.zeros(clean.shape[:2], np.int8)
+    has = counts.sum(axis=-1) > 0
+    combo_map[has] = codes[counts.argmax(axis=-1)[has]]
 
     combos = {}
-    for code, name in _COMBO_NAMES.items():
-        m = combo_map == code
-        cnt = int(m.sum())
+    for code, name, m3 in ((COMBO_NBAL, "Nb-Al", nbal),
+                           (COMBO_ALAL, "Al-Al", alal),
+                           (COMBO_NBNB, "Nb-Nb", nbnb)):
+        cnt = int(m3.sum())
         if cnt < min_cells:
             continue
-        combos[name] = dict(mask=m, cells=cnt, area=cnt * r.vox * r.vox)
+        combos[name] = dict(mask=(combo_map == code), cells=cnt,
+                            area=cnt * r.vox * r.vox)
     return combos, combo_map
