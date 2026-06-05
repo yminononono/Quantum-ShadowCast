@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from gds_parser import load_gds_polygons, list_layers
 from process_engine import (ProcessParams, shadow_vector, wafer_params,
+                            wafer_params_gaussian,
                             evap_beams, wafer_local_angles)
 from cross_section import draw_cross_section
 from phi_cross_section import draw_junction_topview, draw_phi_scan
@@ -223,6 +224,16 @@ def _reset_defaults():
     st.session_state.pop("_imported_sig", None)   # allow re-loading later
 
 
+def _on_stack_change():
+    """Re-default the evap-2/4 'Same tilt' links ON when the user switches the
+    stack radio to Trilayer.  Fires only on real user interaction, so the
+    file-import path that intentionally unlinks them (``_apply_loaded_params``)
+    is preserved."""
+    if st.session_state.get("stack") == "Trilayer":
+        st.session_state["tri_link2"] = True
+        st.session_state["tri_link4"] = True
+
+
 def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level,
                   combos=None):
     """Serialise the full process (parameters + ray-scan + junction results)
@@ -304,7 +315,7 @@ with st.sidebar:
     st.session_state.setdefault("stack", "Bilayer")
     stack = st.radio(
         "Deposition stack", ["Bilayer", "Trilayer"], horizontal=True,
-        key="stack",
+        key="stack", on_change=_on_stack_change,
         help="Bilayer: evap 1 → oxidation → evap 2.  "
              "Trilayer: Nb→Al → oxidation → Al→Nb (Nb/Al/Al/Nb), forming a "
              "junction whose barrier metals are reported as Nb-Al / Al-Al / Nb-Nb.")
@@ -994,6 +1005,30 @@ with tab_wafer:
     st.caption(f"{waf_size} wafer (R = {R_mm:.1f} mm) • {n_on}/"
                f"{waf_n * waf_n} on-wafer cells at '{waf_res}' density.")
 
+    # Finite (Gaussian) source — opt-in Monte-Carlo JJ-area statistics.
+    gauss_on = st.checkbox(
+        "Finite (Gaussian) source — Monte-Carlo JJ-area statistics",
+        key="waf_gauss",
+        help="Model the source as a 2-D Gaussian of r.m.s. size σ [mm] instead "
+             "of an ideal point (angular spread ≈ σ/L).  The engine runs N_mc "
+             "times per on-wafer cell to build a per-cell mean ± σ of the JJ "
+             "area.")
+    sigma_src, n_mc = 0.0, 0
+    if gauss_on:
+        gc1, gc2 = st.columns(2)
+        sigma_src = float(gc1.number_input(
+            "Source size σ [mm]", min_value=0.0, max_value=50.0, value=2.0,
+            step=0.5, key="waf_sigma",
+            help="R.m.s. transverse source size; angular spread ≈ σ/L."))
+        n_mc = int(gc2.number_input(
+            "Monte-Carlo samples / cell", min_value=2, max_value=200, value=20,
+            step=1, key="waf_nmc",
+            help="Engine runs per on-wafer cell.  Total = N_mc × on-wafer "
+                 "cells — keep modest; this is the expensive path."))
+        st.caption(
+            f"≈ {n_mc * n_on} engine runs (N_mc={n_mc} × {n_on} cells) • "
+            f"σ/L ≈ {np.degrees(sigma_src / waf_L):.3f}° at L={waf_L:.0f} mm.")
+
     # Per-evaporation schematic of the fixed source + tilted wafer (always on).
     with st.spinner("Drawing source / wafer-tilt schematic…"):
         figgeo = vv.render_wafer_geometry(params, waf_L, c_flat / R_mm)
@@ -1030,27 +1065,61 @@ with tab_wafer:
                 theta_grids[lbl], phi_grids[lbl] = tg, pg
 
             warea = np.full((waf_n, waf_n), np.nan)       # [iy, ix]; off-wafer NaN
-            done = 0
-            prog = st.progress(0.0, text="Simulating wafer positions…")
-            for iy in range(waf_n):
-                for ix in range(waf_n):
-                    if not wmask[iy, ix]:
-                        continue                          # skip off-wafer cells
-                    q = wafer_params(params, float(Xg[iy, ix]),
-                                     float(Yg[iy, ix]), waf_L)
-                    warea[iy, ix] = _wafer_area(_wafer_sig(q), q)
-                    done += 1
-                    prog.progress(done / n_on,
-                                  text=f"Simulating… {done}/{n_on}")
-            prog.empty()
+            wstd = wsamp = None
+            if gauss_on:
+                # Finite-source Monte-Carlo: N_mc engine runs per on-wafer cell.
+                # A fixed seed makes the result reproducible and cache-friendly
+                # on re-press (each perturbed-angle sample is a distinct
+                # _wafer_area cache key).
+                wstd = np.full((waf_n, waf_n), np.nan)
+                wsamp = np.full((waf_n, waf_n, n_mc), np.nan)   # raw MC areas
+                rng = np.random.default_rng(0)
+                done, total = 0, n_on * n_mc
+                prog = st.progress(0.0, text="Monte-Carlo sampling…")
+                for iy in range(waf_n):
+                    for ix in range(waf_n):
+                        if not wmask[iy, ix]:
+                            continue                      # skip off-wafer cells
+                        smp = np.empty(n_mc)
+                        for m in range(n_mc):
+                            q = wafer_params_gaussian(
+                                params, float(Xg[iy, ix]), float(Yg[iy, ix]),
+                                waf_L, sigma_src, rng)
+                            smp[m] = _wafer_area(_wafer_sig(q), q)
+                            done += 1
+                            prog.progress(done / total,
+                                          text=f"Monte-Carlo… {done}/{total}")
+                        warea[iy, ix] = float(np.mean(smp))
+                        wstd[iy, ix] = float(np.std(smp))
+                        wsamp[iy, ix, :] = smp
+                prog.empty()
+            else:
+                done = 0
+                prog = st.progress(0.0, text="Simulating wafer positions…")
+                for iy in range(waf_n):
+                    for ix in range(waf_n):
+                        if not wmask[iy, ix]:
+                            continue                      # skip off-wafer cells
+                        q = wafer_params(params, float(Xg[iy, ix]),
+                                         float(Yg[iy, ix]), waf_L)
+                        warea[iy, ix] = _wafer_area(_wafer_sig(q), q)
+                        done += 1
+                        prog.progress(done / n_on,
+                                      text=f"Simulating… {done}/{n_on}")
+                prog.empty()
             st.session_state["_wafermap"] = dict(
-                coords=wcoords, areas=warea, theta=theta_grids, phi=phi_grids,
-                L=waf_L, R=R_mm, c=c_flat, d=d_flat, size=waf_size, n=waf_n,
-                res=waf_res, mode=params.mode, stack=params.stack)
+                coords=wcoords, areas=warea, std=wstd, samples=wsamp,
+                theta=theta_grids,
+                phi=phi_grids, L=waf_L, R=R_mm, c=c_flat, d=d_flat,
+                size=waf_size, n=waf_n, res=waf_res, mode=params.mode,
+                stack=params.stack, gauss=bool(gauss_on), sigma=sigma_src,
+                n_mc=n_mc)
 
     wm = st.session_state.get("_wafermap")
     if wm and "theta" in wm:                              # new-format result
         warea = wm["areas"]
+        wstd = wm.get("std")                              # per-cell 1σ (or None)
+        gauss = bool(wm.get("gauss"))                     # finite-source MC?
 
         # (a) Drawn wafer (matplotlib): area + Ic clipped to the disk + flat.
         figw = vv.render_wafer_map_2d(
@@ -1081,9 +1150,18 @@ with tab_wafer:
                                     format=".2f"))
             tips.append(alt.Tooltip(f"{key}_ph:Q", title=f"{lbl} φ′ [°]",
                                     format=".2f"))
+        if gauss:                                         # finite-source error
+            cdata["area_std"] = wstd[on]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cdata["rel"] = np.where(warea[on] != 0,
+                                        wstd[on] / warea[on] * 100.0, np.nan)
+            tips.append(alt.Tooltip("area_std:Q", title="area σ [nm²]",
+                                    format=".0f"))
+            tips.append(alt.Tooltip("rel:Q", title="rel err [%]", format=".2f"))
         cdf = pd.DataFrame(cdata)
         cdf = cdf.assign(x0=cdf["x"] - h / 2, x1=cdf["x"] + h / 2,
-                         y0=cdf["y"] - h / 2, y1=cdf["y"] + h / 2)
+                         y0=cdf["y"] - h / 2, y1=cdf["y"] + h / 2,
+                         cid=np.arange(len(cdf)))         # cell id (on-wafer order)
         Rd = wm["R"] * 1.05                              # equal, symmetric domain
         heat = alt.Chart(cdf).mark_rect().encode(
             x=alt.X("x0:Q", title="wafer x  [mm]",
@@ -1105,11 +1183,71 @@ with tab_wafer:
                         use_container_width=False)
         st.caption("Hover any cell for its area, Ic, and per-evaporation "
                    "effective (θ′, φ′).")
+        if gauss:                                         # σ (1σ error) heatmap
+            heat_std = alt.Chart(cdf).mark_rect().encode(
+                x=alt.X("x0:Q", title="wafer x  [mm]",
+                        scale=alt.Scale(domain=[-Rd, Rd], nice=False)),
+                x2="x1:Q",
+                y=alt.Y("y0:Q", title="wafer y  [mm]",
+                        scale=alt.Scale(domain=[-Rd, Rd], nice=False)),
+                y2="y1:Q",
+                color=alt.Color("area_std:Q", title="area σ [nm²]",
+                                scale=alt.Scale(scheme="magma")),
+                tooltip=tips)
+            samp = wm.get("samples")
+            if samp is None:                              # legacy dict; σ map only
+                st.altair_chart(
+                    (heat_std + outline).properties(
+                        width=480, height=480,
+                        title="JJ-area σ (1σ error) from finite-source "
+                              "Monte-Carlo"),
+                    use_container_width=False)
+                st.caption(f"Per-cell 1σ over N_mc={wm.get('n_mc')} samples "
+                           f"(source σ = {wm.get('sigma'):.1f} mm).")
+            else:
+                # Hover a cell on the σ map → its JJ-area distribution (right).
+                samp_on = samp[on]                        # (n_on, n_mc)
+                n_cells, nmc = samp_on.shape
+                long_df = pd.DataFrame({
+                    "cid": np.repeat(np.arange(n_cells), nmc),
+                    "area": samp_on.reshape(-1)})
+                center_cid = int(np.argmin(Xg[on] ** 2 + Yg[on] ** 2))
+                csel = alt.selection_point(
+                    fields=["cid"], on="mouseover", empty=False,
+                    value=[{"cid": center_cid}])
+                gmin = float(np.nanmin(samp_on))
+                gmax = float(np.nanmax(samp_on))
+                if gmax <= gmin:                          # all samples identical
+                    gmax = gmin + 1.0
+                hist = alt.Chart(long_df).mark_bar(color="#64B5F6").encode(
+                    x=alt.X("area:Q",
+                            bin=alt.Bin(extent=[gmin, gmax], maxbins=18),
+                            title="JJ area [nm²]"),
+                    y=alt.Y("count()", title="samples")
+                    ).transform_filter(csel).properties(
+                        width=360, height=480,
+                        title="Hovered-cell JJ-area distribution")
+                sig_map = (heat_std.add_params(csel) + outline).properties(
+                    width=480, height=480,
+                    title="JJ-area σ (1σ error) — hover a cell for its "
+                          "distribution")
+                st.altair_chart(sig_map | hist, use_container_width=False)
+                st.caption(
+                    f"Left: per-cell 1σ over N_mc={wm.get('n_mc')} samples "
+                    f"(source σ = {wm.get('sigma'):.1f} mm).  Right: the "
+                    f"hovered cell's JJ-area histogram (bin extent shared "
+                    f"across cells; defaults to the centre cell).")
 
         # (c) Sortable table of every on-wafer cell (pretty column names).
         rows = {"x [mm]": Xg[on].round(2), "y [mm]": Yg[on].round(2),
                 "area [nm²]": warea[on].round(0),
                 "Ic [µA]": (warea[on] * 1e-4).round(4)}
+        if gauss:
+            rows["area σ [nm²]"] = wstd[on].round(0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rows["rel err [%]"] = np.where(
+                    warea[on] != 0, wstd[on] / warea[on] * 100.0,
+                    np.nan).round(2)
         for lbl in wm["theta"]:
             rows[f"{lbl} θ′ [°]"] = wm["theta"][lbl][on].round(2)
             rows[f"{lbl} φ′ [°]"] = wm["phi"][lbl][on].round(2)
@@ -1137,6 +1275,24 @@ with tab_wafer:
             f"Centre cell (nominal single-JJ) = {warea[ci, ci]:.0f} nm²  •  "
             f"std/mean = {cv:.1f} %  •  Ic range "
             f"{np.nanmin(wic):.3f}–{np.nanmax(wic):.3f} µA.")
+        if gauss:
+            mean_std = float(np.nanmean(wstd))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rel_map = np.where(warea != 0, wstd / warea * 100.0, np.nan)
+            max_rel = float(np.nanmax(rel_map))
+            g1, g2, g3 = st.columns(3)
+            g1.metric("Mean σ (error)", f"{mean_std:.0f} nm²",
+                      help="Mean over on-wafer cells of the per-cell 1σ JJ-area "
+                           "spread from the finite-source Monte-Carlo.")
+            g2.metric("Max rel error", f"{max_rel:.2f} %",
+                      help="Largest per-cell σ/mean across the wafer.")
+            g3.metric("MC samples / cell", f"{wm.get('n_mc')}")
+            st.caption(
+                f"Finite (Gaussian) source σ = {wm.get('sigma'):.1f} mm "
+                f"(angular spread ≈ "
+                f"{np.degrees(wm.get('sigma') / wm['L']):.3f}° at "
+                f"L={wm['L']:.0f} mm).  ‘Error’ = per-cell 1σ of the JJ area "
+                f"over N_mc={wm.get('n_mc')} Monte-Carlo depositions.")
     else:
         st.info("Set the source/grid configuration above and press "
                 "**Run wafer map**.")

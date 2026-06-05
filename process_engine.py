@@ -220,12 +220,15 @@ def _wafer_rot(theta_deg: float, phi_deg: float) -> np.ndarray:
     return Ry @ Rzm
 
 
-def wafer_local_angles(theta_deg, phi_deg, X, Y, L):
+def wafer_local_angles(theta_deg, phi_deg, X, Y, L, S0=None):
     """Local (θ′, φ′) [deg] a device at wafer-frame (X, Y) sees under the Plassys
     fixed-source / tilted-wafer model.
 
     Source at lab origin; wafer centre at (0, 0, −L) facing the source; wafer
     tilted by ``R = Ry(θ)·Rz(−φ)``.  ``X``, ``Y``, ``L`` share length units (mm).
+    Optional ``S0`` = (x, y, z) lab source offset [mm] (default origin) models a
+    displaced / finite source — the beam direction is taken from ``S0`` to the
+    device instead of from the origin.
     Vectorised over array ``X``/``Y``.  Returns the nominal-equivalent angle at
     X = Y = 0 (for a negative nominal θ the physically-identical positive-θ /
     flipped-φ pair is returned; the engine is angle-convention-agnostic).
@@ -235,7 +238,9 @@ def wafer_local_angles(theta_deg, phi_deg, X, Y, L):
     C = np.array([0.0, 0.0, -float(L)])
     X = np.asarray(X, float); Y = np.asarray(Y, float)
     P = C + X[..., None] * eX + Y[..., None] * eY        # lab positions (..., 3)
-    d = P / np.linalg.norm(P, axis=-1, keepdims=True)     # source at origin
+    if S0 is not None:                                   # finite / displaced src
+        P = P - np.asarray(S0, float)                    # beam from S0 → device
+    d = P / np.linalg.norm(P, axis=-1, keepdims=True)     # unit beam direction
     dloc = d @ R                                          # == Rᵀ·d  (per row)
     th = np.degrees(np.arccos(np.clip(-dloc[..., 2], -1.0, 1.0)))
     ph = np.degrees(np.arctan2(dloc[..., 1], dloc[..., 0]))
@@ -252,5 +257,26 @@ def wafer_params(p: "ProcessParams", X, Y, L) -> "ProcessParams":
     q = copy.copy(p)
     for _lbl, ta, pa, th, ph in evap_beams(p):
         lth, lph = wafer_local_angles(th, ph, float(X), float(Y), L)
+        setattr(q, ta, float(lth)); setattr(q, pa, float(lph))
+    return q
+
+
+def wafer_params_gaussian(p: "ProcessParams", X, Y, L, sigma_src, rng):
+    """One Monte-Carlo draw of ``wafer_params`` for a finite (Gaussian) source of
+    r.m.s. size ``sigma_src`` [mm].
+
+    Each evaporation independently draws a transverse source displacement
+    ``(δx, δy) ~ N(0, σ²)`` in the lab ``z = 0`` plane (a separate physical
+    deposition), so its local incidence angle is perturbed by ≈ σ/L — computed
+    exactly via the displaced-source path of ``wafer_local_angles`` (no
+    small-angle approximation).  ``rng`` is a ``numpy`` ``Generator``.  Returns a
+    ProcessParams copy with the perturbed (θ, φ); only beam-angle fields are
+    touched, so the single-JJ params and the engine stay untouched.
+    """
+    q = copy.copy(p)
+    for _lbl, ta, pa, th, ph in evap_beams(p):
+        dx, dy = rng.normal(0.0, float(sigma_src), size=2)
+        lth, lph = wafer_local_angles(th, ph, float(X), float(Y), L,
+                                      S0=np.array([dx, dy, 0.0]))
         setattr(q, ta, float(lth)); setattr(q, pa, float(lph))
     return q

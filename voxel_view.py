@@ -928,12 +928,13 @@ def render_thickness_surface(r: DepositionResult, view_half=None):
 
 # ── Plassys source / tilted-wafer schematic ────────────────────────
 def render_wafer_geometry(p, L, flat_ratio=0.65):
-    """Per-evaporation schematic: fixed point source BELOW + tilted wafer,
-    as a 3-D perspective plus orthographic top / front / side projections.
+    """Per-evaporation schematic: fixed point source BELOW + tilted wafer, each
+    evaporation shown as a compact 2×2 block — 3-D perspective + orthographic
+    top / front / side projections grouped around it.
 
-    Columns = active evaporations (2 bilayer/Manhattan, 4 trilayer).  Rows:
-      1. 3-D perspective   2. top view (x–y, looking down −z)
-      3. front view (x–z, looking along −y)   4. side view (y–z, along +x)
+    One 2×2 block per active evaporation (2 bilayer/Manhattan, 4 trilayer),
+    tiled in a near-square meta-grid.  Within a block: 3-D (top-left), top view
+    x–y (top-right), front view x–z (bottom-left), side view y–z (bottom-right).
     Real-Plassys layout: the fixed source sits at the origin (red dot, below) and
     the beam goes UP to the wafer (disk + primary flat オリフラ) held centre-up at
     z = +L and tilted by R = Ry(θ)·Rz(−φ).  Orange arrow = wafer normal (toward
@@ -942,7 +943,10 @@ def render_wafer_geometry(p, L, flat_ratio=0.65):
     """
     beams = pe.evap_beams(p)
     n = len(beams)
-    fig = plt.figure(figsize=(3.4 * n, 12.6))
+    mcols = int(np.ceil(np.sqrt(n)))             # evap blocks in a near-square grid
+    mrows = int(np.ceil(n / mcols))
+    fig = plt.figure(figsize=(6.8 * mcols, 6.4 * mrows))
+    gs = fig.add_gridspec(2 * mrows, 2 * mcols)
     pane = (0.05, 0.07, 0.09, 1.0)
     flip = np.array([1.0, 1.0, -1.0])           # source below / beam upward
     C = np.array([0.0, 0.0, float(L)])          # wafer centre ABOVE the source
@@ -963,12 +967,14 @@ def render_wafer_geometry(p, L, flat_ratio=0.65):
         ax.set_xlabel(xl, fontsize=8); ax.set_ylabel(yl, fontsize=8)
         ax.set_title(ttl, fontsize=8); ax.tick_params(labelsize=7)
 
-    for k, (lbl, _ta, _pa, th, ph) in enumerate(beams, 1):
+    for kk, (lbl, _ta, _pa, th, ph) in enumerate(beams):
+        br, bc = divmod(kk, mcols)
+        r0, c0 = 2 * br, 2 * bc
         Rm = pe._wafer_rot(th, ph)
         eX, eY, nrm = Rm[:, 0] * flip, Rm[:, 1] * flip, Rm[:, 2] * flip
         pts = C + uv[:, 0:1] * eX + uv[:, 1:2] * eY     # tilted wafer rim (M,3)
 
-        ax = fig.add_subplot(4, n, k, projection="3d")        # row 1 — 3-D
+        ax = fig.add_subplot(gs[r0, c0], projection="3d")     # block top-left — 3-D
         ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], color="#64B5F6", lw=1.8)
         ax.plot_trisurf(pts[:, 0], pts[:, 1], pts[:, 2],
                         color="#64B5F6", alpha=0.22, linewidth=0)
@@ -983,12 +989,12 @@ def render_wafer_geometry(p, L, flat_ratio=0.65):
         ax.set_xlabel("x  [mm]", fontsize=8); ax.set_ylabel("y  [mm]", fontsize=8)
         ax.set_zlabel("z  [mm]", fontsize=8)
 
-        _proj(fig.add_subplot(4, n, n + k), pts, nrm, 0, 1,        # row 2 top
-              "x  [mm]", "y  [mm]", f"{lbl} — top (x–y)")
-        _proj(fig.add_subplot(4, n, 2 * n + k), pts, nrm, 0, 2,    # row 3 front
-              "x  [mm]", "z  [mm]", f"{lbl} — front (x–z)")
-        _proj(fig.add_subplot(4, n, 3 * n + k), pts, nrm, 1, 2,    # row 4 side
-              "y  [mm]", "z  [mm]", f"{lbl} — side (y–z)")
+        _proj(fig.add_subplot(gs[r0, c0 + 1]), pts, nrm, 0, 1,     # top-right
+              "x  [mm]", "y  [mm]", "top (x–y)")
+        _proj(fig.add_subplot(gs[r0 + 1, c0]), pts, nrm, 0, 2,     # bottom-left
+              "x  [mm]", "z  [mm]", "front (x–z)")
+        _proj(fig.add_subplot(gs[r0 + 1, c0 + 1]), pts, nrm, 1, 2, # bottom-right
+              "y  [mm]", "z  [mm]", "side (y–z)")
 
     fig.suptitle("Fixed point source below (red) + tilted wafer (with flat): "
                  "3-D + orthographic top / front / side projections", fontsize=11)
