@@ -468,6 +468,32 @@ with st.sidebar:
     show_shadow   = st.checkbox("Show shadow deposits (top view)", True)
     show_undercut = st.checkbox("Show undercut regions (top view)", True)
 
+    st.divider()
+    st.subheader("🎲 Finite (Gaussian) e-beam source")
+    jj_gauss = st.checkbox(
+        "Monte-Carlo JJ-area statistics", key="jj_gauss",
+        help="Model the e-beam source as a 2-D Gaussian of r.m.s. size σ [mm] at "
+             "throw distance L [mm] (beam angular spread ≈ σ/L) instead of an ideal "
+             "point. Press Run to execute N_mc engine simulations — each "
+             "independently jitters every evaporation's beam angle — and build the "
+             "JJ-area distribution (mean ± σ). Results appear in the 🎲 Source MC tab.")
+    if jj_gauss:
+        jc1, jc2 = st.columns(2)
+        jj_sigma = float(jc1.number_input("σ [mm]", 0.0, 50.0, 2.0, 0.5,
+                                          key="jj_sigma",
+                                          help="Source r.m.s. transverse size."))
+        jj_L = float(jc2.number_input("L [mm]", 20.0, 2000.0, 200.0, 10.0,
+                                      key="jj_L",
+                                      help="Source→sample throw distance; spread ≈ σ/L."))
+        jj_nmc = int(st.number_input("Monte-Carlo samples", 2, 1000, 50, 1,
+                                     key="jj_nmc", help="Number of engine runs."))
+        st.caption(f"Beam spread ≈ {np.degrees(jj_sigma / jj_L):.3f}° (σ/L) • "
+                   f"{jj_nmc} engine runs at {res_level}.")
+        run_jj_mc = st.button("▶ Run source Monte-Carlo", key="run_jj_mc",
+                              use_container_width=True)
+    else:
+        jj_sigma, jj_L, jj_nmc, run_jj_mc = 0.0, 200.0, 0, False
+
 params = ProcessParams(
     t_pmma=t_pmma, t_mma=t_mma, undercut=undercut,
     angle1=angle1, phi1=phi1, t_metal1=t_metal1,
@@ -492,15 +518,25 @@ def _run_engine(ekey, _params, max_cells, min_vox):
     combos, combo_map = junction_combos(r)
     return r, jm, area, ox, oy, juncs, combos, combo_map
 
-ekey = (params.mode, params.t_pmma, params.t_mma, params.undercut,
-        params.angle1, params.phi1, params.t_metal1,
-        params.angle2, params.phi2, params.t_metal2,
-        params.bridge_len, params.bridge_w, params.bridge_pmma_gap,
-        params.manhattan_wx, params.manhattan_wy,
-        params.manhattan_theta, params.manhattan_delta, params.manhattan_h,
-        _max_cells, _min_vox,
-        params.stack, params.tri_t1, params.tri_t2, params.tri_t3, params.tri_t4,
-        params.tri_angle2, params.tri_phi2, params.tri_angle4, params.tri_phi4)
+def _ekey_for(p):
+    """Engine cache-key tuple for a ProcessParams at the current sidebar
+    resolution (mirrors exactly the fields `simulate` consumes)."""
+    return (p.mode, p.t_pmma, p.t_mma, p.undercut, p.angle1, p.phi1, p.t_metal1,
+            p.angle2, p.phi2, p.t_metal2, p.bridge_len, p.bridge_w,
+            p.bridge_pmma_gap, p.manhattan_wx, p.manhattan_wy, p.manhattan_theta,
+            p.manhattan_delta, p.manhattan_h, _max_cells, _min_vox, p.stack,
+            p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4, p.tri_angle2, p.tri_phi2,
+            p.tri_angle4, p.tri_phi4)
+
+@st.cache_data(show_spinner=False)
+def _mc_area(sig, _p):
+    """Lean engine scorer for the finite-source Monte-Carlo — JJ area only
+    (skips junction_combos); cached per `sig` (= _ekey_for(_p))."""
+    r = simulate(_p, max_cells=_max_cells, min_vox=_min_vox)
+    _, area, _, _, _ = junction_footprint(r)
+    return float(area)
+
+ekey = _ekey_for(params)
 with st.spinner("Running 3D shadow-evaporation engine..."):
     (eng, eng_jm, eng_area, eng_ox, eng_oy, eng_juncs,
      eng_combos, eng_combo_map) = _run_engine(
@@ -511,6 +547,24 @@ eng_njunc = len(eng_juncs)
 eng_ic = eng_area * 1e-4
 # Josephson inductance L_J and energy E_J derived from that critical current.
 eng_jj = jj_electrical(eng_ic)
+
+# ── Finite (Gaussian) e-beam source Monte-Carlo (opt-in, button-triggered) ──
+# Reuses wafer_params_gaussian at wafer-centre (X=Y=0): each draw independently
+# jitters every evaporation's beam angle by the finite-source spread ≈ σ/L, then
+# scores the JJ area with the same cached engine.  Nominal point-source run above
+# is untouched; results land in st.session_state["_jjmc"] for the Source MC tab.
+if run_jj_mc:
+    rng = np.random.default_rng(0)            # fixed seed → reproducible/cacheable
+    smp = np.empty(jj_nmc)
+    prog = st.sidebar.progress(0.0, text="Source Monte-Carlo…")
+    for m in range(jj_nmc):
+        q = wafer_params_gaussian(params, 0.0, 0.0, jj_L, jj_sigma, rng)
+        smp[m] = _mc_area(_ekey_for(q), q)
+        prog.progress((m + 1) / jj_nmc, text=f"Source MC… {m + 1}/{jj_nmc}")
+    prog.empty()
+    st.session_state["_jjmc"] = dict(
+        samples=smp, nominal=float(eng_area), sigma=jj_sigma, L=jj_L,
+        n_mc=jj_nmc, mode=params.mode, stack=params.stack, res=res_level)
 
 # Now the engine has run, fill the sidebar Save box with a download button that
 # exports every parameter + the junction results (re-loadable via the uploader).
@@ -524,12 +578,13 @@ with _save_box:
         use_container_width=True)
 
 # ─── Tabs ─────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab_scan, tab_wafer, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab_scan, tab_srcmc, tab_wafer, tab5 = st.tabs([
     "📐 Cross-section",
     "🗺️ Top View",
     "🔄 φ Junction View",
     "🔍 Break Check",
     "📈 Parameter Scan",
+    "🎲 Source MC",
     "🌐 Wafer Map",
     "📊 Junction Area",
 ])
@@ -964,6 +1019,52 @@ with tab_scan:
             fig_s.tight_layout()
             st.pyplot(fig_s, use_container_width=True)
             plt.close(fig_s)
+
+# ═══ TAB: Source MC (finite Gaussian e-beam source — single JJ) ══
+with tab_srcmc:
+    st.subheader("Finite (Gaussian) e-beam source — JJ-area Monte-Carlo")
+    st.caption("Models the e-beam source as a 2-D Gaussian (r.m.s. size σ at throw "
+               "distance L; beam spread ≈ σ/L) instead of an ideal point. Each run "
+               "independently jitters every evaporation's beam angle, giving the "
+               "probabilistic JJ-area distribution. Enable it and press ▶ Run in the "
+               "left sidebar.")
+    mc = st.session_state.get("_jjmc")
+    if not st.session_state.get("jj_gauss"):
+        st.info("Enable **🎲 Finite (Gaussian) e-beam source** in the left sidebar, "
+                "set σ / L / samples, then press ▶ Run source Monte-Carlo.")
+    elif mc is None:
+        st.info("Press **▶ Run source Monte-Carlo** in the sidebar to compute the "
+                "JJ-area distribution.")
+    else:
+        s = mc["samples"]
+        mean = float(np.mean(s)); std = float(np.std(s))
+        rel = (std / mean * 100.0) if mean > 0 else float("nan")
+        nominal = mc["nominal"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Mean JJ area", f"{mean:,.0f} nm²")
+        c2.metric("σ (1σ error)", f"{std:,.0f} nm²", f"{rel:.2f}% rel")
+        c3.metric("Point-source area", f"{nominal:,.0f} nm²",
+                  (f"{(mean - nominal) / nominal * 100:+.2f}% vs mean")
+                  if nominal > 0 else None)
+        c4.metric("MC samples", f"{mc['n_mc']}")
+        gmin, gmax = float(np.min(s)), float(np.max(s))
+        if gmax <= gmin:
+            gmax = gmin + 1.0
+        base = alt.Chart(pd.DataFrame({"area": s})).mark_bar(color="#64B5F6").encode(
+            x=alt.X("area:Q", bin=alt.Bin(extent=[gmin, gmax], maxbins=24),
+                    title="JJ area [nm²]"),
+            y=alt.Y("count()", title="samples"))
+        r_mean = alt.Chart(pd.DataFrame({"v": [mean]})).mark_rule(
+            color="#CE93D8", size=2).encode(x="v:Q")
+        r_nom = alt.Chart(pd.DataFrame({"v": [nominal]})).mark_rule(
+            color="#FFB74D", strokeDash=[6, 4], size=2).encode(x="v:Q")
+        st.altair_chart((base + r_mean + r_nom).properties(
+            height=360, title="JJ-area distribution (finite-source Monte-Carlo)"),
+            use_container_width=True)
+        st.caption(f"σ = {mc['sigma']:.1f} mm, L = {mc['L']:.0f} mm "
+                   f"(beam spread ≈ {np.degrees(mc['sigma'] / mc['L']):.3f}°) • "
+                   f"N_mc = {mc['n_mc']} • {mc['res']}.  Purple line = MC mean, "
+                   f"dashed orange = point-source area.")
 
 # ═══ TAB: Wafer Map (Plassys point-source / tilted-wafer) ════════
 with tab_wafer:
