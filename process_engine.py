@@ -261,22 +261,53 @@ def wafer_params(p: "ProcessParams", X, Y, L) -> "ProcessParams":
     return q
 
 
-def wafer_params_gaussian(p: "ProcessParams", X, Y, L, sigma_src, rng):
-    """One Monte-Carlo draw of ``wafer_params`` for a finite (Gaussian) source of
-    r.m.s. size ``sigma_src`` [mm].
+def sample_beam_cloud(pattern, size, n, rng):
+    """``n``×2 array of source-plane offsets ``(dx, dy)`` [mm] drawn from the e-beam
+    raster intensity ``pattern`` (how the source spread is shaped on the target).
 
-    Each evaporation independently draws a transverse source displacement
-    ``(δx, δy) ~ N(0, σ²)`` in the lab ``z = 0`` plane (a separate physical
-    deposition), so its local incidence angle is perturbed by ≈ σ/L — computed
-    exactly via the displaced-source path of ``wafer_local_angles`` (no
-    small-angle approximation).  ``rng`` is a ``numpy`` ``Generator``.  Returns a
-    ProcessParams copy with the perturbed (θ, φ); only beam-angle fields are
-    touched, so the single-JJ params and the engine stay untouched.
+    All patterns are azimuthally isotropic.  ``size`` meaning: ``gaussian`` → σ
+    (r.m.s.); ``uniform`` / ``rotline`` → disk diameter.  ``point`` → zeros (ideal
+    point source).  ``rotline`` is a line spot rotated uniformly (the standard recipe)
+    → an area density ∝ 1/ρ, i.e. *uniform in radius*.  ``rng`` is a numpy
+    ``Generator``; any unknown pattern degrades to a point source.
+    """
+    n = int(n); s = float(size)
+    if s <= 0 or pattern == "point":
+        return np.zeros((n, 2))
+    if pattern == "gaussian":                            # isotropic 2-D Gaussian, σ=s
+        return rng.normal(0.0, s, size=(n, 2))
+    if pattern == "uniform":                             # area-uniform disk, dia = s
+        r = (s / 2.0) * np.sqrt(rng.random(n)); ph = rng.random(n) * 2.0 * np.pi
+        return np.column_stack([r * np.cos(ph), r * np.sin(ph)])
+    if pattern == "rotline":                             # rotating line → 1/ρ disk
+        t = (rng.random(n) - 0.5) * s                    # point on the line, |t| ≤ s/2
+        ph = rng.random(n) * 2.0 * np.pi                 # uniform rotation
+        return np.column_stack([t * np.cos(ph), t * np.sin(ph)])
+    return np.zeros((n, 2))
+
+
+def wafer_params_source(p: "ProcessParams", X, Y, L, pattern, size, rng):
+    """One Monte-Carlo draw of ``wafer_params`` for a finite source whose spatial
+    spread follows ``pattern`` (see :func:`sample_beam_cloud`).
+
+    Each evaporation independently draws a transverse source offset (a separate
+    physical deposition), so its local incidence angle is perturbed accordingly —
+    computed exactly via the displaced-source path of ``wafer_local_angles`` (no
+    small-angle approximation).  Returns a ProcessParams copy with the perturbed
+    (θ, φ); only beam-angle fields are touched, so the single-JJ params and the
+    engine stay untouched.
     """
     q = copy.copy(p)
-    for _lbl, ta, pa, th, ph in evap_beams(p):
-        dx, dy = rng.normal(0.0, float(sigma_src), size=2)
+    beams = evap_beams(p)
+    offs = sample_beam_cloud(pattern, size, len(beams), rng)
+    for (_lbl, ta, pa, th, ph), (dx, dy) in zip(beams, offs):
         lth, lph = wafer_local_angles(th, ph, float(X), float(Y), L,
                                       S0=np.array([dx, dy, 0.0]))
         setattr(q, ta, float(lth)); setattr(q, pa, float(lph))
     return q
+
+
+def wafer_params_gaussian(p: "ProcessParams", X, Y, L, sigma_src, rng):
+    """Back-compat wrapper: a Gaussian-pattern draw of :func:`wafer_params_source`
+    (finite source of r.m.s. size ``sigma_src`` [mm])."""
+    return wafer_params_source(p, X, Y, L, "gaussian", sigma_src, rng)

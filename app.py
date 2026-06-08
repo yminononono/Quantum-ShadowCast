@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from gds_parser import load_gds_polygons, list_layers
 from process_engine import (ProcessParams, shadow_vector, wafer_params,
-                            wafer_params_gaussian,
+                            wafer_params_gaussian, wafer_params_source,
+                            sample_beam_cloud,
                             evap_beams, wafer_local_angles)
 from cross_section import draw_cross_section
 from phi_cross_section import draw_junction_topview, draw_phi_scan
@@ -49,6 +50,63 @@ WAFER_SPECS = {
     "4 inch": (50.0, 32.50),
     "6 inch": (75.0, 57.50),
 }
+
+# ─── E-beam source raster patterns (finite-source Monte-Carlo) ───────────────
+# label → sampler key consumed by process_engine.sample_beam_cloud.  "Rotating line"
+# (line spot swept + rotated 10 rpm → centre-peaked disk, areal density ∝ 1/ρ) is the
+# default; it is the physically correct profile for the standard recipe.
+BEAM_PATTERNS = {
+    "Rotating line (disk, 1/ρ)": "rotline",
+    "Uniform disk":              "uniform",
+    "Gaussian":                  "gaussian",
+    "Point":                     "point",
+}
+
+
+def _beam_pattern_controls(prefix, container=st):
+    """Render the beam-pattern picker + its size input, returning ``(pattern_key,
+    size)`` for ``sample_beam_cloud`` / ``wafer_params_source``.  ``size`` is σ for
+    Gaussian, else the disk diameter; all patterns are isotropic (no orientation).
+    Widget keys are ``prefix``-scoped so the single-JJ and wafer-map pickers stay
+    independent."""
+    lbl = container.selectbox("Beam pattern", list(BEAM_PATTERNS),
+                              key=f"{prefix}_pattern",
+                              help="Source intensity shape. 'Rotating line' (line spot "
+                                   "swept + rotated 10 rpm) is the standard recipe — a "
+                                   "centre-peaked disk, areal density ∝ 1/ρ.")
+    pat = BEAM_PATTERNS[lbl]
+    size = 0.0
+    if pat == "gaussian":
+        size = float(container.number_input("σ [mm]", 0.0, 50.0, 2.0, 0.5,
+                                            key=f"{prefix}_sigma",
+                                            help="Source r.m.s. transverse size."))
+    elif pat in ("uniform", "rotline"):
+        size = float(container.number_input(
+            "Source size [mm] (diameter)", 0.0, 60.0, 12.0, 0.5,
+            key=f"{prefix}_size",
+            help="Full disk diameter (≈10–15 mm typical)."))
+    return pat, size
+
+
+def _source_dist_charts(pattern, size, rng_seed=1, n=4000):
+    """Altair (scatter, radial-profile) pair visualising the source-plane intensity
+    distribution for the chosen beam ``pattern`` — the 2-D sample cloud and its
+    probability vs radius ρ (flat for rotating-line, rising ∝ρ for uniform disk,
+    Rayleigh-peaked for Gaussian)."""
+    cloud = sample_beam_cloud(pattern, size, n, np.random.default_rng(rng_seed))
+    lim = max(1.0, float(np.abs(cloud).max()) * 1.1)
+    df = pd.DataFrame({"x": cloud[:, 0], "y": cloud[:, 1],
+                       "rho": np.hypot(cloud[:, 0], cloud[:, 1])})
+    scatter = alt.Chart(df).mark_circle(size=8, opacity=0.25, color="#64B5F6").encode(
+        x=alt.X("x:Q", scale=alt.Scale(domain=[-lim, lim]), title="source x [mm]"),
+        y=alt.Y("y:Q", scale=alt.Scale(domain=[-lim, lim]), title="source y [mm]")
+        ).properties(width=320, height=320,
+                     title=f"Source-plane intensity — {pattern}")
+    radial = alt.Chart(df).mark_bar(color="#80CBC4").encode(
+        x=alt.X("rho:Q", bin=alt.Bin(maxbins=30), title="radius ρ [mm]"),
+        y=alt.Y("count()", title="samples ∝ probability")
+        ).properties(width=320, height=320, title="Radial profile P(ρ)")
+    return scatter, radial
 
 # Sidebar widget keys.  Mode-specific widgets get DISTINCT keys (prefixed) so
 # switching modes can never feed an out-of-range value into a shared slider.
@@ -469,30 +527,29 @@ with st.sidebar:
     show_undercut = st.checkbox("Show undercut regions (top view)", True)
 
     st.divider()
-    st.subheader("🎲 Finite (Gaussian) e-beam source")
-    jj_gauss = st.checkbox(
-        "Monte-Carlo JJ-area statistics", key="jj_gauss",
-        help="Model the e-beam source as a 2-D Gaussian of r.m.s. size σ [mm] at "
-             "throw distance L [mm] (beam angular spread ≈ σ/L) instead of an ideal "
-             "point. Press Run to execute N_mc engine simulations — each "
+    st.subheader("🎲 Finite e-beam source — Monte-Carlo")
+    jj_src = st.checkbox(
+        "Enable beam-pattern JJ-area statistics", key="jj_src",
+        help="Model the e-beam source with a finite spatial spread set by its raster "
+             "pattern (rotating line / uniform disk / Gaussian / point) instead of an "
+             "ideal point. Press Run to execute N_mc engine simulations — each "
              "independently jitters every evaporation's beam angle — and build the "
              "JJ-area distribution (mean ± σ). Results appear in the 🎲 Source MC tab.")
-    if jj_gauss:
+    if jj_src:
+        jj_pat, jj_size = _beam_pattern_controls("jj")
         jc1, jc2 = st.columns(2)
-        jj_sigma = float(jc1.number_input("σ [mm]", 0.0, 50.0, 2.0, 0.5,
-                                          key="jj_sigma",
-                                          help="Source r.m.s. transverse size."))
-        jj_L = float(jc2.number_input("L [mm]", 20.0, 2000.0, 200.0, 10.0,
-                                      key="jj_L",
-                                      help="Source→sample throw distance; spread ≈ σ/L."))
-        jj_nmc = int(st.number_input("Monte-Carlo samples", 2, 1000, 50, 1,
-                                     key="jj_nmc", help="Number of engine runs."))
-        st.caption(f"Beam spread ≈ {np.degrees(jj_sigma / jj_L):.3f}° (σ/L) • "
-                   f"{jj_nmc} engine runs at {res_level}.")
+        jj_L = float(jc1.number_input("Throw distance L [mm]", 20.0, 2000.0,
+                                      550.0, 10.0, key="jj_L",
+                                      help="Source→sample distance; spread ≈ size/L."))
+        jj_nmc = int(jc2.number_input("Monte-Carlo samples", 2, 1000, 50, 1,
+                                      key="jj_nmc", help="Number of engine runs."))
+        _spread = (jj_size if jj_pat == "gaussian" else jj_size / 2.0) / jj_L
+        st.caption(f"Pattern: {jj_pat} • angular spread ≈ {np.degrees(_spread):.3f}° "
+                   f"• {jj_nmc} engine runs at {res_level}.")
         run_jj_mc = st.button("▶ Run source Monte-Carlo", key="run_jj_mc",
                               use_container_width=True)
     else:
-        jj_sigma, jj_L, jj_nmc, run_jj_mc = 0.0, 200.0, 0, False
+        jj_pat, jj_size, jj_L, jj_nmc, run_jj_mc = "point", 0.0, 550.0, 0, False
 
 params = ProcessParams(
     t_pmma=t_pmma, t_mma=t_mma, undercut=undercut,
@@ -548,9 +605,9 @@ eng_ic = eng_area * 1e-4
 # Josephson inductance L_J and energy E_J derived from that critical current.
 eng_jj = jj_electrical(eng_ic)
 
-# ── Finite (Gaussian) e-beam source Monte-Carlo (opt-in, button-triggered) ──
-# Reuses wafer_params_gaussian at wafer-centre (X=Y=0): each draw independently
-# jitters every evaporation's beam angle by the finite-source spread ≈ σ/L, then
+# ── Finite e-beam source Monte-Carlo (opt-in, button-triggered) ──
+# Reuses wafer_params_source at wafer-centre (X=Y=0): each draw independently
+# jitters every evaporation's beam angle by the chosen beam pattern's spread, then
 # scores the JJ area with the same cached engine.  Nominal point-source run above
 # is untouched; results land in st.session_state["_jjmc"] for the Source MC tab.
 if run_jj_mc:
@@ -558,13 +615,13 @@ if run_jj_mc:
     smp = np.empty(jj_nmc)
     prog = st.sidebar.progress(0.0, text="Source Monte-Carlo…")
     for m in range(jj_nmc):
-        q = wafer_params_gaussian(params, 0.0, 0.0, jj_L, jj_sigma, rng)
+        q = wafer_params_source(params, 0.0, 0.0, jj_L, jj_pat, jj_size, rng)
         smp[m] = _mc_area(_ekey_for(q), q)
         prog.progress((m + 1) / jj_nmc, text=f"Source MC… {m + 1}/{jj_nmc}")
     prog.empty()
     st.session_state["_jjmc"] = dict(
-        samples=smp, nominal=float(eng_area), sigma=jj_sigma, L=jj_L,
-        n_mc=jj_nmc, mode=params.mode, stack=params.stack, res=res_level)
+        samples=smp, nominal=float(eng_area), pattern=jj_pat, size=jj_size,
+        L=jj_L, n_mc=jj_nmc, mode=params.mode, stack=params.stack, res=res_level)
 
 # Now the engine has run, fill the sidebar Save box with a download button that
 # exports every parameter + the junction results (re-loadable via the uploader).
@@ -1020,18 +1077,18 @@ with tab_scan:
             st.pyplot(fig_s, use_container_width=True)
             plt.close(fig_s)
 
-# ═══ TAB: Source MC (finite Gaussian e-beam source — single JJ) ══
+# ═══ TAB: Source MC (finite beam-pattern e-beam source — single JJ) ══
 with tab_srcmc:
-    st.subheader("Finite (Gaussian) e-beam source — JJ-area Monte-Carlo")
-    st.caption("Models the e-beam source as a 2-D Gaussian (r.m.s. size σ at throw "
-               "distance L; beam spread ≈ σ/L) instead of an ideal point. Each run "
-               "independently jitters every evaporation's beam angle, giving the "
-               "probabilistic JJ-area distribution. Enable it and press ▶ Run in the "
-               "left sidebar.")
+    st.subheader("Finite e-beam source — JJ-area Monte-Carlo")
+    st.caption("Models the e-beam source with a finite spatial spread set by its "
+               "raster pattern (rotating line / uniform disk / Gaussian / point) at "
+               "throw distance L, instead of an ideal point. Each run independently "
+               "jitters every evaporation's beam angle, giving the probabilistic "
+               "JJ-area distribution. Enable it and press ▶ Run in the left sidebar.")
     mc = st.session_state.get("_jjmc")
-    if not st.session_state.get("jj_gauss"):
-        st.info("Enable **🎲 Finite (Gaussian) e-beam source** in the left sidebar, "
-                "set σ / L / samples, then press ▶ Run source Monte-Carlo.")
+    if not st.session_state.get("jj_src"):
+        st.info("Enable **🎲 Finite e-beam source** in the left sidebar, choose a "
+                "beam pattern / size / samples, then press ▶ Run source Monte-Carlo.")
     elif mc is None:
         st.info("Press **▶ Run source Monte-Carlo** in the sidebar to compute the "
                 "JJ-area distribution.")
@@ -1047,6 +1104,10 @@ with tab_srcmc:
                   (f"{(mean - nominal) / nominal * 100:+.2f}% vs mean")
                   if nominal > 0 else None)
         c4.metric("MC samples", f"{mc['n_mc']}")
+        # Source-plane intensity distribution (2-D scatter + radial profile).
+        _sc, _rad = _source_dist_charts(mc["pattern"], mc["size"])
+        st.altair_chart(_sc | _rad, use_container_width=False)
+        # JJ-area distribution from the Monte-Carlo.
         gmin, gmax = float(np.min(s)), float(np.max(s))
         if gmax <= gmin:
             gmax = gmin + 1.0
@@ -1059,12 +1120,14 @@ with tab_srcmc:
         r_nom = alt.Chart(pd.DataFrame({"v": [nominal]})).mark_rule(
             color="#FFB74D", strokeDash=[6, 4], size=2).encode(x="v:Q")
         st.altair_chart((base + r_mean + r_nom).properties(
-            height=360, title="JJ-area distribution (finite-source Monte-Carlo)"),
+            height=320, title="JJ-area distribution (Monte-Carlo)"),
             use_container_width=True)
-        st.caption(f"σ = {mc['sigma']:.1f} mm, L = {mc['L']:.0f} mm "
-                   f"(beam spread ≈ {np.degrees(mc['sigma'] / mc['L']):.3f}°) • "
-                   f"N_mc = {mc['n_mc']} • {mc['res']}.  Purple line = MC mean, "
-                   f"dashed orange = point-source area.")
+        _sz = (f"σ = {mc['size']:.1f} mm" if mc["pattern"] == "gaussian"
+               else f"diameter = {mc['size']:.1f} mm")
+        st.caption(f"Pattern: {mc['pattern']} ({_sz}), L = {mc['L']:.0f} mm • "
+                   f"N_mc = {mc['n_mc']} • {mc['res']}.  Top: source-plane sample "
+                   f"cloud + radial profile P(ρ).  Bottom: JJ-area histogram — "
+                   f"purple line = MC mean, dashed orange = point-source area.")
 
 # ═══ TAB: Wafer Map (Plassys point-source / tilted-wafer) ════════
 with tab_wafer:
@@ -1081,7 +1144,7 @@ with tab_wafer:
     wc1, wc2, wc3, wc4 = st.columns(4)
     waf_L = wc1.number_input(
         "Throw distance L [mm]", min_value=20.0, max_value=2000.0,
-        value=200.0, step=10.0, key="waf_L",
+        value=550.0, step=10.0, key="waf_L",
         help="Source→wafer-centre distance. Smaller L ⇒ stronger position "
              "dependence (deviation ≈ r/L).")
     waf_size = wc2.selectbox(
@@ -1106,29 +1169,31 @@ with tab_wafer:
     st.caption(f"{waf_size} wafer (R = {R_mm:.1f} mm) • {n_on}/"
                f"{waf_n * waf_n} on-wafer cells at '{waf_res}' density.")
 
-    # Finite (Gaussian) source — opt-in Monte-Carlo JJ-area statistics.
+    # Finite source — opt-in beam-pattern Monte-Carlo JJ-area statistics.
     gauss_on = st.checkbox(
-        "Finite (Gaussian) source — Monte-Carlo JJ-area statistics",
+        "Finite source — beam-pattern Monte-Carlo JJ-area statistics",
         key="waf_gauss",
-        help="Model the source as a 2-D Gaussian of r.m.s. size σ [mm] instead "
-             "of an ideal point (angular spread ≈ σ/L).  The engine runs N_mc "
-             "times per on-wafer cell to build a per-cell mean ± σ of the JJ "
-             "area.")
-    sigma_src, n_mc = 0.0, 0
+        help="Model the source with a finite spatial spread set by its raster "
+             "pattern (rotating line / uniform disk / Gaussian / point) instead of an "
+             "ideal point.  The engine runs N_mc times per on-wafer cell to build a "
+             "per-cell mean ± σ of the JJ area.")
+    waf_pat, waf_size_src, n_mc = "point", 0.0, 0
     if gauss_on:
         gc1, gc2 = st.columns(2)
-        sigma_src = float(gc1.number_input(
-            "Source size σ [mm]", min_value=0.0, max_value=50.0, value=2.0,
-            step=0.5, key="waf_sigma",
-            help="R.m.s. transverse source size; angular spread ≈ σ/L."))
+        waf_pat, waf_size_src = _beam_pattern_controls("waf_src", gc1)
         n_mc = int(gc2.number_input(
             "Monte-Carlo samples / cell", min_value=2, max_value=200, value=20,
             step=1, key="waf_nmc",
             help="Engine runs per on-wafer cell.  Total = N_mc × on-wafer "
                  "cells — keep modest; this is the expensive path."))
+        _wspread = (waf_size_src if waf_pat == "gaussian"
+                    else waf_size_src / 2.0) / waf_L
         st.caption(
-            f"≈ {n_mc * n_on} engine runs (N_mc={n_mc} × {n_on} cells) • "
-            f"σ/L ≈ {np.degrees(sigma_src / waf_L):.3f}° at L={waf_L:.0f} mm.")
+            f"≈ {n_mc * n_on} engine runs (N_mc={n_mc} × {n_on} cells) • pattern "
+            f"'{waf_pat}' • spread ≈ {np.degrees(_wspread):.3f}° at L={waf_L:.0f} mm.")
+        # Source-plane intensity distribution (2-D scatter + radial profile).
+        _wsc, _wrad = _source_dist_charts(waf_pat, waf_size_src)
+        st.altair_chart(_wsc | _wrad, use_container_width=False)
 
     # Per-evaporation schematic of the fixed source + tilted wafer (always on).
     with st.spinner("Drawing source / wafer-tilt schematic…"):
@@ -1183,9 +1248,9 @@ with tab_wafer:
                             continue                      # skip off-wafer cells
                         smp = np.empty(n_mc)
                         for m in range(n_mc):
-                            q = wafer_params_gaussian(
+                            q = wafer_params_source(
                                 params, float(Xg[iy, ix]), float(Yg[iy, ix]),
-                                waf_L, sigma_src, rng)
+                                waf_L, waf_pat, waf_size_src, rng)
                             smp[m] = _wafer_area(_wafer_sig(q), q)
                             done += 1
                             prog.progress(done / total,
@@ -1213,8 +1278,8 @@ with tab_wafer:
                 theta=theta_grids,
                 phi=phi_grids, L=waf_L, R=R_mm, c=c_flat, d=d_flat,
                 size=waf_size, n=waf_n, res=waf_res, mode=params.mode,
-                stack=params.stack, gauss=bool(gauss_on), sigma=sigma_src,
-                n_mc=n_mc)
+                stack=params.stack, gauss=bool(gauss_on), pattern=waf_pat,
+                src_size=waf_size_src, n_mc=n_mc)
 
     wm = st.session_state.get("_wafermap")
     if wm and "theta" in wm:                              # new-format result
@@ -1304,7 +1369,8 @@ with tab_wafer:
                               "Monte-Carlo"),
                     use_container_width=False)
                 st.caption(f"Per-cell 1σ over N_mc={wm.get('n_mc')} samples "
-                           f"(source σ = {wm.get('sigma'):.1f} mm).")
+                           f"(source: {wm.get('pattern', 'gaussian')}, "
+                           f"{wm.get('src_size', wm.get('sigma', 0.0)):.1f} mm).")
             else:
                 # Hover a cell on the σ map → its JJ-area distribution (right).
                 samp_on = samp[on]                        # (n_on, n_mc)
@@ -1335,7 +1401,8 @@ with tab_wafer:
                 st.altair_chart(sig_map | hist, use_container_width=False)
                 st.caption(
                     f"Left: per-cell 1σ over N_mc={wm.get('n_mc')} samples "
-                    f"(source σ = {wm.get('sigma'):.1f} mm).  Right: the "
+                    f"(source: {wm.get('pattern', 'gaussian')}, "
+                    f"{wm.get('src_size', wm.get('sigma', 0.0)):.1f} mm).  Right: the "
                     f"hovered cell's JJ-area histogram (bin extent shared "
                     f"across cells; defaults to the centre cell).")
 
@@ -1388,12 +1455,14 @@ with tab_wafer:
             g2.metric("Max rel error", f"{max_rel:.2f} %",
                       help="Largest per-cell σ/mean across the wafer.")
             g3.metric("MC samples / cell", f"{wm.get('n_mc')}")
+            _wp = wm.get('pattern', 'gaussian')
+            _wsz = float(wm.get('src_size', wm.get('sigma', 0.0)))
+            _wsp = (_wsz if _wp == 'gaussian' else _wsz / 2.0) / wm['L']
             st.caption(
-                f"Finite (Gaussian) source σ = {wm.get('sigma'):.1f} mm "
-                f"(angular spread ≈ "
-                f"{np.degrees(wm.get('sigma') / wm['L']):.3f}° at "
-                f"L={wm['L']:.0f} mm).  ‘Error’ = per-cell 1σ of the JJ area "
-                f"over N_mc={wm.get('n_mc')} Monte-Carlo depositions.")
+                f"Finite source — pattern '{_wp}', size {_wsz:.1f} mm "
+                f"(angular spread ≈ {np.degrees(_wsp):.3f}° at L={wm['L']:.0f} mm).  "
+                f"‘Error’ = per-cell 1σ of the JJ area over N_mc={wm.get('n_mc')} "
+                f"Monte-Carlo depositions.")
     else:
         st.info("Set the source/grid configuration above and press "
                 "**Run wafer map**.")
