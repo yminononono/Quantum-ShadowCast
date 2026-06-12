@@ -108,6 +108,96 @@ def _source_dist_charts(pattern, size, rng_seed=1, n=4000):
         ).properties(width=320, height=320, title="Radial profile P(ρ)")
     return scatter, radial
 
+
+def _beam_angle_meta(p):
+    """``(labels, theta_nom_signed)`` for the active evaporations of ``p``.
+    ``labels`` = ['θ1','φ1','θ2','φ2', …] (1-based over ``evap_beams`` order);
+    ``theta_nom_signed`` = each evaporation's signed nominal θ (used to map the
+    engine's θ≥0 convention back to the user's sidebar convention)."""
+    labels, thnom = [], []
+    for j, (_lbl, _ta, _pa, thn, _phn) in enumerate(evap_beams(p)):
+        labels += [f"θ{j + 1}", f"φ{j + 1}"]
+        thnom.append(float(thn))
+    return labels, thnom
+
+
+def _beam_angle_row(q, p):
+    """Flat ``[θ1, φ1, θ2, φ2, …]`` of the perturbed angles ``q`` actually sets
+    (engine convention, θ≥0)."""
+    out = []
+    for _lbl, ta, pa, _thn, _phn in evap_beams(p):
+        out += [float(getattr(q, ta)), float(getattr(q, pa))]
+    return out
+
+
+def _angle_distribution_ui(key, A, labels, theta_nom, area=None,
+                           area_label="JJ area [nm²]"):
+    """1-D / 2-D / correlation viewer for an ``(n_samples × 2·nbeams)`` raw angle
+    array ``A``.  Re-expresses angles in the user's nominal (signed) convention:
+    flip the sign of any θ whose nominal is negative (φ → φ−180), then unwrap each
+    φ column about its median so tiny clusters stay continuous (no ±180 split).
+    Adds JJ area as a selectable variable when given.  ``key`` namespaces the
+    widgets so multiple instances coexist.  Safe internal column names (s0,s1,…)
+    sidestep Altair's shorthand parser (θ/φ/brackets)."""
+    A = np.asarray(A, float)
+    cols, titles = {}, {}
+    for j in range(len(theta_nom)):
+        th = A[:, 2 * j].copy(); ph = A[:, 2 * j + 1].copy()
+        if theta_nom[j] < 0:                     # back to the user's signed convention
+            th = -th; ph = ph - 180.0
+        med = float(np.median(ph))               # unwrap φ to stay continuous
+        ph = ((ph - med + 180.0) % 360.0) - 180.0 + med
+        cols[f"s{2 * j}"] = th;     titles[f"s{2 * j}"] = f"{labels[2 * j]} [°]"
+        cols[f"s{2 * j + 1}"] = ph; titles[f"s{2 * j + 1}"] = f"{labels[2 * j + 1]} [°]"
+    if area is not None:
+        cols["area"] = np.asarray(area, float); titles["area"] = area_label
+    df = pd.DataFrame(cols)
+    inv = {v: k for k, v in titles.items()}      # display title → safe column name
+    names = list(titles.values())
+    view = st.radio("View", ["1-D histogram", "2-D scatter", "Correlation matrix"],
+                    horizontal=True, key=f"{key}_view")
+    if view == "1-D histogram":
+        v = st.selectbox("Variable", names, key=f"{key}_1d")
+        ch = alt.Chart(df).mark_bar(color="#64B5F6").encode(
+            x=alt.X(field=inv[v], type="quantitative",
+                    bin=alt.Bin(maxbins=30), title=v),
+            y=alt.Y("count()", title="samples"))
+        st.altair_chart(ch.properties(height=320), use_container_width=True)
+    elif view == "2-D scatter":
+        c1, c2 = st.columns(2)
+        vx = c1.selectbox("X", names, index=0, key=f"{key}_x")
+        vy = c2.selectbox("Y", names, index=min(1, len(names) - 1), key=f"{key}_y")
+        sd = float(df[inv[vx]].std() * df[inv[vy]].std())
+        r = (float(np.corrcoef(df[inv[vx]], df[inv[vy]])[0, 1])
+             if sd > 0 else float("nan"))
+        ch = alt.Chart(df).mark_circle(size=22, opacity=0.5, color="#CE93D8").encode(
+            x=alt.X(field=inv[vx], type="quantitative",
+                    scale=alt.Scale(zero=False), title=vx),
+            y=alt.Y(field=inv[vy], type="quantitative",
+                    scale=alt.Scale(zero=False), title=vy))
+        st.altair_chart(ch.properties(width=420, height=420),
+                        use_container_width=False)
+        st.caption(f"Pearson r = {r:.3f}  (n = {len(df)} MC samples).")
+    else:
+        with np.errstate(invalid="ignore"):
+            M = np.corrcoef(np.column_stack([df[inv[v]] for v in names]).T)
+        M = np.atleast_2d(np.nan_to_num(M, nan=0.0))
+        long = pd.DataFrame([{"a": names[i], "b": names[j], "r": float(M[i, j])}
+                             for i in range(len(names)) for j in range(len(names))])
+        heat = alt.Chart(long).mark_rect().encode(
+            x=alt.X("a:N", title=None, sort=names),
+            y=alt.Y("b:N", title=None, sort=names),
+            color=alt.Color("r:Q",
+                            scale=alt.Scale(scheme="redblue", domain=[-1, 1])))
+        txt = alt.Chart(long).mark_text(baseline="middle").encode(
+            x=alt.X("a:N", sort=names), y=alt.Y("b:N", sort=names),
+            text=alt.Text("r:Q", format=".2f"), color=alt.value("black"))
+        st.altair_chart((heat + txt).properties(width=420, height=420),
+                        use_container_width=False)
+        st.caption("Pearson correlation. With an isotropic source each evaporation's "
+                   "angles are drawn independently (angle–angle ≈ 0); correlations "
+                   "between an angle and JJ area show which beams drive the area.")
+
 # Sidebar widget keys.  Mode-specific widgets get DISTINCT keys (prefixed) so
 # switching modes can never feed an out-of-range value into a shared slider.
 _SHARED_KEYS = ["t_pmma", "t_mma", "undercut", "angle1", "phi1", "t_metal1"]
@@ -613,15 +703,19 @@ eng_jj = jj_electrical(eng_ic)
 if run_jj_mc:
     rng = np.random.default_rng(0)            # fixed seed → reproducible/cacheable
     smp = np.empty(jj_nmc)
+    _alabels, _athnom = _beam_angle_meta(params)
+    jang = np.empty((jj_nmc, len(_alabels)))  # perturbed (θ,φ) per evap, per sample
     prog = st.sidebar.progress(0.0, text="Source Monte-Carlo…")
     for m in range(jj_nmc):
         q = wafer_params_source(params, 0.0, 0.0, jj_L, jj_pat, jj_size, rng)
         smp[m] = _mc_area(_ekey_for(q), q)
+        jang[m] = _beam_angle_row(q, params)
         prog.progress((m + 1) / jj_nmc, text=f"Source MC… {m + 1}/{jj_nmc}")
     prog.empty()
     st.session_state["_jjmc"] = dict(
         samples=smp, nominal=float(eng_area), pattern=jj_pat, size=jj_size,
-        L=jj_L, n_mc=jj_nmc, mode=params.mode, stack=params.stack, res=res_level)
+        L=jj_L, n_mc=jj_nmc, mode=params.mode, stack=params.stack, res=res_level,
+        angles=jang, angle_labels=_alabels, angle_theta_nom=_athnom)
 
 # Now the engine has run, fill the sidebar Save box with a download button that
 # exports every parameter + the junction results (re-loadable via the uploader).
@@ -1128,6 +1222,12 @@ with tab_srcmc:
                    f"N_mc = {mc['n_mc']} • {mc['res']}.  Top: source-plane sample "
                    f"cloud + radial profile P(ρ).  Bottom: JJ-area histogram — "
                    f"purple line = MC mean, dashed orange = point-source area.")
+        # Per-evaporation beam-angle distributions & correlations.
+        if mc.get("angles") is not None:
+            with st.expander("📐 Beam-angle distributions & correlations",
+                             expanded=False):
+                _angle_distribution_ui("jjang", mc["angles"], mc["angle_labels"],
+                                       mc["angle_theta_nom"], area=mc["samples"])
 
 # ═══ TAB: Wafer Map (Plassys point-source / tilted-wafer) ════════
 with tab_wafer:
@@ -1231,7 +1331,8 @@ with tab_wafer:
                 theta_grids[lbl], phi_grids[lbl] = tg, pg
 
             warea = np.full((waf_n, waf_n), np.nan)       # [iy, ix]; off-wafer NaN
-            wstd = wsamp = None
+            wstd = wsamp = wang = None
+            _walabels, _wathnom = _beam_angle_meta(params)
             if gauss_on:
                 # Finite-source Monte-Carlo: N_mc engine runs per on-wafer cell.
                 # A fixed seed makes the result reproducible and cache-friendly
@@ -1239,6 +1340,7 @@ with tab_wafer:
                 # _wafer_area cache key).
                 wstd = np.full((waf_n, waf_n), np.nan)
                 wsamp = np.full((waf_n, waf_n, n_mc), np.nan)   # raw MC areas
+                wang = np.full((waf_n, waf_n, n_mc, len(_walabels)), np.nan)
                 rng = np.random.default_rng(0)
                 done, total = 0, n_on * n_mc
                 prog = st.progress(0.0, text="Monte-Carlo sampling…")
@@ -1252,6 +1354,7 @@ with tab_wafer:
                                 params, float(Xg[iy, ix]), float(Yg[iy, ix]),
                                 waf_L, waf_pat, waf_size_src, rng)
                             smp[m] = _wafer_area(_wafer_sig(q), q)
+                            wang[iy, ix, m, :] = _beam_angle_row(q, params)
                             done += 1
                             prog.progress(done / total,
                                           text=f"Monte-Carlo… {done}/{total}")
@@ -1279,7 +1382,8 @@ with tab_wafer:
                 phi=phi_grids, L=waf_L, R=R_mm, c=c_flat, d=d_flat,
                 size=waf_size, n=waf_n, res=waf_res, mode=params.mode,
                 stack=params.stack, gauss=bool(gauss_on), pattern=waf_pat,
-                src_size=waf_size_src, n_mc=n_mc)
+                src_size=waf_size_src, n_mc=n_mc,
+                angles=wang, angle_labels=_walabels, angle_theta_nom=_wathnom)
 
     wm = st.session_state.get("_wafermap")
     if wm and "theta" in wm:                              # new-format result
@@ -1405,6 +1509,24 @@ with tab_wafer:
                     f"{wm.get('src_size', wm.get('sigma', 0.0)):.1f} mm).  Right: the "
                     f"hovered cell's JJ-area histogram (bin extent shared "
                     f"across cells; defaults to the centre cell).")
+
+            # Per-cell beam-angle distributions & correlations.
+            if wm.get("angles") is not None:
+                st.markdown("**Per-cell beam-angle distributions & correlations**")
+                ij = list(zip(*np.where(on)))     # (iy,ix) in C-order == Xg[on]
+                xs_on, ys_on = Xg[on], Yg[on]
+                cell_labels = [f"({xs_on[k]:.0f}, {ys_on[k]:.0f}) mm"
+                               for k in range(len(ij))]
+                cc = int(np.argmin(xs_on ** 2 + ys_on ** 2))   # centre cell default
+                k = st.selectbox("Cell", range(len(ij)), index=cc,
+                                 format_func=lambda i: cell_labels[i],
+                                 key="wafang_cell")
+                iy, ix = ij[k]
+                _angle_distribution_ui("wafang", wm["angles"][iy, ix],
+                                       wm["angle_labels"], wm["angle_theta_nom"],
+                                       area=wm["samples"][iy, ix])
+                st.caption(f"Cell ({xs_on[k]:.1f}, {ys_on[k]:.1f}) mm — beam angles "
+                           f"over N_mc={wm.get('n_mc')} finite-source draws.")
 
         # (c) Sortable table of every on-wafer cell (pretty column names).
         rows = {"x [mm]": Xg[on].round(2), "y [mm]": Yg[on].round(2),
