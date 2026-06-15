@@ -161,7 +161,10 @@ def _draw(ax, cat, h_axis, v_axis, h_label, v_label, title, hlim=None, vlim=None
         s.set_linewidth(0.8)
     ax.tick_params(length=3, width=0.7)
     if hlim is not None:
-        ax.set_xlim(-hlim, hlim)
+        if np.isscalar(hlim):
+            ax.set_xlim(-hlim, hlim)                      # symmetric half-width
+        else:
+            ax.set_xlim(hlim[0], hlim[1])                # explicit (lo, hi) window
     if vlim is not None:
         ax.set_ylim(vlim[0], vlim[1])
 
@@ -258,19 +261,20 @@ def _junc_labels(ax, juncs):
                           ec="#0e1117", lw=0.8))
 
 
-def _beam_arrow_cs(ax, d, uvec, hlim, ztop, color, label, side=-1):
+def _beam_arrow_cs(ax, d, uvec, hlim, ztop, color, label, side=-1, xcenter=0.0):
     """Draw the evaporation beam direction as an arrow on a cross section.
 
     ``uvec=(ux,uy)`` is the in-plane unit vector of the slice direction; the
     beam's horizontal component is projected onto it so the arrow tilt is
-    correct for an obliquely-oriented slice."""
+    correct for an obliquely-oriented slice.  ``xcenter`` shifts the arrow with a
+    panned horizontal window."""
     ux, uy = uvec
     dh = d[0] * ux + d[1] * uy
     dz = d[2]
     n = np.hypot(dh, dz) or 1.0
     dh, dz = dh / n, dz / n
     L = 0.42 * ztop
-    head = np.array([side * 0.42 * hlim, 0.34 * ztop])   # near surface
+    head = np.array([xcenter + side * 0.42 * hlim, 0.34 * ztop])   # near surface
     tail = head - L * np.array([dh, dz])                 # up toward source
     ax.annotate("", xy=head, xytext=tail,
                 arrowprops=dict(arrowstyle="-|>", color=color, lw=2.2))
@@ -411,7 +415,8 @@ def _resist_cat_cross(cat, solid2d, zs, z_split):
 
 
 def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
-                         junc_mask=None, view_half=None, zmax=None):
+                         junc_mask=None, view_half=None, zmax=None,
+                         view_center=0.0, zmin=None):
     """Render one combined cross-section slice (all layers, junction marked).
 
     The slice is taken at in-plane azimuth ``angle_deg`` with perpendicular
@@ -440,11 +445,13 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
 
     title = f"Cross section  (α = {angle_deg:.0f}°,  offset = {offset:.0f} nm)"
     (ux, uy), _ = _slice_dirs(angle_deg)
-    hlim = _zoom_half(r, view_half)
-    vlim = (zs[0], zmax) if zmax is not None else None
-    fig, ax = plt.subplots(figsize=(7.6, 4.3))
-    _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
-    vtop = zmax if zmax is not None else float(zs[-1])
+    half = _zoom_half(r, view_half)
+    hwin = (view_center - half, view_center + half)
+    vlo = float(zs[0] if zmin is None else zmin)
+    vhi = float(zs[-1] if zmax is None else zmax)
+    vlim = (vlo, vhi); vtop = vhi
+    fig, ax = plt.subplots(figsize=(7.6, 4.3), dpi=140)
+    _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hwin, vlim=vlim)
     # AlOx: a thin (~3 nm) skin on every exposed Al1 face, incl. the Al1/Al2
     # interface (so Al2 sits on top of the barrier) and the metal corners.
     _oxide_edges_cs(ax, al1, (solid2d == RESIST) | (solid2d == SUBSTRATE),
@@ -454,10 +461,10 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     c_e1 = _COLORS[C_E1_NB] if films2d is not None else _COLORS[C_AL1]
     c_e2 = _COLORS[C_E3_AL] if films2d is not None else _COLORS[C_AL2]
     lbl_e2 = "evap 3" if films2d is not None else "evap 2"
-    _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), hlim, vtop, c_e1,
-                   "evap 1", side=-1)
-    _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), hlim, vtop, c_e2,
-                   lbl_e2, side=+1)
+    _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), half, vtop, c_e1,
+                   "evap 1", side=-1, xcenter=view_center)
+    _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), half, vtop, c_e2,
+                   lbl_e2, side=+1, xcenter=view_center)
     present = [c for c in sorted(np.unique(cat).tolist()) if c != C_EMPTY]
     _legend(fig, present)
     fig.tight_layout(rect=[0, 0.08, 1, 1])
@@ -465,7 +472,7 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
 
 
 def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None,
-                  view_half=None, zmax=None):
+                  view_half=None, zmax=None, view_center=0.0, zmin=None):
     """Staged cross section sliced at in-plane azimuth ``angle_deg`` with
     perpendicular ``offset`` [nm].
 
@@ -518,13 +525,29 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
             # Lift-off: strip the resist; only grounded metal survives.
             _paint_metal(cat, True, True, mask=grounded)
             if emphasise_junc and junc2 is not None and not tri:
-                cat[junc2 & grounded] = C_JUNC
+                # ~10 nm on EACH side of the AlOx barrier: top of grounded Al1
+                # (below the oxide) + bottom of grounded Al2 (above it).  Keeps the
+                # metal shape; recolours only the junction interface (not a
+                # full-height rectangle).  ≥1 voxel/side; thinner where finer.
+                dz = float(zs[1] - zs[0]) if len(zs) > 1 else 1.0
+                n = max(1, int(round(10.0 / dz)))        # ≈10 nm per side, in voxels
+                g1, g2 = al1 & grounded, al2 & grounded
+                band = np.zeros_like(grounded)
+                for i in np.where(jc & g1.any(1) & g2.any(1))[0]:
+                    a1 = np.where(g1[i])[0]              # Al1 cells (lower electrode)
+                    a2 = np.where(g2[i])[0]              # Al2 cells (upper electrode)
+                    band[i, a1[-n:]] = True              # top ~10 nm of Al1 (below oxide)
+                    band[i, a2[:n]] = True               # bottom ~10 nm of Al2 (above oxide)
+                cat[band & (g1 | g2)] = C_JUNC
         return cat
 
     ox_excl_pre = (solid2d == RESIST) | sub
-    hlim = _zoom_half(r, view_half)
-    vlim = (zs[0], zmax) if zmax is not None else None
-    vtop = zmax if zmax is not None else float(zs[-1])
+    half = _zoom_half(r, view_half)                      # scalar half-width (arrows)
+    hwin = (view_center - half, view_center + half)      # panned (lo, hi) for _draw
+    vlo = float(zs[0] if zmin is None else zmin)
+    vhi = float(zs[-1] if zmax is None else zmax)
+    vlim = (vlo, vhi)
+    vtop = vhi
 
     # ── trilayer: 7-panel sequence (Evap1→Evap2→Ox→Evap3→Evap4→Lift-off) ──
     if tri:
@@ -555,12 +578,12 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
             ("6. Evap 4 (Nb)",   cat_tri(["nb1", "al2", "al3", "nb4"]), "pre",  ("nb4", _COLORS[C_E4_NB], "evap 4", +1)),
             ("7. Lift-off (JJ)", cat_tri(order, liftoff=True),          "post", None),
         ]
-        fig, axes = plt.subplots(2, 4, figsize=(17.5, 8.0),
+        fig, axes = plt.subplots(2, 4, figsize=(17.5, 8.0), dpi=150,
                                  sharex=True, sharey=True)
         axes = axes.ravel()
         for ax, (title, cat, ox, arrow) in zip(axes, panels):
             _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title,
-                  hlim=hlim, vlim=vlim)
+                  hlim=hwin, vlim=vlim)
             if ox == "pre":       # resist still blocks oxidation
                 _oxide_edges_cs(ax, al1, ox_excl_pre, h_axis, zs)
             elif ox == "post":    # lift-off: only grounded electrode-1 oxidises
@@ -568,7 +591,8 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
             if arrow is not None:
                 name, col, lbl, side = arrow
                 d = td.get(name, r.meta["d1"])
-                _beam_arrow_cs(ax, d, (ux, uy), hlim, vtop, col, lbl, side=side)
+                _beam_arrow_cs(ax, d, (ux, uy), half, vtop, col, lbl, side=side,
+                               xcenter=view_center)
         for ax in axes[len(panels):]:
             ax.axis("off")       # unused cells (7 stages in a 2×4 grid)
         _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP,
@@ -588,21 +612,22 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
         ("4. Evaporation 2", cat_build(inc_al1=True, inc_al2=True),      True),
         ("5. Lift-off (JJ)", cat_build(liftoff=True, emphasise_junc=True), True),
     ]
-    fig, axes = plt.subplots(2, 3, figsize=(13.5, 8.0), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, 3, figsize=(13.5, 8.0), dpi=150,
+                             sharex=True, sharey=True)
     axes = axes.ravel()
     for k, (ax, (title, cat, show_ox)) in enumerate(zip(axes, panels)):
-        _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hlim, vlim=vlim)
+        _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hwin, vlim=vlim)
         if show_ox:
             if k == 4:        # lift-off: resist stripped, grounded Al1 only
                 _oxide_edges_cs(ax, al1 & grounded, sub, h_axis, zs)
             else:
                 _oxide_edges_cs(ax, al1, ox_excl_pre, h_axis, zs)
         if k in (1, 2):       # evap-1 related panels
-            _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), hlim, vtop,
-                           c_e1, "evap 1", side=-1)
+            _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), half, vtop,
+                           c_e1, "evap 1", side=-1, xcenter=view_center)
         if k == 3:            # evap-2 panel
-            _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), hlim, vtop,
-                           c_e2, "evap 2", side=+1)
+            _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), half, vtop,
+                           c_e2, "evap 2", side=+1, xcenter=view_center)
     axes[-1].axis("off")      # 6th cell unused (5 stages)
     _legend(fig, [C_SUBSTRATE, C_RESIST_LO, C_RESIST_UP,
                   C_AL1, C_AL2, C_JUNC])
@@ -923,6 +948,37 @@ def render_thickness_surface(r: DepositionResult, view_half=None):
     for a in (ax.xaxis, ax.yaxis, ax.zaxis):
         a.set_pane_color((0.05, 0.07, 0.09, 1.0))
     fig.tight_layout()
+    return fig
+
+
+def render_thickness_surface_plotly(r: DepositionResult, view_half=None):
+    """Interactive (drag-rotate / zoom / pan) Plotly 3-D surface of the lift-off
+    metal-film thickness — same field/window as :func:`render_thickness_surface`.
+
+    Returns a ``plotly.graph_objects.Figure``; ``plotly`` is imported lazily so
+    this module still imports if plotly is absent (the caller falls back to the
+    matplotlib surface)."""
+    import plotly.graph_objects as go
+
+    thick = _thickness_field(r)
+    hw = _top_half(r, view_half)
+    xsel = np.abs(r.xs) <= hw
+    ysel = np.abs(r.ys) <= hw
+    if not xsel.any():
+        xsel[:] = True                                      # degenerate-window guard
+    if not ysel.any():
+        ysel[:] = True
+    Z = thick[np.ix_(xsel, ysel)]                           # (Nx, Ny)
+    # go.Surface expects z shaped (len(y), len(x)) → transpose.
+    fig = go.Figure(go.Surface(
+        x=r.xs[xsel], y=r.ys[ysel], z=Z.T, colorscale="Viridis",
+        colorbar=dict(title="thickness [nm]")))
+    fig.update_layout(
+        template="plotly_dark", title="Lift-off metal thickness (3D)",
+        scene=dict(xaxis_title="x [nm]", yaxis_title="y [nm]",
+                   zaxis_title="thickness [nm]", aspectmode="auto"),
+        margin=dict(l=0, r=0, t=30, b=0), height=520,
+        paper_bgcolor="#0e1117", font=dict(color="#e6e6e6"))
     return fig
 
 

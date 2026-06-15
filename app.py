@@ -373,13 +373,22 @@ def _reset_defaults():
 
 
 def _on_stack_change():
-    """Re-default the evap-2/4 'Same tilt' links ON when the user switches the
-    stack radio to Trilayer.  Fires only on real user interaction, so the
-    file-import path that intentionally unlinks them (``_apply_loaded_params``)
-    is preserved."""
-    if st.session_state.get("stack") == "Trilayer":
-        st.session_state["tri_link2"] = True
-        st.session_state["tri_link4"] = True
+    """On a real switch to Trilayer: re-link evap-2/4 to their electrode primary and
+    carry the current evap-1 / evap-3 tilts into the evap-2/4 controls, so the angle
+    info is preserved in every case (links on, or later unlinked — including a
+    re-switch after the primary changed).  Fires only on real user interaction, so the
+    file-import path that intentionally unlinks them (``_apply_loaded_params``) is
+    preserved."""
+    if st.session_state.get("stack") != "Trilayer":
+        return
+    st.session_state["tri_link2"] = True
+    st.session_state["tri_link4"] = True
+    # Drop any stale independent evap-2/4 angles so the next time they are unlinked
+    # they re-seed from the *current* evap-1 / evap-3 tilts (``_tri_linked_tilt``'s
+    # ``setdefault``).  Popping (vs assigning) avoids Streamlit reverting an
+    # unrendered widget key to its old backed-up value while the link stays on.
+    for k in ("tri_a2", "tri_p2", "tri_a4", "tri_p4"):
+        st.session_state.pop(k, None)
 
 
 def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level,
@@ -775,14 +784,26 @@ with tab1:
     # default when something else on the page triggers a rerun.
     st.session_state.setdefault("cs_half", min(_gR, 800.0))
     st.session_state.setdefault("cs_zmax", min(_ztop, 600.0))
+    st.session_state.setdefault("cs_xc", 0.0)
+    st.session_state.setdefault("cs_zmin", 0.0)
     st.session_state["cs_half"] = float(np.clip(st.session_state["cs_half"], 100.0, _gR))
     st.session_state["cs_zmax"] = float(np.clip(st.session_state["cs_zmax"], 100.0, _ztop))
-    with st.expander("🔍 表示範囲 (View range)", expanded=False):
+    st.session_state["cs_xc"] = float(np.clip(st.session_state["cs_xc"], -_gR, _gR))
+    st.session_state["cs_zmin"] = float(np.clip(st.session_state["cs_zmin"], 0.0, _ztop - 50.0))
+    with st.expander("🔍 表示範囲 / 拡大 (View range / zoom)", expanded=False):
         vr1, vr2 = st.columns(2)
         cs_half = vr1.slider("Horizontal half-width [nm]", 100.0, _gR,
-                             step=50.0, key="cs_half")
-        cs_zmax = vr2.slider("Z max [nm]", 100.0, _ztop,
-                             step=50.0, key="cs_zmax")
+                             step=25.0, key="cs_half")
+        cs_xc = vr2.slider("Horizontal center [nm]  (pan)", -_gR, _gR,
+                           step=25.0, key="cs_xc")
+        vr3, vr4 = st.columns(2)
+        cs_zmin = vr3.slider("Z min [nm]", 0.0, _ztop - 50.0,
+                             step=25.0, key="cs_zmin")
+        cs_zmax = vr4.slider("Z max [nm]", 100.0, _ztop,
+                             step=25.0, key="cs_zmax")
+        st.caption("Narrow the window (and pan with the center slider) to zoom; the "
+                   "⤢ fullscreen button on a figure enlarges it.")
+    _cs_zmin = min(cs_zmin, cs_zmax - 25.0)               # keep z-window non-inverted
 
     # Orientation aid: show WHERE the chosen slice cuts through the device on a
     # top view (dashed yellow line), so the cross section is easy to locate.
@@ -800,12 +821,14 @@ with tab1:
     with st.spinner("Slicing voxel grid..."):
         st.markdown("**Process stages** — resist → evap 1 → oxidation → evap 2 → lift-off")
         figs = vv.render_stages(eng, slice_angle, slice_pos, eng_jm,
-                                view_half=cs_half, zmax=cs_zmax)
+                                view_half=cs_half, zmax=cs_zmax,
+                                view_center=cs_xc, zmin=_cs_zmin)
         st.pyplot(figs, use_container_width=True)
         plt.close(figs)
         st.markdown("**Combined slice** (all layers, junction highlighted)")
         figc = vv.render_cross_section(eng, slice_angle, slice_pos, eng_jm,
-                                       view_half=cs_half, zmax=cs_zmax)
+                                       view_half=cs_half, zmax=cs_zmax,
+                                       view_center=cs_xc, zmin=_cs_zmin)
         st.pyplot(figc, use_container_width=True)
         plt.close(figc)
 
@@ -901,9 +924,15 @@ with tab2:
             plt.close(figth)
     with tc2:
         with st.spinner("Rendering 3D thickness surface..."):
-            figth3 = vv.render_thickness_surface(eng, view_half=top_half)
-            st.pyplot(figth3, use_container_width=True)
-            plt.close(figth3)
+            try:                                  # interactive Plotly (drag-rotate)
+                st.plotly_chart(
+                    vv.render_thickness_surface_plotly(eng, view_half=top_half),
+                    use_container_width=True)
+                st.caption("Drag to rotate · scroll to zoom · shift-drag to pan.")
+            except Exception:                     # plotly missing → static fallback
+                figth3 = vv.render_thickness_surface(eng, view_half=top_half)
+                st.pyplot(figth3, use_container_width=True)
+                plt.close(figth3)
 
     if eng_njunc >= 2:
         st.warning(f"⚠️ {eng_njunc} separate Josephson junctions detected "
