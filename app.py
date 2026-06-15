@@ -215,7 +215,7 @@ _TRI_KEYS = {"tri_t1": "tri_t1", "tri_t2": "tri_t2",
 # (slider min, max) per widget key — used to clamp loaded values so an
 # out-of-range file can never crash widget creation.
 _KEY_RANGE = {
-    "t_pmma": (100, 800), "t_mma": (100, 1500), "undercut": (0, 500),
+    "t_pmma": (100, 2000), "t_mma": (100, 1500), "undercut": (0, 500),
     "angle1": (-60, 60), "phi1": (-90, 90), "t_metal1": (10, 200),
     "d_angle2": (-60, 60), "d_phi2": (-90, 90), "d_tmetal2": (10, 200),
     "d_bridge_len": (50, 2000), "d_bridge_w": (50, 1000),
@@ -509,20 +509,33 @@ with st.sidebar:
     tri_angle2 = tri_phi2 = tri_angle4 = tri_phi4 = 0.0
 
     st.subheader("Bilayer resist")
-    st.caption("Recipe arxiv:2101.01453 — PMMA A-4 ≈250 nm / MMA EL-13 ≈900 nm")
+    if mode == "Dolan bridge":
+        st.caption("Recipe arxiv:2101.01453 — PMMA A-4 ≈250 nm / MMA EL-13 ≈900 nm")
+    else:
+        st.caption("Manhattan: MMA = lower undercut sublayer · "
+                   "PMMA = upper imaging resist (recipe: ~1800 nm)")
     st.session_state.setdefault("t_pmma", 250)
-    t_pmma = st.slider("PMMA [nm]  (top, no undercut)", 100, 800,
+    t_pmma = st.slider("PMMA [nm]  (top, no undercut)", 100, 2000,
                        step=25, key="t_pmma")
     st.session_state.setdefault("t_mma", 900)
     t_mma = st.slider("MMA [nm]  (bottom = bridge height / vertical gap)",
                       100, 1500, step=25, key="t_mma",
-                      help="MMA bottom-layer thickness.  The bridge underside "
-                           "sits at z = MMA height, so this sets the vertical "
-                           "shadow gap.  Junction overlap ≈ 2·MMA·tanθ − bridge width.")
+                      help=("MMA bottom-layer thickness.  The bridge underside "
+                            "sits at z = MMA height, so this sets the vertical "
+                            "shadow gap.  Junction overlap ≈ 2·MMA·tanθ − bridge width."
+                            if mode == "Dolan bridge" else
+                            "Lower undercut sublayer thickness.  The undercut shelf "
+                            "lets the metal lift off cleanly.  Manhattan: typically "
+                            "400–600 nm."))
     st.session_state.setdefault("undercut", 150)
     undercut = st.slider("MMA undercut u [nm]  (one-sided)", 0, 500,
                          step=10, key="undercut")
-    st.caption(f"Total resist: {t_pmma+t_mma} nm  ·  vertical shadow gap = MMA = {t_mma} nm")
+    if mode == "Dolan bridge":
+        st.caption(f"Total resist: {t_pmma+t_mma} nm  ·  vertical shadow gap = MMA = {t_mma} nm")
+    else:
+        st.caption(f"Lower sublayer (MMA): {t_mma} nm  ·  "
+                   f"Upper imaging (PMMA): {t_pmma} nm  ·  "
+                   f"Total: {t_pmma+t_mma} nm")
 
     st.subheader("Evaporation 1" + (" — Nb" if stack == "Trilayer" else ""))
     if stack == "Trilayer":
@@ -633,7 +646,7 @@ with st.sidebar:
         # (the 3D engine is the source of truth and uses θ₁/φ₁/θ₂/φ₂ directly).
         manhattan_theta = (abs(angle1) + abs(angle2)) / 2.0
         manhattan_delta = max(abs(phi1), abs(phi2 - 90.0), 1.0)
-        manhattan_h = float(t_pmma + t_mma)
+        manhattan_h = float(t_pmma)   # upper imaging resist only; lower sublayer = t_mma
 
     st.divider()
     st.subheader("Ray-scan resolution")

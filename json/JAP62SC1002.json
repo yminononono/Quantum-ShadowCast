@@ -1,0 +1,62 @@
+{
+  "shadowcast": "v6",
+  "mode": "Manhattan",
+  "stack": "Bilayer",
+  "parameters": {
+    "t_pmma": 300,
+    "t_mma": 200,
+    "undercut": 150,
+    "angle1": 45,
+    "phi1": 0,
+    "t_metal1": 30,
+    "angle2": 45,
+    "phi2": 90,
+    "t_metal2": 30,
+    "bridge_len": 700,
+    "bridge_w": 300,
+    "bridge_pmma_gap": 0.0,
+    "manhattan_wx": 200,
+    "manhattan_wy": 200,
+    "manhattan_theta": 45.0,
+    "manhattan_delta": 1.0,
+    "manhattan_h": 300.0,
+    "mode": "Manhattan",
+    "stack": "Bilayer",
+    "tri_t1": 80.0,
+    "tri_t2": 10.0,
+    "tri_t3": 10.0,
+    "tri_t4": 150.0,
+    "tri_angle2": 0.0,
+    "tri_phi2": 0.0,
+    "tri_angle4": 0.0,
+    "tri_phi4": 0.0,
+    "sidewall": true
+  },
+  "ray_scan": {
+    "resolution": "Maximum (slowest)",
+    "max_cells": 420,
+    "min_vox_nm": 2.0,
+    "voxel_nm": 5.333333333333333
+  },
+  "results": {
+    "junction_area_nm2": 40960.0,
+    "overlap_x_nm": 170.66666666666666,
+    "overlap_y_nm": 213.33333333333331,
+    "n_junctions": 1,
+    "est_Ic_uA": 4.096,
+    "L_J_nH": 0.08034813927623373,
+    "E_J_J": 1.3480180878354569e-21,
+    "E_J_over_h_GHz": 2034.4156601412633,
+    "E_J_over_kB_K": 97.63655265280725,
+    "junctions": [
+      {
+        "area_nm2": 40960.0,
+        "overlap_x_nm": 170.66666666666666,
+        "overlap_y_nm": 213.33333333333331,
+        "center_x_nm": -16.000000000015575,
+        "center_y_nm": -1.5802470443304628e-11,
+        "cells": 1440
+      }
+    ]
+  }
+}

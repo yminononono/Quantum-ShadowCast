@@ -114,7 +114,7 @@ def build_occluders(p: ProcessParams):
         # Bilayer: a lower undercut sublayer (widened openings) carries the upper
         # imaging resist (nominal openings).  The undercut shelf lets metal lift
         # off cleanly, exactly like the Dolan MMA/PMMA stack.
-        t_lo = min(0.3 * h, 400.0)                   # undercut sublayer thickness
+        t_lo = p.t_mma                                # lower undercut sublayer = MMA
         z_top = t_lo + h
         # The electrode line must be long enough that the tilted beam can slide
         # all the way down to the floor in the crossing region: the beam clears
