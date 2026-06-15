@@ -174,6 +174,31 @@ def _occluded(origins, d, boxes, eps=1e-3):
     return hit
 
 
+def _occluded_mask(ii, jj, kk, d, mask):
+    """Boolean (N,): does the ray from each surface voxel (ii, jj, kk) toward the
+    source (−d) pass through any True cell of ``mask`` (a prior evaporation's metal,
+    i.e. its resist-sidewall coating)?  Marches in ≈1-cell steps along the dominant
+    beam axis.  This is what makes a prior deposit narrow the opening seen by a later
+    evaporation (the sidewall effect)."""
+    Nx, Ny, Nz = mask.shape
+    u = -np.asarray(d, float) / (np.abs(d).max() + 1e-12)   # toward source, ~1 cell/step
+    fi = ii.astype(float) + 0.5 + u[0]                      # start one step off surface
+    fj = jj.astype(float) + 0.5 + u[1]
+    fk = kk.astype(float) + 0.5 + u[2]
+    hit = np.zeros(len(ii), bool)
+    alive = np.ones(len(ii), bool)
+    for _ in range(Nx + Ny + Nz):
+        ci = np.floor(fi).astype(int); cj = np.floor(fj).astype(int)
+        ck = np.floor(fk).astype(int)
+        alive &= (ci >= 0) & (ci < Nx) & (cj >= 0) & (cj < Ny) & (ck >= 0) & (ck < Nz)
+        if not alive.any():
+            break
+        a = alive
+        hit[a] |= mask[ci[a], cj[a], ck[a]]
+        fi += u[0]; fj += u[1]; fk += u[2]
+    return hit
+
+
 # ════════════════════════════════════════════════════════════════
 # Voxel simulation
 # ════════════════════════════════════════════════════════════════
@@ -222,12 +247,17 @@ def _label_solid(xs, ys, zs, boxes):
     return lab
 
 
-def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes):
+def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None):
     """Return bool grid of metal voxels for one evaporation.
 
     A cell receives metal if it is EMPTY, its beam-forward neighbour is solid
     (it sits on a surface facing the beam), and the ray toward the source is
     unobstructed.  The film is then grown `n` cells back toward the source.
+
+    ``occ_mask`` (optional bool grid) is extra occluding metal from a prior
+    evaporation: a surface cell is also shadowed if its ray to the source passes
+    through it — this is the sidewall effect (prior wall coating narrows the
+    opening).  ``None`` ⇒ resist-only shadowing (unchanged behaviour).
     """
     Nx, Ny, Nz = lab.shape
     solid = lab != EMPTY
@@ -270,6 +300,8 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes):
     origins = np.stack([xs[ii], ys[jj], zs[kk]], axis=1)
     u = -d                                   # toward the source
     blocked = _occluded(origins, u, boxes)
+    if occ_mask is not None:                 # sidewall: prior-metal wall coating shadows
+        blocked = blocked | _occluded_mask(ii, jj, kk, d, occ_mask)
     lit = ~blocked
 
     metal = np.zeros_like(solid)
@@ -345,7 +377,8 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         alox = _oxide_skin(al1)
         lab2 = lab.copy()
         lab2[al1] = RESIST
-        al2 = _deposit(lab2, xs, ys, zs, vox, d2, p.t_metal2, boxes)
+        al2 = _deposit(lab2, xs, ys, zs, vox, d2, p.t_metal2, boxes,
+                       occ_mask=(al1 if p.sidewall else None))
         meta_d1, meta_d2 = d1, d2
     else:
         # ── Trilayer: Nb1 → Al2 → oxidation → Al3 → Nb4 ───────────
@@ -358,7 +391,8 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
 
         nb1 = _deposit(lab, xs, ys, zs, vox, d1, p.tri_t1, boxes)
         lab_b = lab.copy(); lab_b[nb1] = RESIST
-        al2f = _deposit(lab_b, xs, ys, zs, vox, d2, p.tri_t2, boxes)
+        al2f = _deposit(lab_b, xs, ys, zs, vox, d2, p.tri_t2, boxes,
+                        occ_mask=(nb1 if p.sidewall else None))
         elec1 = nb1 | al2f                            # bottom electrode
 
         # Oxidation after evap1+evap2: skin on ALL exposed faces of the bottom
@@ -366,9 +400,11 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         alox = _oxide_skin(elec1)
 
         lab_c = lab.copy(); lab_c[elec1] = RESIST     # electrode 2 sees elec1 solid
-        al3 = _deposit(lab_c, xs, ys, zs, vox, d3, p.tri_t3, boxes)
+        al3 = _deposit(lab_c, xs, ys, zs, vox, d3, p.tri_t3, boxes,
+                       occ_mask=(elec1 if p.sidewall else None))
         lab_d = lab_c.copy(); lab_d[al3] = RESIST
-        nb4 = _deposit(lab_d, xs, ys, zs, vox, d4, p.tri_t4, boxes)
+        nb4 = _deposit(lab_d, xs, ys, zs, vox, d4, p.tri_t4, boxes,
+                       occ_mask=((elec1 | al3) if p.sidewall else None))
         elec2 = al3 | nb4                             # top electrode
 
         al1, al2 = elec1, elec2                       # keep al1/al2 = the two electrodes

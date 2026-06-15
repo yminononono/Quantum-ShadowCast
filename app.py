@@ -264,6 +264,8 @@ def _apply_loaded_params(pdict, raydict):
         # the primary tilt so the loaded θ/φ are used as-is.
         st.session_state["tri_link2"] = False
         st.session_state["tri_link4"] = False
+    if pdict.get("sidewall") is not None:
+        st.session_state["sidewall"] = bool(pdict["sidewall"]); applied += 1
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -383,6 +385,7 @@ _PARAM_DEFAULTS = {
     "tri_t1": 80, "tri_t2": 10, "tri_t3": 10, "tri_t4": 150,
     "tri_a2": -24, "tri_p2": 0, "tri_a4": 24, "tri_p4": 0,
     "tri_link2": True, "tri_link4": True,
+    "sidewall": False,
     "res_level": "Standard (fast)",
 }
 
@@ -643,6 +646,16 @@ with st.sidebar:
     _max_cells, _min_vox = RES_LEVELS[res_level]
 
     st.divider()
+    st.subheader("⚙ Process options")
+    sidewall = st.checkbox(
+        "Side-wall effect (1st-evap coating narrows later evaporations)",
+        key="sidewall",
+        help="The first evaporation also coats the resist sidewall, narrowing the "
+             "opening seen by later evaporations (≈ the deposited thickness, "
+             "auto-varying with the local incident angle across the wafer — "
+             "Jpn. J. Appl. Phys. aca256).  Opt-in; off = ideal openings.")
+
+    st.divider()
     st.subheader("Display")
     show_shadow   = st.checkbox("Show shadow deposits (top view)", True)
     show_undercut = st.checkbox("Show undercut regions (top view)", True)
@@ -685,6 +698,7 @@ params = ProcessParams(
     tri_t1=tri_t1, tri_t2=tri_t2, tri_t3=tri_t3, tri_t4=tri_t4,
     tri_angle2=tri_angle2, tri_phi2=tri_phi2,
     tri_angle4=tri_angle4, tri_phi4=tri_phi4,
+    sidewall=sidewall,
 )
 res = compute_junction_area(params)
 
@@ -704,7 +718,7 @@ def _ekey_for(p):
             p.bridge_pmma_gap, p.manhattan_wx, p.manhattan_wy, p.manhattan_theta,
             p.manhattan_delta, p.manhattan_h, _max_cells, _min_vox, p.stack,
             p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4, p.tri_angle2, p.tri_phi2,
-            p.tri_angle4, p.tri_phi4)
+            p.tri_angle4, p.tri_phi4, getattr(p, "sidewall", False))
 
 @st.cache_data(show_spinner=False)
 def _mc_area(sig, _p):
@@ -1114,7 +1128,8 @@ with tab_scan:
                 p.bridge_w, p.bridge_pmma_gap, p.manhattan_wx, p.manhattan_wy,
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h, _smc, _smv,
                 p.stack, p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4,
-                p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4)
+                p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4,
+                getattr(p, "sidewall", False))
 
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
@@ -1369,7 +1384,7 @@ with tab_wafer:
                 p.bridge_len, p.bridge_w, p.bridge_pmma_gap, p.undercut,
                 p.t_mma, p.t_pmma, p.manhattan_wx, p.manhattan_wy,
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h,
-                _wsmc, _wsmv)
+                _wsmc, _wsmv, getattr(p, "sidewall", False))
 
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):
@@ -1443,7 +1458,7 @@ with tab_wafer:
                 L=waf_L, R=R_mm, c=c_flat, d=d_flat,
                 size=waf_size, n=waf_n, res=waf_res, mode=params.mode,
                 stack=params.stack, gauss=bool(gauss_on), pattern=waf_pat,
-                src_size=waf_size_src, n_mc=n_mc,
+                src_size=waf_size_src, n_mc=n_mc, sidewall=bool(params.sidewall),
                 angles=wang, angle_labels=_walabels, angle_theta_nom=_wathnom)
 
     wm = st.session_state.get("_wafermap")
@@ -1641,6 +1656,11 @@ with tab_wafer:
             f"Centre cell (nominal single-JJ) = {warea[ci, ci]:.0f} nm²  •  "
             f"std/mean = {cv:.1f} %  •  Ic range "
             f"{np.nanmin(wic):.3f}–{np.nanmax(wic):.3f} µA  •  R_n range {_rn_txt}.")
+        if wm.get("sidewall"):
+            st.caption("⚙ Side-wall effect ON — the 1st-evaporation wall coating "
+                       "narrows later evaporations; the narrowing grows with the "
+                       "local incident angle, so the area / R_n map is asymmetric "
+                       "across the wafer (Jpn. J. Appl. Phys. aca256).")
         if gauss:
             mean_std = float(np.nanmean(wstd))
             with np.errstate(divide="ignore", invalid="ignore"):

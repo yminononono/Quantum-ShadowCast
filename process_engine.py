@@ -107,6 +107,9 @@ class ProcessParams:
     tri_phi2:   float =   0.0     # evap2 azimuth [°]
     tri_angle4: float =  24.0     # evap4 (Nb, electrode-2 upper) tilt [°]
     tri_phi4:   float =   0.0     # evap4 azimuth [°]
+    # Opt-in: a prior evaporation's resist-sidewall coating shadows later
+    # evaporations (narrows their effective opening — Jpn. J. Appl. Phys. aca256).
+    sidewall: bool = False
 
     @property
     def t_resist(self) -> float:
