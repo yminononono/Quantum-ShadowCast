@@ -24,7 +24,7 @@ from gds_parser import load_gds_polygons, list_layers
 from process_engine import (ProcessParams, shadow_vector, wafer_params,
                             wafer_params_gaussian, wafer_params_source,
                             sample_beam_cloud,
-                            evap_beams, wafer_local_angles)
+                            evap_beams, wafer_local_angles, wafer_source_dist)
 from cross_section import draw_cross_section
 from phi_cross_section import draw_junction_topview, draw_phi_scan
 from manhattan_check import manhattan_break_check
@@ -275,21 +275,34 @@ _H_PL  = 6.62607015e-34          # Planck constant         [J·s]
 _HBAR  = _H_PL / (2 * np.pi)     # reduced Planck constant [J·s]
 _PHI0  = _H_PL / (2 * _E_CHG)    # magnetic flux quantum   [Wb]
 _KB    = 1.380649e-23            # Boltzmann constant      [J/K]
+_DELTA_AL = 1.764 * _KB * 1.2    # Al superconducting gap  [J] (Tc ≈ 1.2 K) ≈ 0.18 meV
+
+
+def _rn_from_ic_uA(ic_uA):
+    """Normal-state resistance R_n [Ω] from Ic via Ambegaokar–Baratoff (T→0):
+    ``Ic·R_n = πΔ/2e`` ⇒ ``R_n = πΔ/(2e·Ic)``.  Scalar or array; Ic ≤ 0 → ∞."""
+    ic = np.asarray(ic_uA, float) * 1e-6           # A
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rn = np.pi * _DELTA_AL / (2.0 * _E_CHG * ic)
+    return np.where(ic > 0, rn, np.inf)
 
 
 def jj_electrical(ic_uA):
-    """Josephson inductance & energy derived from the critical current Ic.
+    """Josephson inductance, energy & normal-state resistance derived from Ic.
 
-    L_J = ħ / (2e·Ic),   E_J = (Φ₀/2π)·Ic = ħ·Ic/2e.
-    Returns L_J [nH], E_J [J], E_J/h [GHz] and E_J/kB [K].  For Ic ≤ 0
-    (open circuit) L_J is infinite and E_J is zero."""
+    L_J = ħ / (2e·Ic),   E_J = (Φ₀/2π)·Ic = ħ·Ic/2e,
+    R_n = πΔ/(2e·Ic)  (Ambegaokar–Baratoff, Al gap Δ at T→0).
+    Returns L_J [nH], E_J [J], E_J/h [GHz], E_J/kB [K] and R_n [Ω].  For Ic ≤ 0
+    (open circuit) L_J and R_n are infinite and E_J is zero."""
     ic = float(ic_uA) * 1e-6                       # A
     if ic <= 0:
-        return dict(Lj_nH=float("inf"), Ej_J=0.0, Ej_h_GHz=0.0, Ej_kB_K=0.0)
+        return dict(Lj_nH=float("inf"), Ej_J=0.0, Ej_h_GHz=0.0, Ej_kB_K=0.0,
+                    Rn_ohm=float("inf"))
     Lj = _HBAR / (2 * _E_CHG * ic)                 # H
     Ej = (_PHI0 / (2 * np.pi)) * ic                # J
     return dict(Lj_nH=Lj * 1e9, Ej_J=Ej,
-                Ej_h_GHz=Ej / _H_PL / 1e9, Ej_kB_K=Ej / _KB)
+                Ej_h_GHz=Ej / _H_PL / 1e9, Ej_kB_K=Ej / _KB,
+                Rn_ohm=float(_rn_from_ic_uA(ic_uA)))
 
 
 def _fmt_lj(lj_nH):
@@ -299,6 +312,15 @@ def _fmt_lj(lj_nH):
     if lj_nH >= 1000.0:
         return f"{lj_nH / 1000.0:.3f} µH"
     return f"{lj_nH:.3f} nH"
+
+
+def _fmt_rn(ohm):
+    """Human-readable normal-state resistance (Ω / kΩ, or ∞ for an open junction)."""
+    if not np.isfinite(ohm):
+        return "∞ (open)"
+    if ohm >= 1000.0:
+        return f"{ohm / 1000.0:.2f} kΩ"
+    return f"{ohm:.1f} Ω"
 
 
 # Trilayer junction barrier composition (metal pair across the oxide).
@@ -843,12 +865,14 @@ with tab1:
         "overlapping voxels (Σ cells × voxel²), so non-rectangular junctions "
         "are handled exactly; overlap x / y are just the bounding-box extents."
     )
-    e1, e2, e3 = st.columns(3)
+    e1, e2, e3, e4 = st.columns(4)
     e1.metric("Est. critical current Iᶜ", f"{eng_ic:.3f} µA",
               help="Al, ~4 K: jc = 10 kA/cm² (Ambegaokar–Baratoff)")
-    e2.metric("Josephson inductance L_J", _fmt_lj(eng_jj["Lj_nH"]),
+    e2.metric("Normal resistance R_n", _fmt_rn(eng_jj["Rn_ohm"]),
+              help="R_n = πΔ/(2e·Iᶜ) (Ambegaokar–Baratoff, Al Δ≈0.18 meV)")
+    e3.metric("Josephson inductance L_J", _fmt_lj(eng_jj["Lj_nH"]),
               help="L_J = ħ / (2e·Iᶜ)")
-    e3.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
+    e4.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
               help=f"E_J = (Φ₀/2π)·Iᶜ = {eng_jj['Ej_kB_K']:.2f} K·k_B")
 
     if params.stack == "Trilayer":
@@ -1270,7 +1294,7 @@ with tab_wafer:
         "(with its primary flat / オリフラ); the centre reproduces the "
         "single-JJ result.")
 
-    wc1, wc2, wc3, wc4 = st.columns(4)
+    wc1, wc2, wc3, wc4, wc5 = st.columns(5)
     waf_L = wc1.number_input(
         "Throw distance L [mm]", min_value=20.0, max_value=2000.0,
         value=550.0, step=10.0, key="waf_L",
@@ -1279,24 +1303,31 @@ with tab_wafer:
     waf_size = wc2.selectbox(
         "Wafer size", list(WAFER_SPECS.keys()), index=2, key="waf_size",
         help="Real wafer disk with its primary flat (オリフラ) at the bottom; "
-             "the grid spans the whole wafer and off-wafer cells are skipped.")
+             "off-wafer grid cells are skipped.")
     R_mm, c_flat = WAFER_SPECS[waf_size]
     d_flat = float(np.sqrt(R_mm ** 2 - (c_flat / 2.0) ** 2))
     waf_n = int(wc3.number_input(
         "Grid N (N×N)", min_value=2, max_value=11, value=5, step=1,
         key="waf_n"))
-    waf_res = wc4.selectbox(
+    waf_cell = float(wc4.number_input(
+        "Grid cell size [mm]", min_value=1.0, max_value=10.0, value=5.0, step=0.1,
+        key="waf_cell",
+        help="Pitch of the N×N grid, centred on the wafer; a small N need not "
+             "reach the edge."))
+    waf_res = wc5.selectbox(
         "Voxel grid density", list(RES_LEVELS.keys()), key="waf_res",
         help="Finer = slower; each grid cell is a full engine run.")
     _wsmc, _wsmv = RES_LEVELS[waf_res]
-    # Grid spans the whole wafer; cells outside the disk or below the primary
-    # flat are skipped.  Reused by the run loop and the maps below.
-    wcoords = np.linspace(-R_mm, R_mm, waf_n)
+    # Centred N×N grid with the chosen pitch (fills from the centre; cells outside
+    # the disk or below the primary flat are skipped).  Reused below.
+    wcoords = (np.arange(waf_n) - (waf_n - 1) / 2.0) * waf_cell
     Xg, Yg = np.meshgrid(wcoords, wcoords)
     wmask = (Xg ** 2 + Yg ** 2 <= R_mm ** 2) & (Yg >= -d_flat)
     n_on = int(wmask.sum())
-    st.caption(f"{waf_size} wafer (R = {R_mm:.1f} mm) • {n_on}/"
-               f"{waf_n * waf_n} on-wafer cells at '{waf_res}' density.")
+    _span = (waf_n - 1) * waf_cell
+    st.caption(f"{waf_size} wafer (R = {R_mm:.1f} mm) • {waf_n}×{waf_n} grid at "
+               f"{waf_cell:.1f} mm pitch (span {_span:.1f} mm, centred) • "
+               f"{n_on}/{waf_n * waf_n} on-wafer cells at '{waf_res}'.")
 
     # Finite source — opt-in beam-pattern Monte-Carlo JJ-area statistics.
     gauss_on = st.checkbox(
@@ -1354,10 +1385,11 @@ with tab_wafer:
         else:
             # Per-evaporation effective (θ′, φ′) over the whole grid — pure math,
             # vectorised, computed once (the engine still runs per on-wafer cell).
-            theta_grids, phi_grids = {}, {}
+            theta_grids, phi_grids, dist_grids = {}, {}, {}
             for lbl, _ta, _pa, th, ph in evap_beams(params):
                 tg, pg = wafer_local_angles(th, ph, Xg, Yg, waf_L)
                 theta_grids[lbl], phi_grids[lbl] = tg, pg
+                dist_grids[lbl] = wafer_source_dist(th, ph, Xg, Yg, waf_L)
 
             warea = np.full((waf_n, waf_n), np.nan)       # [iy, ix]; off-wafer NaN
             wstd = wsamp = wang = None
@@ -1407,8 +1439,8 @@ with tab_wafer:
                 prog.empty()
             st.session_state["_wafermap"] = dict(
                 coords=wcoords, areas=warea, std=wstd, samples=wsamp,
-                theta=theta_grids,
-                phi=phi_grids, L=waf_L, R=R_mm, c=c_flat, d=d_flat,
+                theta=theta_grids, phi=phi_grids, dist=dist_grids,
+                L=waf_L, R=R_mm, c=c_flat, d=d_flat,
                 size=waf_size, n=waf_n, res=waf_res, mode=params.mode,
                 stack=params.stack, gauss=bool(gauss_on), pattern=waf_pat,
                 src_size=waf_size_src, n_mc=n_mc,
@@ -1435,12 +1467,16 @@ with tab_wafer:
         # (b) Interactive hover heatmap (Altair).  ASCII column keys avoid
         # Vega-Lite field-name escaping; pretty labels live in tooltip titles.
         h = (wm["coords"][1] - wm["coords"][0]) if wm["n"] > 1 else wm["R"]
+        _dist = wm.get("dist", {})                        # per-evap source distance
+        _rn = _rn_from_ic_uA(warea[on] * 1e-4)            # R_n [Ω] per cell
+        _rn = np.where(np.isfinite(_rn), _rn, np.nan)     # ∞ (open) → null for Vega
         cdata = {"x": Xg[on], "y": Yg[on], "area": warea[on],
-                 "Ic": warea[on] * 1e-4}
+                 "Ic": warea[on] * 1e-4, "Rn": _rn}
         tips = [alt.Tooltip("x:Q", title="x [mm]", format=".1f"),
                 alt.Tooltip("y:Q", title="y [mm]", format=".1f"),
                 alt.Tooltip("area:Q", title="area [nm²]", format=".0f"),
-                alt.Tooltip("Ic:Q", title="Ic [µA]", format=".4f")]
+                alt.Tooltip("Ic:Q", title="Ic [µA]", format=".4f"),
+                alt.Tooltip("Rn:Q", title="R_n [Ω]", format=".0f")]
         for lbl in wm["theta"]:
             key = lbl.replace(" ", "_")
             cdata[f"{key}_th"] = wm["theta"][lbl][on]
@@ -1449,6 +1485,10 @@ with tab_wafer:
                                     format=".2f"))
             tips.append(alt.Tooltip(f"{key}_ph:Q", title=f"{lbl} φ′ [°]",
                                     format=".2f"))
+            if lbl in _dist:                              # source→device distance
+                cdata[f"{key}_d"] = _dist[lbl][on]
+                tips.append(alt.Tooltip(f"{key}_d:Q", title=f"{lbl} dist [mm]",
+                                        format=".1f"))
         if gauss:                                         # finite-source error
             cdata["area_std"] = wstd[on]
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -1560,7 +1600,8 @@ with tab_wafer:
         # (c) Sortable table of every on-wafer cell (pretty column names).
         rows = {"x [mm]": Xg[on].round(2), "y [mm]": Yg[on].round(2),
                 "area [nm²]": warea[on].round(0),
-                "Ic [µA]": (warea[on] * 1e-4).round(4)}
+                "Ic [µA]": (warea[on] * 1e-4).round(4),
+                "R_n [Ω]": _rn_from_ic_uA(warea[on] * 1e-4).round(1)}
         if gauss:
             rows["area σ [nm²]"] = wstd[on].round(0)
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -1570,6 +1611,8 @@ with tab_wafer:
         for lbl in wm["theta"]:
             rows[f"{lbl} θ′ [°]"] = wm["theta"][lbl][on].round(2)
             rows[f"{lbl} φ′ [°]"] = wm["phi"][lbl][on].round(2)
+            if lbl in _dist:
+                rows[f"{lbl} dist [mm]"] = _dist[lbl][on].round(1)
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.download_button(
@@ -1590,10 +1633,14 @@ with tab_wafer:
                   help="(max − min) / mean across the wafer — the JJ-area "
                        "‘ふらつき’.")
         wic = warea * 1e-4
+        _rn_on = _rn_from_ic_uA(warea[on] * 1e-4)
+        _rn_fin = _rn_on[np.isfinite(_rn_on)]
+        _rn_txt = (f"{_fmt_rn(float(_rn_fin.min()))}–{_fmt_rn(float(_rn_fin.max()))}"
+                   if _rn_fin.size else "—")
         st.caption(
             f"Centre cell (nominal single-JJ) = {warea[ci, ci]:.0f} nm²  •  "
             f"std/mean = {cv:.1f} %  •  Ic range "
-            f"{np.nanmin(wic):.3f}–{np.nanmax(wic):.3f} µA.")
+            f"{np.nanmin(wic):.3f}–{np.nanmax(wic):.3f} µA  •  R_n range {_rn_txt}.")
         if gauss:
             mean_std = float(np.nanmean(wstd))
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -1629,12 +1676,14 @@ with tab5:
               help="Al, 4K: jc=10 kA/cm² (Ambegaokar-Baratoff)")
     c5.metric("Junctions",           f"{eng_njunc}",
               help="Number of spatially separate Al1∩Al2 overlaps")
-    j1, j2, j3 = st.columns(3)
-    j1.metric("Josephson inductance L_J", _fmt_lj(eng_jj["Lj_nH"]),
+    j1, j2, j3, j4 = st.columns(4)
+    j1.metric("Normal resistance R_n", _fmt_rn(eng_jj["Rn_ohm"]),
+              help="R_n = πΔ/(2e·Iᶜ) (Ambegaokar–Baratoff, Al Δ≈0.18 meV)")
+    j2.metric("Josephson inductance L_J", _fmt_lj(eng_jj["Lj_nH"]),
               help="L_J = ħ / (2e·Iᶜ)")
-    j2.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
+    j3.metric("Josephson energy E_J/h", f"{eng_jj['Ej_h_GHz']:.2f} GHz",
               help="E_J = (Φ₀/2π)·Iᶜ = ħ·Iᶜ/2e")
-    j3.metric("E_J / k_B", f"{eng_jj['Ej_kB_K']:.2f} K")
+    j4.metric("E_J / k_B", f"{eng_jj['Ej_kB_K']:.2f} K")
     if params.stack == "Trilayer":
         _combo_metrics(eng_combos)
     st.caption(

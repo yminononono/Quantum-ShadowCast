@@ -247,6 +247,22 @@ def wafer_local_angles(theta_deg, phi_deg, X, Y, L, S0=None):
     return th, ph
 
 
+def wafer_source_dist(theta_deg, phi_deg, X, Y, L):
+    """Source(origin)→device distance [mm] for a device at wafer-frame (X, Y) on a
+    wafer tilted to (theta, phi) at throw distance L.
+
+    ``P = C + X·eX + Y·eY`` (C = wafer centre at (0,0,−L)); the returned ``|P|`` is
+    the beam path length, which varies with wafer position and — because the
+    in-plane offset tilts with the wafer — per evaporation.  Vectorised over X/Y.
+    """
+    R = _wafer_rot(theta_deg, phi_deg)
+    eX, eY = R[:, 0], R[:, 1]
+    C = np.array([0.0, 0.0, -float(L)])
+    X = np.asarray(X, float); Y = np.asarray(Y, float)
+    P = C + X[..., None] * eX + Y[..., None] * eY
+    return np.linalg.norm(P, axis=-1)
+
+
 def wafer_params(p: "ProcessParams", X, Y, L) -> "ProcessParams":
     """``copy.copy(p)`` with every active evaporation's (θ, φ) replaced by its
     local angle for scalar wafer position (X, Y).
