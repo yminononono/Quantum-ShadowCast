@@ -12,5 +12,12 @@ gdstk>=0.9.0
 # Alternative: gdspy (legacy, widely used)
 # gdspy>=1.6.0
 
+# Optional: drag-rotatable 3D lift-off thickness surface (Top View tab).
+# Falls back to a static matplotlib surface if absent.
+# plotly>=5.0.0
+
 # Optional: more accurate polygon offset for non-convex shapes
 # shapely>=2.0.0
+
+# Note: pandas and altair ship with streamlit and back the interactive
+# wafer-map heatmap / sortable table.
