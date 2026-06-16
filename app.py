@@ -216,6 +216,7 @@ _TRI_KEYS = {"tri_t1": "tri_t1", "tri_t2": "tri_t2",
 # out-of-range file can never crash widget creation.
 _KEY_RANGE = {
     "t_pmma": (100, 2000), "t_mma": (100, 1500), "undercut": (0, 500),
+    "jc_al": (1, 1e6),
     "angle1": (-60, 60), "phi1": (-90, 90), "t_metal1": (10, 200),
     "d_angle2": (-60, 60), "d_phi2": (-90, 90), "d_tmetal2": (10, 200),
     "d_bridge_len": (50, 2000), "d_bridge_w": (50, 1000),
@@ -266,6 +267,10 @@ def _apply_loaded_params(pdict, raydict):
         st.session_state["tri_link4"] = False
     if pdict.get("sidewall") is not None:
         st.session_state["sidewall"] = bool(pdict["sidewall"]); applied += 1
+    if pdict.get("jc_al") is not None:
+        v = float(pdict["jc_al"])
+        if 1.0 <= v <= 1e6:
+            st.session_state["jc_al"] = v; applied += 1
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -386,6 +391,7 @@ _PARAM_DEFAULTS = {
     "tri_a2": -24, "tri_p2": 0, "tri_a4": 24, "tri_p4": 0,
     "tri_link2": True, "tri_link4": True,
     "sidewall": False,
+    "jc_al": 1000,
     "res_level": "Standard (fast)",
 }
 
@@ -417,7 +423,7 @@ def _on_stack_change():
 
 
 def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level,
-                  combos=None):
+                  combos=None, jc_al=1000.0):
     """Serialise the full process (parameters + ray-scan + junction results)
     to a JSON string that can be re-loaded to restore every parameter."""
     juncs_out = [dict(area_nm2=float(j["area"]), overlap_x_nm=float(j["ox"]),
@@ -437,11 +443,13 @@ def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level,
     if combos:
         results["barrier_composition_nm2"] = {
             name: float(d["area"]) for name, d in combos.items()}
+    params_dict = asdict(params)
+    params_dict["jc_al"] = float(jc_al)
     out = {
         "shadowcast": "v6",
         "mode": params.mode,
         "stack": params.stack,
-        "parameters": asdict(params),
+        "parameters": params_dict,
         "ray_scan": {"resolution": res_level,
                      "max_cells": int(eng.meta.get("max_cells", 0)),
                      "min_vox_nm": float(eng.meta.get("min_vox", 0.0)),
@@ -667,6 +675,14 @@ with st.sidebar:
              "opening seen by later evaporations (≈ the deposited thickness, "
              "auto-varying with the local incident angle across the wafer — "
              "Jpn. J. Appl. Phys. aca256).  Opt-in; off = ideal openings.")
+    st.session_state.setdefault("jc_al", 1000)
+    jc_al = float(st.number_input(
+        "Critical current density Jc [A/cm²]",
+        min_value=1.0, max_value=1e6, step=100.0, key="jc_al",
+        help="Al-AlOx-Al junction critical current density.  "
+             "Typical range: 100–10 000 A/cm²  (qubit-grade: ~1 kA/cm²).  "
+             "Ic = Jc × area;  R_N = πΔ/(2e·Ic) (Ambegaokar–Baratoff, Δ ≈ 0.18 meV)."))
+    ic_factor = jc_al * 1e-8  # nm² → µA  (Jc[A/cm²] × 1e-14 cm²/nm² × 1e6 µA/A)
 
     st.divider()
     st.subheader("Display")
@@ -747,9 +763,9 @@ with st.spinner("Running 3D shadow-evaporation engine..."):
      eng_combos, eng_combo_map) = _run_engine(
         ekey, params, _max_cells, _min_vox)
 eng_njunc = len(eng_juncs)
-# Engine-based critical current (jc = 10 kA/cm², Ambegaokar-Baratoff),
-# consistent with junction_area.py:  Ic[µA] = area_nm2 · 1e-4
-eng_ic = eng_area * 1e-4
+# Engine-based critical current via Ambegaokar-Baratoff.
+# Ic[µA] = area_nm2 × jc_al[A/cm²] × 1e-8  (= area × 1e-14 cm²/nm² × 1e6 µA/A × jc)
+eng_ic = eng_area * ic_factor
 # Josephson inductance L_J and energy E_J derived from that critical current.
 eng_jj = jj_electrical(eng_ic)
 
@@ -782,7 +798,7 @@ with _save_box:
         "💾 Save parameters + results",
         data=_build_export(params, eng, eng_area, eng_ox, eng_oy,
                            eng_njunc, eng_ic, eng_juncs, res_level,
-                           combos=eng_combos),
+                           combos=eng_combos, jc_al=jc_al),
         file_name="shadowcast_params.json", mime="application/json",
         use_container_width=True)
 
@@ -894,7 +910,7 @@ with tab1:
     )
     e1, e2, e3, e4 = st.columns(4)
     e1.metric("Est. critical current Iᶜ", f"{eng_ic:.3f} µA",
-              help="Al, ~4 K: jc = 10 kA/cm² (Ambegaokar–Baratoff)")
+              help=f"Al, ~4 K: Jc = {jc_al:.0f} A/cm² (Ambegaokar–Baratoff)")
     e2.metric("Normal resistance R_n", _fmt_rn(eng_jj["Rn_ohm"]),
               help="R_n = πΔ/(2e·Iᶜ) (Ambegaokar–Baratoff, Al Δ≈0.18 meV)")
     e3.metric("Josephson inductance L_J", _fmt_lj(eng_jj["Lj_nH"]),
@@ -1119,7 +1135,7 @@ with tab_scan:
                      "E_J/k_B [K]": "#EF9A9A"}
 
     def _metric_from_area(area_nm2, metric):
-        ic = area_nm2 * 1e-4
+        ic = area_nm2 * ic_factor
         jj = jj_electrical(ic)
         if metric == "Junction area [nm²]": return area_nm2
         if metric == "Est. Ic [µA]":        return ic
@@ -1482,7 +1498,7 @@ with tab_wafer:
 
         # (a) Drawn wafer (matplotlib): area + Ic clipped to the disk + flat.
         figw = vv.render_wafer_map_2d(
-            wm["coords"], warea, warea * 1e-4, wm["R"], wm["c"], wm["d"],
+            wm["coords"], warea, warea * ic_factor, wm["R"], wm["c"], wm["d"],
             title=(f"{wm['size']} wafer — {wm['stack']}/{wm['mode']}  "
                    f"(L={wm['L']:.0f} mm, {wm['n']}×{wm['n']}, {wm['res']})"))
         st.pyplot(figw, use_container_width=True); plt.close(figw)
@@ -1496,10 +1512,10 @@ with tab_wafer:
         # Vega-Lite field-name escaping; pretty labels live in tooltip titles.
         h = (wm["coords"][1] - wm["coords"][0]) if wm["n"] > 1 else wm["R"]
         _dist = wm.get("dist", {})                        # per-evap source distance
-        _rn = _rn_from_ic_uA(warea[on] * 1e-4)            # R_n [Ω] per cell
+        _rn = _rn_from_ic_uA(warea[on] * ic_factor)        # R_n [Ω] per cell
         _rn = np.where(np.isfinite(_rn), _rn, np.nan)     # ∞ (open) → null for Vega
         cdata = {"x": Xg[on], "y": Yg[on], "area": warea[on],
-                 "Ic": warea[on] * 1e-4, "Rn": _rn}
+                 "Ic": warea[on] * ic_factor, "Rn": _rn}
         tips = [alt.Tooltip("x:Q", title="x [mm]", format=".1f"),
                 alt.Tooltip("y:Q", title="y [mm]", format=".1f"),
                 alt.Tooltip("area:Q", title="area [nm²]", format=".0f"),
@@ -1628,8 +1644,8 @@ with tab_wafer:
         # (c) Sortable table of every on-wafer cell (pretty column names).
         rows = {"x [mm]": Xg[on].round(2), "y [mm]": Yg[on].round(2),
                 "area [nm²]": warea[on].round(0),
-                "Ic [µA]": (warea[on] * 1e-4).round(4),
-                "R_n [Ω]": _rn_from_ic_uA(warea[on] * 1e-4).round(1)}
+                "Ic [µA]": (warea[on] * ic_factor).round(4),
+                "R_n [Ω]": _rn_from_ic_uA(warea[on] * ic_factor).round(1)}
         if gauss:
             rows["area σ [nm²]"] = wstd[on].round(0)
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -1660,8 +1676,8 @@ with tab_wafer:
         s4.metric("Area spread", f"{rel:.1f} %",
                   help="(max − min) / mean across the wafer — the JJ-area "
                        "‘ふらつき’.")
-        wic = warea * 1e-4
-        _rn_on = _rn_from_ic_uA(warea[on] * 1e-4)
+        wic = warea * ic_factor
+        _rn_on = _rn_from_ic_uA(warea[on] * ic_factor)
         _rn_fin = _rn_on[np.isfinite(_rn_on)]
         _rn_txt = (f"{_fmt_rn(float(_rn_fin.min()))}–{_fmt_rn(float(_rn_fin.max()))}"
                    if _rn_fin.size else "—")
@@ -1706,7 +1722,7 @@ with tab5:
     c2.metric("Overlap y (engine)",  f"{eng_oy:.0f} nm")
     c3.metric("Area A (engine)",     f"{eng_area:.0f} nm²")
     c4.metric("Est. Ic (engine)",    f"{eng_ic:.3f} µA",
-              help="Al, 4K: jc=10 kA/cm² (Ambegaokar-Baratoff)")
+              help=f"Al, 4K: Jc = {jc_al:.0f} A/cm² (Ambegaokar-Baratoff)")
     c5.metric("Junctions",           f"{eng_njunc}",
               help="Number of spatially separate Al1∩Al2 overlaps")
     j1, j2, j3, j4 = st.columns(4)
@@ -1801,7 +1817,7 @@ with tab5:
         "💾 Export parameters + results (re-loadable)",
         data=_build_export(params, eng, eng_area, eng_ox, eng_oy,
                            eng_njunc, eng_ic, eng_juncs, res_level,
-                           combos=eng_combos),
+                           combos=eng_combos, jc_al=jc_al),
         file_name="shadowcast_params.json", mime="application/json",
         help="Re-load this file with the sidebar uploader to restore every "
              "parameter.")
