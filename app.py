@@ -271,6 +271,8 @@ def _apply_loaded_params(pdict, raydict):
         v = float(pdict["jc_al"])
         if 1.0 <= v <= 1e6:
             st.session_state["jc_al"] = v; applied += 1
+    if pdict.get("jj_walls") is not None:
+        st.session_state["jj_walls"] = bool(pdict["jj_walls"]); applied += 1
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -328,6 +330,18 @@ def _fmt_rn(ohm):
     if ohm >= 1000.0:
         return f"{ohm / 1000.0:.2f} kΩ"
     return f"{ohm:.1f} Ω"
+
+
+def _fmt_sig(v, sig=2):
+    """Format to `sig` significant figures, plain (no sci-notation) for sensible
+    magnitudes; blank for non-finite (open/off-wafer)."""
+    if v is None or not np.isfinite(v):
+        return ""
+    if v == 0:
+        return "0"
+    import math
+    d = (sig - 1) - math.floor(math.log10(abs(v)))   # decimals for `sig` sig figs
+    return f"{round(v, d):g}"
 
 
 # Trilayer junction barrier composition (metal pair across the oxide).
@@ -392,6 +406,7 @@ _PARAM_DEFAULTS = {
     "tri_link2": True, "tri_link4": True,
     "sidewall": False,
     "jc_al": 1000,
+    "jj_walls": False,
     "res_level": "Standard (fast)",
 }
 
@@ -423,7 +438,7 @@ def _on_stack_change():
 
 
 def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level,
-                  combos=None, jc_al=1000.0):
+                  combos=None, jc_al=1000.0, jj_walls=False):
     """Serialise the full process (parameters + ray-scan + junction results)
     to a JSON string that can be re-loaded to restore every parameter."""
     juncs_out = [dict(area_nm2=float(j["area"]), overlap_x_nm=float(j["ox"]),
@@ -445,6 +460,7 @@ def _build_export(params, eng, area, ox, oy, njunc, ic, juncs, res_level,
             name: float(d["area"]) for name, d in combos.items()}
     params_dict = asdict(params)
     params_dict["jc_al"] = float(jc_al)
+    params_dict["jj_walls"] = bool(jj_walls)
     out = {
         "shadowcast": "v6",
         "mode": params.mode,
@@ -683,6 +699,15 @@ with st.sidebar:
              "Typical range: 100–10 000 A/cm²  (qubit-grade: ~1 kA/cm²).  "
              "Ic = Jc × area;  R_N = πΔ/(2e·Ic) (Ambegaokar–Baratoff, Δ ≈ 0.18 meV)."))
     ic_factor = jc_al * 1e-8  # nm² → µA  (Jc[A/cm²] × 1e-14 cm²/nm² × 1e6 µA/A)
+    st.session_state.setdefault("jj_walls", False)
+    jj_walls = st.checkbox(
+        "Count sidewall (vertical) junction area", key="jj_walls",
+        help="Off (default): junction area = the horizontal floor overlap only "
+             "(electrode 2 on top of electrode 1 across the oxide), matching the "
+             "expected planar junction.  On: also count the vertical M-O-M "
+             "barrier where metal climbs the resist sidewall (full 3-D area, "
+             "larger).  When on, the floor-only and sidewall-only areas are "
+             "shown separately.")
 
     st.divider()
     st.subheader("Display")
@@ -752,16 +777,30 @@ def _ekey_for(p):
 @st.cache_data(show_spinner=False)
 def _mc_area(sig, _p):
     """Lean engine scorer for the finite-source Monte-Carlo — JJ area only
-    (skips junction_combos); cached per `sig` (= _ekey_for(_p))."""
+    (skips junction_combos); cached per `sig` (= _ekey_for(_p)).  Returns
+    ``(floor_area, full_area)`` so the sidewall toggle can pick without re-sim."""
     r = simulate(_p, max_cells=_max_cells, min_vox=_min_vox)
-    _, area, _, _, _ = junction_footprint(r)
-    return float(area)
+    _, a_full, _, _, _ = junction_footprint(r, include_sidewalls=True)
+    _, a_floor, _, _, _ = junction_footprint(r, include_sidewalls=False)
+    return float(a_floor), float(a_full)
 
 ekey = _ekey_for(params)
 with st.spinner("Running 3D shadow-evaporation engine..."):
-    (eng, eng_jm, eng_area, eng_ox, eng_oy, eng_juncs,
-     eng_combos, eng_combo_map) = _run_engine(
+    (eng, _jm_c, _area_c, _ox_c, _oy_c, _juncs_c,
+     _combos_c, _combo_map_c) = _run_engine(
         ekey, params, _max_cells, _min_vox)
+# Measure both conventions on the cached voxel result (cheap O(N) numpy) so the
+# sidewall toggle never re-runs simulate.  Active = full when jj_walls else floor.
+eng_jm_full,  eng_area_full,  _oxf, _oyf, eng_juncs_full = junction_footprint(
+    eng, include_sidewalls=True)
+eng_jm_floor, eng_area_floor, _ox0, _oy0, eng_juncs_floor = junction_footprint(
+    eng, include_sidewalls=False)
+eng_area_walls = max(eng_area_full - eng_area_floor, 0.0)
+eng_area = eng_area_full if jj_walls else eng_area_floor
+eng_jm, eng_ox, eng_oy, eng_juncs = (
+    (eng_jm_full,  _oxf, _oyf, eng_juncs_full) if jj_walls else
+    (eng_jm_floor, _ox0, _oy0, eng_juncs_floor))
+eng_combos, eng_combo_map = junction_combos(eng, include_sidewalls=jj_walls)
 eng_njunc = len(eng_juncs)
 # Engine-based critical current via Ambegaokar-Baratoff.
 # Ic[µA] = area_nm2 × jc_al[A/cm²] × 1e-8  (= area × 1e-14 cm²/nm² × 1e6 µA/A × jc)
@@ -782,7 +821,8 @@ if run_jj_mc:
     prog = st.sidebar.progress(0.0, text="Source Monte-Carlo…")
     for m in range(jj_nmc):
         q = wafer_params_source(params, 0.0, 0.0, jj_L, jj_pat, jj_size, rng)
-        smp[m] = _mc_area(_ekey_for(q), q)
+        _af, _afull = _mc_area(_ekey_for(q), q)
+        smp[m] = _afull if jj_walls else _af
         jang[m] = _beam_angle_row(q, params)
         prog.progress((m + 1) / jj_nmc, text=f"Source MC… {m + 1}/{jj_nmc}")
     prog.empty()
@@ -798,7 +838,7 @@ with _save_box:
         "💾 Save parameters + results",
         data=_build_export(params, eng, eng_area, eng_ox, eng_oy,
                            eng_njunc, eng_ic, eng_juncs, res_level,
-                           combos=eng_combos, jc_al=jc_al),
+                           combos=eng_combos, jc_al=jc_al, jj_walls=jj_walls),
         file_name="shadowcast_params.json", mime="application/json",
         use_container_width=True)
 
@@ -900,14 +940,32 @@ with tab1:
     st.divider()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Voxel size", f"{eng.vox:.1f} nm")
-    c2.metric("Junction area (engine)", f"{eng_area:.0f} nm²")
+    c2.metric("Junction area (engine)", f"{eng_area:.0f} nm²",
+              help=("Active area = full 3-D (floor + sidewalls)." if jj_walls
+                    else "Active area = horizontal floor overlap only."))
     c3.metric("Overlap x (engine)", f"{eng_ox:.0f} nm")
     c4.metric("Overlap y (engine)", f"{eng_oy:.0f} nm")
-    st.caption(
-        "Junction area = the **true Al1∩Al2 overlap** measured by counting "
-        "overlapping voxels (Σ cells × voxel²), so non-rectangular junctions "
-        "are handled exactly; overlap x / y are just the bounding-box extents."
-    )
+    if jj_walls:
+        w1, w2, w3 = st.columns(3)
+        w1.metric("• Floor area", f"{eng_area_floor:.0f} nm²",
+                  help="Horizontal overlap (electrode 2 on top of electrode 1).")
+        w2.metric("• Sidewall area", f"{eng_area_walls:.0f} nm²",
+                  help="Vertical M-O-M barrier on the resist sidewalls.")
+        w3.metric("• Total (floor+walls)", f"{eng_area_full:.0f} nm²",
+                  help="Sum used for Ic / R_n while 'Count sidewall' is on.")
+        st.caption(
+            "Junction area = Al1∩Al2 overlap (Σ cells × voxel²).  **Sidewall "
+            "counting ON** → Ic / R_n use the **total** (floor + walls); the "
+            "floor-only and sidewall-only parts are split above."
+        )
+    else:
+        st.caption(
+            "Junction area = the **true Al1∩Al2 overlap** measured by counting "
+            "overlapping voxels (Σ cells × voxel²), so non-rectangular junctions "
+            "are handled exactly; overlap x / y are just the bounding-box "
+            "extents.  **Floor-only** (vertical sidewall barrier excluded — "
+            "enable 'Count sidewall' in the sidebar to add it)."
+        )
     e1, e2, e3, e4 = st.columns(4)
     e1.metric("Est. critical current Iᶜ", f"{eng_ic:.3f} µA",
               help=f"Al, ~4 K: Jc = {jc_al:.0f} A/cm² (Ambegaokar–Baratoff)")
@@ -1163,8 +1221,9 @@ with tab_scan:
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
         r = simulate(_p, max_cells=_smc, min_vox=_smv)
-        _, area, _, _, _ = junction_footprint(r)
-        return float(area)
+        _, a_full, _, _, _ = junction_footprint(r, include_sidewalls=True)
+        _, a_floor, _, _, _ = junction_footprint(r, include_sidewalls=False)
+        return float(a_floor), float(a_full)
 
     if scan_dim == "1D":
         xv = st.selectbox("Scan variable", var_names, key="scan_x1d")
@@ -1186,7 +1245,8 @@ with tab_scan:
                 prog = st.progress(0.0, text="Scanning…")
                 for i, vx in enumerate(xs):
                     p2 = copy.copy(params); setattr(p2, xattr, float(vx))
-                    areas[i] = _scan_area(_scan_sig(p2), p2)
+                    _af, _afull = _scan_area(_scan_sig(p2), p2)
+                    areas[i] = _afull if jj_walls else _af
                     prog.progress((i + 1) / len(xs),
                                   text=f"Scanning… {i+1}/{len(xs)}")
                 prog.empty()
@@ -1245,7 +1305,8 @@ with tab_scan:
                 for ix, vx in enumerate(xs):
                     p2 = copy.copy(params)
                     setattr(p2, xattr, float(vx)); setattr(p2, yattr, float(vy))
-                    areas[iy, ix] = _scan_area(_scan_sig(p2), p2)
+                    _af, _afull = _scan_area(_scan_sig(p2), p2)
+                    areas[iy, ix] = _afull if jj_walls else _af
                     done += 1
                     prog.progress(done / total, text=f"Scanning… {done}/{total}")
             prog.empty()
@@ -1350,14 +1411,28 @@ with tab_wafer:
              "off-wafer grid cells are skipped.")
     R_mm, c_flat = WAFER_SPECS[waf_size]
     d_flat = float(np.sqrt(R_mm ** 2 - (c_flat / 2.0) ** 2))
-    waf_n = int(wc3.number_input(
-        "Grid N (N×N)", min_value=2, max_value=11, value=5, step=1,
-        key="waf_n"))
+    # Cell size first (wc4) so the Grid-N max can scale with it.  st.columns
+    # placement is independent of call order, so N still renders in column 3.
     waf_cell = float(wc4.number_input(
         "Grid cell size [mm]", min_value=1.0, max_value=10.0, value=5.0, step=0.1,
         key="waf_cell",
         help="Pitch of the N×N grid, centred on the wafer; a small N need not "
              "reach the edge."))
+    # Max N = the grid that just spans the full wafer diameter (2R) at this
+    # pitch; beyond it only adds off-wafer corner cells.  Capped for sanity
+    # (each grid cell is a full engine run).
+    N_FILL_CAP = 41
+    n_fill = int(np.ceil(2.0 * R_mm / waf_cell)) + 1
+    waf_n_max = max(2, min(n_fill, N_FILL_CAP))
+    if int(st.session_state.get("waf_n", 5)) > waf_n_max:
+        st.session_state["waf_n"] = waf_n_max        # avoid Streamlit max error
+    waf_n = int(wc3.number_input(
+        "Grid N (N×N)", min_value=2, max_value=waf_n_max, value=5, step=1,
+        key="waf_n",
+        help=f"Cells per side of the centred N×N grid.  Max {waf_n_max} = the N "
+             f"whose {waf_cell:.1f} mm pitch spans the full {waf_size} wafer "
+             f"(2R = {2 * R_mm:.0f} mm); raise the cell size to fill the wafer "
+             f"with fewer cells."))
     waf_res = wc5.selectbox(
         "Voxel grid density", list(RES_LEVELS.keys()), key="waf_res",
         help="Finer = slower; each grid cell is a full engine run.")
@@ -1369,9 +1444,14 @@ with tab_wafer:
     wmask = (Xg ** 2 + Yg ** 2 <= R_mm ** 2) & (Yg >= -d_flat)
     n_on = int(wmask.sum())
     _span = (waf_n - 1) * waf_cell
+    _fills = _span >= 2 * R_mm
     st.caption(f"{waf_size} wafer (R = {R_mm:.1f} mm) • {waf_n}×{waf_n} grid at "
                f"{waf_cell:.1f} mm pitch (span {_span:.1f} mm, centred) • "
-               f"{n_on}/{waf_n * waf_n} on-wafer cells at '{waf_res}'.")
+               f"{n_on}/{waf_n * waf_n} on-wafer cells at '{waf_res}'"
+               + (" • spans full wafer" if _fills else "") + ".")
+    if n_on > 200:
+        st.caption(f"⚠ {n_on} on-wafer cells = {n_on} full engine runs — this "
+                   f"may take a while.")
 
     # Finite source — opt-in beam-pattern Monte-Carlo JJ-area statistics.
     gauss_on = st.checkbox(
@@ -1418,8 +1498,9 @@ with tab_wafer:
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):
         r = simulate(_p, max_cells=_wsmc, min_vox=_wsmv)
-        _, area, _, _, _ = junction_footprint(r)
-        return float(area)
+        _, a_full, ox, oy, _ = junction_footprint(r, include_sidewalls=True)
+        _, a_floor, _, _, _ = junction_footprint(r, include_sidewalls=False)
+        return float(a_floor), float(a_full), float(ox), float(oy)
 
     if st.button("▶ Run wafer map", key="run_wafer",
                  use_container_width=True):
@@ -1436,6 +1517,8 @@ with tab_wafer:
                 dist_grids[lbl] = wafer_source_dist(th, ph, Xg, Yg, waf_L)
 
             warea = np.full((waf_n, waf_n), np.nan)       # [iy, ix]; off-wafer NaN
+            wox = np.full((waf_n, waf_n), np.nan)         # per-cell overlap x [nm]
+            woy = np.full((waf_n, waf_n), np.nan)         # per-cell overlap y [nm]
             wstd = wsamp = wang = None
             _walabels, _wathnom = _beam_angle_meta(params)
             if gauss_on:
@@ -1454,16 +1537,21 @@ with tab_wafer:
                         if not wmask[iy, ix]:
                             continue                      # skip off-wafer cells
                         smp = np.empty(n_mc)
+                        smp_ox = np.empty(n_mc); smp_oy = np.empty(n_mc)
                         for m in range(n_mc):
                             q = wafer_params_source(
                                 params, float(Xg[iy, ix]), float(Yg[iy, ix]),
                                 waf_L, waf_pat, waf_size_src, rng)
-                            smp[m] = _wafer_area(_wafer_sig(q), q)
+                            _af, _afull, _ox, _oy = _wafer_area(_wafer_sig(q), q)
+                            smp[m] = _afull if jj_walls else _af
+                            smp_ox[m] = _ox; smp_oy[m] = _oy
                             wang[iy, ix, m, :] = _beam_angle_row(q, params)
                             done += 1
                             prog.progress(done / total,
                                           text=f"Monte-Carlo… {done}/{total}")
                         warea[iy, ix] = float(np.mean(smp))
+                        wox[iy, ix] = float(np.mean(smp_ox))
+                        woy[iy, ix] = float(np.mean(smp_oy))
                         wstd[iy, ix] = float(np.std(smp))
                         wsamp[iy, ix, :] = smp
                 prog.empty()
@@ -1476,18 +1564,22 @@ with tab_wafer:
                             continue                      # skip off-wafer cells
                         q = wafer_params(params, float(Xg[iy, ix]),
                                          float(Yg[iy, ix]), waf_L)
-                        warea[iy, ix] = _wafer_area(_wafer_sig(q), q)
+                        _af, _afull, _ox, _oy = _wafer_area(_wafer_sig(q), q)
+                        warea[iy, ix] = _afull if jj_walls else _af
+                        wox[iy, ix] = _ox; woy[iy, ix] = _oy
                         done += 1
                         prog.progress(done / n_on,
                                       text=f"Simulating… {done}/{n_on}")
                 prog.empty()
             st.session_state["_wafermap"] = dict(
-                coords=wcoords, areas=warea, std=wstd, samples=wsamp,
+                coords=wcoords, areas=warea, ox=wox, oy=woy,
+                std=wstd, samples=wsamp,
                 theta=theta_grids, phi=phi_grids, dist=dist_grids,
                 L=waf_L, R=R_mm, c=c_flat, d=d_flat,
                 size=waf_size, n=waf_n, res=waf_res, mode=params.mode,
                 stack=params.stack, gauss=bool(gauss_on), pattern=waf_pat,
                 src_size=waf_size_src, n_mc=n_mc, sidewall=bool(params.sidewall),
+                walls=bool(jj_walls),
                 angles=wang, angle_labels=_walabels, angle_theta_nom=_wathnom)
 
     wm = st.session_state.get("_wafermap")
@@ -1514,13 +1606,48 @@ with tab_wafer:
         _dist = wm.get("dist", {})                        # per-evap source distance
         _rn = _rn_from_ic_uA(warea[on] * ic_factor)        # R_n [Ω] per cell
         _rn = np.where(np.isfinite(_rn), _rn, np.nan)     # ∞ (open) → null for Vega
+
+        # Selectable 2D-map quantity (colour + optional in-cell label).  Each
+        # entry: display-name → 2-D grid over the whole N×N (colour map is global).
+        _rn2d = _rn_from_ic_uA(warea * ic_factor)
+        _rn2d = np.where(np.isfinite(_rn2d), _rn2d, np.nan)
+        metrics = {"JJ area [nm²]": warea,
+                   "Est. Ic [µA]":  warea * ic_factor,
+                   "R_n [kΩ]":      _rn2d / 1000.0}
+        _wox, _woy = wm.get("ox"), wm.get("oy")           # None for legacy results
+        if _wox is not None:
+            metrics["Overlap x [nm]"] = _wox
+        if _woy is not None:
+            metrics["Overlap y [nm]"] = _woy
+        for lbl in wm["theta"]:
+            metrics[f"{lbl} θ′ [°]"] = wm["theta"][lbl]
+            metrics[f"{lbl} φ′ [°]"] = wm["phi"][lbl]
+            if lbl in _dist:
+                metrics[f"{lbl} dist [mm]"] = _dist[lbl]
+        if gauss:
+            metrics["area σ [nm²]"] = wstd
+        COLORMAPS = {
+            "Green→Yellow→Red": ("redyellowgreen", True),   # green=low … red=high
+            "Viridis": ("viridis", False), "Magma": ("magma", False),
+            "Plasma": ("plasma", False),   "Turbo": ("turbo", False),
+            "Blue→Red": ("redblue", True), "Cividis": ("cividis", False)}
+        cc1, cc2, cc3, cc4 = st.columns([2, 2, 1, 2])
+        msel = cc1.selectbox("2D map value", list(metrics), key="wmap_metric")
+        cmsel = cc2.selectbox("Colour map", list(COLORMAPS), key="wmap_cmap")
+        sig = int(cc3.number_input("Sig figs", 1, 5, 2, 1, key="wmap_sig"))
+        show_vals = cc4.checkbox("Show value in each cell", key="wmap_labels")
+        _scheme, _rev = COLORMAPS[cmsel]
+        _mval_on = np.asarray(metrics[msel])[on].astype(float)
+        _mval_on = np.where(np.isfinite(_mval_on), _mval_on, np.nan)
+
         cdata = {"x": Xg[on], "y": Yg[on], "area": warea[on],
-                 "Ic": warea[on] * ic_factor, "Rn": _rn}
+                 "Ic": warea[on] * ic_factor, "Rn": _rn / 1000.0,
+                 "val": _mval_on, "label": [_fmt_sig(v, sig) for v in _mval_on]}
         tips = [alt.Tooltip("x:Q", title="x [mm]", format=".1f"),
                 alt.Tooltip("y:Q", title="y [mm]", format=".1f"),
                 alt.Tooltip("area:Q", title="area [nm²]", format=".0f"),
                 alt.Tooltip("Ic:Q", title="Ic [µA]", format=".4f"),
-                alt.Tooltip("Rn:Q", title="R_n [Ω]", format=".0f")]
+                alt.Tooltip("Rn:Q", title="R_n [kΩ]", format=".3f")]
         for lbl in wm["theta"]:
             key = lbl.replace(" ", "_")
             cdata[f"{key}_th"] = wm["theta"][lbl][on]
@@ -1551,8 +1678,9 @@ with tab_wafer:
                     scale=alt.Scale(domain=[-Rd, Rd], nice=False)), x2="x1:Q",
             y=alt.Y("y0:Q", title="wafer y  [mm]",
                     scale=alt.Scale(domain=[-Rd, Rd], nice=False)), y2="y1:Q",
-            color=alt.Color("area:Q", title="area [nm²]",
-                            scale=alt.Scale(scheme="viridis")),
+            color=alt.Color("val:Q", title=msel,
+                            scale=alt.Scale(scheme=_scheme, reverse=_rev),
+                            legend=alt.Legend(orient="bottom")),
             tooltip=tips)
         tt = np.linspace(np.arctan2(-wm["d"], wm["c"] / 2),
                          np.arctan2(-wm["d"], -wm["c"] / 2) + 2 * np.pi, 200)
@@ -1562,10 +1690,23 @@ with tab_wafer:
             "o": np.arange(202)})
         outline = alt.Chart(out).mark_line(color="#90A4AE").encode(
             x="x:Q", y="y:Q", order="o:O")
-        st.altair_chart((heat + outline).properties(width=480, height=480),
+        _layers = heat + outline
+        if show_vals:                                     # in-cell value labels
+            _mid = float(np.nanmedian(_mval_on)) if np.isfinite(_mval_on).any() \
+                else 0.0
+            text = alt.Chart(cdf).mark_text(fontSize=9, baseline="middle").encode(
+                x=alt.X("x:Q", scale=alt.Scale(domain=[-Rd, Rd], nice=False)),
+                y=alt.Y("y:Q", scale=alt.Scale(domain=[-Rd, Rd], nice=False)),
+                text="label:N",
+                color=alt.condition(alt.datum.val > _mid, alt.value("black"),
+                                    alt.value("white")))
+            _layers = _layers + text
+        st.altair_chart(_layers.properties(width=460, height=460),
                         use_container_width=False)
-        st.caption("Hover any cell for its area, Ic, and per-evaporation "
-                   "effective (θ′, φ′).")
+        st.caption(f"Colour = **{msel}** ({cmsel}).  "
+                   + (f"In-cell values at {sig} sig figs.  " if show_vals else "")
+                   + "Hover any cell for its area, Ic, R_n and per-evaporation "
+                     "effective (θ′, φ′).")
         if gauss:                                         # σ (1σ error) heatmap
             heat_std = alt.Chart(cdf).mark_rect().encode(
                 x=alt.X("x0:Q", title="wafer x  [mm]",
@@ -1575,13 +1716,14 @@ with tab_wafer:
                         scale=alt.Scale(domain=[-Rd, Rd], nice=False)),
                 y2="y1:Q",
                 color=alt.Color("area_std:Q", title="area σ [nm²]",
-                                scale=alt.Scale(scheme="magma")),
+                                scale=alt.Scale(scheme="magma"),
+                                legend=alt.Legend(orient="bottom")),
                 tooltip=tips)
             samp = wm.get("samples")
             if samp is None:                              # legacy dict; σ map only
                 st.altair_chart(
                     (heat_std + outline).properties(
-                        width=480, height=480,
+                        width=460, height=460,
                         title="JJ-area σ (1σ error) from finite-source "
                               "Monte-Carlo"),
                     use_container_width=False)
@@ -1612,7 +1754,7 @@ with tab_wafer:
                         width=360, height=480,
                         title="Hovered-cell JJ-area distribution")
                 sig_map = (heat_std.add_params(csel) + outline).properties(
-                    width=480, height=480,
+                    width=460, height=460,
                     title="JJ-area σ (1σ error) — hover a cell for its "
                           "distribution")
                 st.altair_chart(sig_map | hist, use_container_width=False)
@@ -1645,7 +1787,7 @@ with tab_wafer:
         rows = {"x [mm]": Xg[on].round(2), "y [mm]": Yg[on].round(2),
                 "area [nm²]": warea[on].round(0),
                 "Ic [µA]": (warea[on] * ic_factor).round(4),
-                "R_n [Ω]": _rn_from_ic_uA(warea[on] * ic_factor).round(1)}
+                "R_n [kΩ]": (_rn_from_ic_uA(warea[on] * ic_factor) / 1000.0).round(3)}
         if gauss:
             rows["area σ [nm²]"] = wstd[on].round(0)
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -1684,7 +1826,8 @@ with tab_wafer:
         st.caption(
             f"Centre cell (nominal single-JJ) = {warea[ci, ci]:.0f} nm²  •  "
             f"std/mean = {cv:.1f} %  •  Ic range "
-            f"{np.nanmin(wic):.3f}–{np.nanmax(wic):.3f} µA  •  R_n range {_rn_txt}.")
+            f"{np.nanmin(wic):.3f}–{np.nanmax(wic):.3f} µA  •  R_n range {_rn_txt}.  "
+            f"JJ area = **{'floor + sidewalls' if wm.get('walls') else 'floor only'}**.")
         if wm.get("sidewall"):
             st.caption("⚙ Side-wall effect ON — the 1st-evaporation wall coating "
                        "narrows later evaporations; the narrowing grows with the "
@@ -1720,11 +1863,19 @@ with tab5:
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("Overlap x (engine)",  f"{eng_ox:.0f} nm")
     c2.metric("Overlap y (engine)",  f"{eng_oy:.0f} nm")
-    c3.metric("Area A (engine)",     f"{eng_area:.0f} nm²")
+    c3.metric("Area A (engine)",     f"{eng_area:.0f} nm²",
+              help=("Active = floor + sidewalls." if jj_walls
+                    else "Active = floor only."))
     c4.metric("Est. Ic (engine)",    f"{eng_ic:.3f} µA",
               help=f"Al, 4K: Jc = {jc_al:.0f} A/cm² (Ambegaokar-Baratoff)")
     c5.metric("Junctions",           f"{eng_njunc}",
               help="Number of spatially separate Al1∩Al2 overlaps")
+    if jj_walls:
+        w1, w2, w3 = st.columns(3)
+        w1.metric("• Floor area",  f"{eng_area_floor:.0f} nm²")
+        w2.metric("• Sidewall area", f"{eng_area_walls:.0f} nm²")
+        w3.metric("• Total (floor+walls)", f"{eng_area_full:.0f} nm²",
+                  help="Ic / R_n use this total while 'Count sidewall' is on.")
     j1, j2, j3, j4 = st.columns(4)
     j1.metric("Normal resistance R_n", _fmt_rn(eng_jj["Rn_ohm"]),
               help="R_n = πΔ/(2e·Iᶜ) (Ambegaokar–Baratoff, Al Δ≈0.18 meV)")
@@ -1817,7 +1968,7 @@ with tab5:
         "💾 Export parameters + results (re-loadable)",
         data=_build_export(params, eng, eng_area, eng_ox, eng_oy,
                            eng_njunc, eng_ic, eng_juncs, res_level,
-                           combos=eng_combos, jc_al=jc_al),
+                           combos=eng_combos, jc_al=jc_al, jj_walls=jj_walls),
         file_name="shadowcast_params.json", mime="application/json",
         help="Re-load this file with the sidebar uploader to restore every "
              "parameter.")

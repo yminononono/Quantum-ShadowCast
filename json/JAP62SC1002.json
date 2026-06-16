@@ -8,10 +8,10 @@
     "undercut": 150,
     "angle1": 45,
     "phi1": 0,
-    "t_metal1": 30,
+    "t_metal1": 40,
     "angle2": 45,
     "phi2": 90,
-    "t_metal2": 30,
+    "t_metal2": 60,
     "bridge_len": 700,
     "bridge_w": 300,
     "bridge_pmma_gap": 0.0,
@@ -30,7 +30,9 @@
     "tri_phi2": 0.0,
     "tri_angle4": 0.0,
     "tri_phi4": 0.0,
-    "sidewall": true
+    "sidewall": true,
+    "jc_al": 280.0,
+    "jj_walls": false
   },
   "ray_scan": {
     "resolution": "Maximum (slowest)",
@@ -39,23 +41,23 @@
     "voxel_nm": 5.333333333333333
   },
   "results": {
-    "junction_area_nm2": 40960.0,
-    "overlap_x_nm": 170.66666666666666,
-    "overlap_y_nm": 213.33333333333331,
+    "junction_area_nm2": 32426.666666666664,
+    "overlap_x_nm": 160.0,
+    "overlap_y_nm": 202.66666666666666,
     "n_junctions": 1,
-    "est_Ic_uA": 4.096,
-    "L_J_nH": 0.08034813927623373,
-    "E_J_J": 1.3480180878354569e-21,
-    "E_J_over_h_GHz": 2034.4156601412633,
-    "E_J_over_kB_K": 97.63655265280725,
+    "est_Ic_uA": 0.09079466666666666,
+    "L_J_nH": 3.624728087649642,
+    "E_J_J": 2.988106761368596e-23,
+    "E_J_over_h_GHz": 45.096213799797994,
+    "E_J_over_kB_K": 2.164276917137227,
     "junctions": [
       {
-        "area_nm2": 40960.0,
-        "overlap_x_nm": 170.66666666666666,
-        "overlap_y_nm": 213.33333333333331,
-        "center_x_nm": -16.000000000015575,
+        "area_nm2": 32426.666666666664,
+        "overlap_x_nm": 160.0,
+        "overlap_y_nm": 202.66666666666666,
+        "center_x_nm": -21.333333333348836,
         "center_y_nm": -1.5802470443304628e-11,
-        "cells": 1440
+        "cells": 1140
       }
     ]
   }

@@ -490,7 +490,8 @@ def _dilate6(m):
     return out
 
 
-def _junction_cells_3d(r: DepositionResult, min_cells: int = 2):
+def _junction_cells_3d(r: DepositionResult, min_cells: int = 2,
+                       include_sidewalls: bool = True):
     """Cleaned 3-D Josephson-junction mask + per-junction list.
 
     The tunnel barrier is the thin oxide between the two electrodes.  In the
@@ -514,6 +515,14 @@ def _junction_cells_3d(r: DepositionResult, min_cells: int = 2):
     z_floor = r.meta.get("z_floor", r.z_top)
     zsel = (zs >= 0) & (zs < z_floor)
     j3 = r.alox & r.al2 & zsel[None, None, :]    # oxide cells reached by elec 2
+    if not include_sidewalls:
+        # Floor-only: keep only the horizontal top-surface barrier — oxide cells
+        # with bottom-electrode metal directly beneath (elec 2 on top of elec 1).
+        # Vertical sidewall barriers (oxide on a wall face, metal/resist below,
+        # not elec-1 metal) are dropped.
+        al1_below = np.zeros_like(r.al1)
+        al1_below[:, :, 1:] = r.al1[:, :, :-1]
+        j3 = j3 & al1_below
     j2 = j3.any(axis=2)                           # xy footprint of the junction
 
     # Dolan's open trench floods both depositions onto the leads, leaving stray
@@ -548,7 +557,8 @@ def _junction_cells_3d(r: DepositionResult, min_cells: int = 2):
     return clean, juncs
 
 
-def junction_footprint(r: DepositionResult, min_cells: int = 2):
+def junction_footprint(r: DepositionResult, min_cells: int = 2,
+                       include_sidewalls: bool = True):
     """Full 3-D Josephson-junction barrier: substrate floor *and* metal walls.
 
     The barrier is every oxide cell electrode 2 reaches across the oxide skin of
@@ -562,7 +572,7 @@ def junction_footprint(r: DepositionResult, min_cells: int = 2):
     full 3-D barrier area (floor + walls); ``ox/oy`` are the xy footprint of the
     largest junction (not a bounding box merging separate junctions).
     """
-    clean, juncs = _junction_cells_3d(r, min_cells)
+    clean, juncs = _junction_cells_3d(r, min_cells, include_sidewalls)
     junc = clean.any(axis=2)                       # xy projection for the map
     area = sum(d["area"] for d in juncs)
     if juncs:
@@ -577,7 +587,8 @@ COMBO_NONE, COMBO_NBAL, COMBO_ALAL, COMBO_NBNB = 0, 1, 2, 3
 _COMBO_NAMES = {COMBO_NBAL: "Nb-Al", COMBO_ALAL: "Al-Al", COMBO_NBNB: "Nb-Nb"}
 
 
-def junction_combos(r: DepositionResult, min_cells: int = 2):
+def junction_combos(r: DepositionResult, min_cells: int = 2,
+                    include_sidewalls: bool = True):
     """Classify every 3-D junction cell by the metal pair across the oxide.
 
     For a trilayer (Nb/Al–AlOx–Al/Nb) each barrier cell separates electrode-1's
@@ -595,7 +606,7 @@ def junction_combos(r: DepositionResult, min_cells: int = 2):
     """
     if getattr(r, "stack", "Bilayer") != "Trilayer" or not r.films:
         return {}, None
-    clean, _ = _junction_cells_3d(r, min_cells)
+    clean, _ = _junction_cells_3d(r, min_cells, include_sidewalls)
 
     # electrode-1 side: Al where the evap-2 Al sublayer borders the oxide cell,
     # else Nb (every barrier cell is an oxide-skin cell of electrode 1, so the
