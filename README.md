@@ -130,10 +130,10 @@ judgments are based on it.
 ## Requirements
 
 - **Python 3.10+** (developed and tested on 3.11)
-- Core packages: `streamlit`, `numpy`, `matplotlib` (plus `pandas` and `altair`,
-  which ship with Streamlit and back the interactive wafer-map heatmap/table)
-- Optional: `plotly` for the drag-rotatable 3D thickness surface (falls back to
-  a static matplotlib surface if absent); `gdstk` for GDS import
+- Core packages: `streamlit`, `numpy`, `matplotlib`, `plotly` (plus `pandas` and
+  `altair`, which ship with Streamlit and back the interactive wafer-map
+  heatmap/table)
+- Optional: `gdstk` for GDS import
 
 Dependencies are kept minimal (`scipy` / `rtree` are **not** required).
 
@@ -160,8 +160,8 @@ The minimal set in `requirements.txt` is enough to run the app:
 streamlit>=1.28.0
 numpy>=1.24.0
 matplotlib>=3.7.0
+plotly>=5.0.0         # drag-rotatable 3D thickness surface (Top View tab)
 gdstk>=0.9.0          # only if you use GDS import
-plotly>=5.0.0         # optional: drag-rotatable 3D thickness surface
 ```
 
 (`pandas` and `altair` come bundled with Streamlit.)
