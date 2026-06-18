@@ -53,6 +53,7 @@ class ProcessParams:
     t_pmma:   float = 250.0   # PMMA top layer [nm]  (no undercut)
     t_mma:    float = 900.0   # MMA  bot layer [nm]  (= bridge underside height / vertical gap)
     undercut: float = 150.0   # MMA one-sided undercut [nm]
+    resist_round: float = 0.0 # resist opening corner fillet radius [nm] (0 = sharp)
 
     # ── Evaporation 1 ─────────────────────────────────────────
     # Uniaxial tilt ±24° (same azimuth φ, opposite polar θ); 30 nm Al each.

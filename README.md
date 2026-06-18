@@ -36,6 +36,13 @@ judgments are based on it.
     to their electrode's primary angle).
 - **3D shadow-evaporation engine**: voxel ray-casting that reproduces the metal
   films, the oxide, and the resist undercut.
+- **Rounded resist corners** (option): a slider rounds the **top resist layer's
+  top and bottom faces** with a fillet of the chosen radius (0 = sharp). The
+  fillet is a true circle defined **independently of the voxel grid density**
+  (the shadow test is analytic), so the modelled shape — and the resulting
+  shadow / junction area — does not change with resolution; the cross-section
+  fill is still drawn at voxel resolution. Reflected consistently in the
+  cross-section, top view, and wafer map.
 - **Arbitrary junction shape**: the junction is not assumed to be square — it is
   the true oxide barrier between the two electrodes (even when non-rectangular),
   measured by cell count in 3D. A device may contain several spatially separate
@@ -256,6 +263,7 @@ labels. The wafer centre always reproduces the single-JJ result.
 | `t_pmma` | PMMA thickness [nm] (Dolan: top resist; Manhattan: upper imaging resist) |
 | `t_mma` | MMA thickness [nm] (Dolan: bottom resist = bridge air-gap height; Manhattan: lower undercut sublayer) |
 | `undercut` | One-sided MMA undercut [nm] |
+| `resist_round` | Resist opening corner fillet radius [nm] (0 = sharp lip/foot) |
 | θ₁ / φ₁ / d₁ | Polar angle / azimuth / metal thickness of evaporation 1 |
 | θ₂ / φ₂ / d₂ | Polar angle / azimuth / metal thickness of evaporation 2 |
 | `bridge_len` / `bridge_w` | (Dolan) bridge length / width [nm] |

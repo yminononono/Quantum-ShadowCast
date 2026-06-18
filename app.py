@@ -200,7 +200,8 @@ def _angle_distribution_ui(key, A, labels, theta_nom, area=None,
 
 # Sidebar widget keys.  Mode-specific widgets get DISTINCT keys (prefixed) so
 # switching modes can never feed an out-of-range value into a shared slider.
-_SHARED_KEYS = ["t_pmma", "t_mma", "undercut", "angle1", "phi1", "t_metal1"]
+_SHARED_KEYS = ["t_pmma", "t_mma", "undercut", "resist_round",
+                "angle1", "phi1", "t_metal1"]
 _DOLAN_KEYS = {"angle2": "d_angle2", "phi2": "d_phi2", "t_metal2": "d_tmetal2",
                "bridge_len": "d_bridge_len", "bridge_w": "d_bridge_w",
                "bridge_pmma_gap": "d_bridge_pmma_gap"}
@@ -216,7 +217,7 @@ _TRI_KEYS = {"tri_t1": "tri_t1", "tri_t2": "tri_t2",
 # out-of-range file can never crash widget creation.
 _KEY_RANGE = {
     "t_pmma": (100, 2000), "t_mma": (100, 1500), "undercut": (0, 500),
-    "jc_al": (1, 1e6),
+    "resist_round": (0, 200), "jc_al": (1, 1e6),
     "angle1": (-60, 60), "phi1": (-90, 90), "t_metal1": (10, 200),
     "d_angle2": (-60, 60), "d_phi2": (-90, 90), "d_tmetal2": (10, 200),
     "d_bridge_len": (50, 2000), "d_bridge_w": (50, 1000),
@@ -395,7 +396,7 @@ def _tri_linked_tilt(idx, src_idx, prim_angle, prim_phi,
 _PARAM_DEFAULTS = {
     "mode": "Dolan bridge",
     "stack": "Bilayer",
-    "t_pmma": 250, "t_mma": 900, "undercut": 150,
+    "t_pmma": 250, "t_mma": 900, "undercut": 150, "resist_round": 0,
     "angle1": -24, "phi1": 0, "t_metal1": 30,
     "d_angle2": 24, "d_phi2": 0, "d_tmetal2": 30,
     "d_bridge_len": 250, "d_bridge_w": 250, "d_bridge_pmma_gap": 0,
@@ -554,6 +555,12 @@ with st.sidebar:
     st.session_state.setdefault("undercut", 150)
     undercut = st.slider("MMA undercut u [nm]  (one-sided)", 0, 500,
                          step=10, key="undercut")
+    st.session_state.setdefault("resist_round", 0)
+    resist_round = st.slider(
+        "Resist corner rounding r [nm]", 0, 200, step=5, key="resist_round",
+        help="Round the resist opening's top lip and bottom foot with a fillet "
+             "of this radius (0 = sharp corners).  The wall flares near the top "
+             "and floor, so it shifts the shadow and the junction area.")
     if mode == "Dolan bridge":
         st.caption(f"Total resist: {t_pmma+t_mma} nm  ·  vertical shadow gap = MMA = {t_mma} nm")
     else:
@@ -740,7 +747,7 @@ with st.sidebar:
         jj_pat, jj_size, jj_L, jj_nmc, run_jj_mc = "point", 0.0, 550.0, 0, False
 
 params = ProcessParams(
-    t_pmma=t_pmma, t_mma=t_mma, undercut=undercut,
+    t_pmma=t_pmma, t_mma=t_mma, undercut=undercut, resist_round=resist_round,
     angle1=angle1, phi1=phi1, t_metal1=t_metal1,
     angle2=angle2, phi2=phi2, t_metal2=t_metal2,
     bridge_len=bridge_len, bridge_w=bridge_w, bridge_pmma_gap=bridge_pmma_gap,
@@ -772,7 +779,8 @@ def _ekey_for(p):
             p.bridge_pmma_gap, p.manhattan_wx, p.manhattan_wy, p.manhattan_theta,
             p.manhattan_delta, p.manhattan_h, _max_cells, _min_vox, p.stack,
             p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4, p.tri_angle2, p.tri_phi2,
-            p.tri_angle4, p.tri_phi4, getattr(p, "sidewall", False))
+            p.tri_angle4, p.tri_phi4, getattr(p, "sidewall", False),
+            getattr(p, "resist_round", 0.0))
 
 @st.cache_data(show_spinner=False)
 def _mc_area(sig, _p):
@@ -1216,7 +1224,7 @@ with tab_scan:
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h, _smc, _smv,
                 p.stack, p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4,
                 p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4,
-                getattr(p, "sidewall", False))
+                getattr(p, "sidewall", False), getattr(p, "resist_round", 0.0))
 
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
@@ -1493,7 +1501,8 @@ with tab_wafer:
                 p.bridge_len, p.bridge_w, p.bridge_pmma_gap, p.undercut,
                 p.t_mma, p.t_pmma, p.manhattan_wx, p.manhattan_wy,
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h,
-                _wsmc, _wsmv, getattr(p, "sidewall", False))
+                _wsmc, _wsmv, getattr(p, "sidewall", False),
+                getattr(p, "resist_round", 0.0))
 
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):

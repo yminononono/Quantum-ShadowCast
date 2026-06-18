@@ -76,6 +76,43 @@ def _frame_boxes(hx, hy, z0, z1, R):
     ]
 
 
+def _layer_boxes(open_rects, R, z0, z1, r=0.0, round_top=False, round_bot=False):
+    """Complement of `open_rects` in [-R,R]² over [z0,z1], with the opening
+    optionally flared by a radius-`r` quarter-round at its top (z1) and/or bottom
+    (z0) face — the resist lip / interface.  The wall retreats so the opening
+    widens by up to r at the rounded face, following a quarter circle tangent to
+    the wall and that face, approximated by `K` thin z-slabs.  `K` adapts to the
+    radius (not the voxel grid), so the modelled fillet is a fixed, density-
+    independent circle.  r<=0 ⇒ a plain layer.
+    """
+    rr = float(max(0.0, r))
+    if rr <= 0.0 or not (round_top or round_bot):
+        return _solid_from_openings(open_rects, R, z0, z1)
+    faces = int(round_top) + int(round_bot)
+    rr = min(rr, (z1 - z0) / faces)                        # keep the fillets apart
+    K = int(np.clip(round(rr / 5.0), 10, 20))              # ~5 nm ledges; smooth circle
+
+    def _exp(rects, e):
+        return [(x0 - e, x1 + e, y0 - e, y1 + e) for (x0, x1, y0, y1) in rects]
+
+    boxes = []
+    zlo = z0 + (rr if round_bot else 0.0)
+    zhi = z1 - (rr if round_top else 0.0)
+    if zhi > zlo:                                           # nominal middle
+        boxes += _solid_from_openings(open_rects, R, zlo, zhi)
+    if round_top:
+        for k in range(K):
+            za, zb = z1 - rr + k * rr / K, z1 - rr + (k + 1) * rr / K
+            e = rr - np.sqrt(max(rr * rr - (0.5 * (za + zb) - (z1 - rr)) ** 2, 0.0))
+            boxes += _solid_from_openings(_exp(open_rects, e), R, za, zb)
+    if round_bot:
+        for k in range(K):
+            za, zb = z0 + k * rr / K, z0 + (k + 1) * rr / K
+            e = rr - np.sqrt(max(rr * rr - ((z0 + rr) - 0.5 * (za + zb)) ** 2, 0.0))
+            boxes += _solid_from_openings(_exp(open_rects, e), R, za, zb)
+    return boxes
+
+
 def build_occluders(p: ProcessParams):
     """Return (boxes, R, z_top, resist_h) for the given process."""
     if p.mode == "Dolan bridge":
@@ -96,11 +133,21 @@ def build_occluders(p: ProcessParams):
         ap_hy = Wj / 2                              # aperture half-width (y)
         R = trench_hx + u + 400.0
 
+        rr = getattr(p, "resist_round", 0.0)
         boxes = []
-        # MMA (undercut sublayer) fills 0..gap; trench widened by undercut.
-        boxes += _frame_boxes(trench_hx + u, ap_hy + u, 0.0, gap, R)
-        # PMMA layer: open trench (no bridge yet), gap..z_top
-        boxes += _frame_boxes(trench_hx, ap_hy, gap, z_top, R)
+        if rr <= 0.0:
+            # MMA (undercut sublayer) fills 0..gap; trench widened by undercut.
+            boxes += _frame_boxes(trench_hx + u, ap_hy + u, 0.0, gap, R)
+            # PMMA layer: open trench (no bridge yet), gap..z_top
+            boxes += _frame_boxes(trench_hx, ap_hy, gap, z_top, R)
+        else:
+            # Rounded resist: only the PMMA (top) layer is filleted — its top lip
+            # and its bottom face at the MMA interface.  The MMA (bottom) layer
+            # stays sharp.
+            boxes += _frame_boxes(trench_hx + u, ap_hy + u, 0.0, gap, R)
+            boxes += _layer_boxes(
+                [(-trench_hx, trench_hx, -ap_hy, ap_hy)],
+                R, gap, z_top, rr, round_top=True, round_bot=True)
         # Suspended bridge: narrow strip across the middle of the trench,
         # hanging over the air gap at z = gap.
         boxes.append(_box(-L / 2, L / 2, -ap_hy, ap_hy, gap, z_top))
@@ -131,8 +178,16 @@ def build_occluders(p: ProcessParams):
         # Undercut copies: transverse width widened by u on the lower sublayer.
         A_u = (-arm, arm, -wA / 2 - u, wA / 2 + u)
         B_u = (-wB / 2 - u, wB / 2 + u, -arm, arm)
-        boxes = _solid_from_openings([A_u, B_u], R, 0.0, t_lo)      # lower (undercut)
-        boxes += _solid_from_openings([A, B], R, t_lo, z_top)       # upper (imaging)
+        rr = getattr(p, "resist_round", 0.0)
+        if rr <= 0.0:
+            boxes = _solid_from_openings([A_u, B_u], R, 0.0, t_lo)   # lower (undercut)
+            boxes += _solid_from_openings([A, B], R, t_lo, z_top)    # upper (imaging)
+        else:
+            # Rounded resist: only the upper (imaging) layer is filleted — its top
+            # lip and its bottom face at the interface.  The lower layer stays sharp.
+            boxes = _solid_from_openings([A_u, B_u], R, 0.0, t_lo)
+            boxes += _layer_boxes([A, B], R, t_lo, z_top, rr,
+                                  round_top=True, round_bot=True)
         return boxes, R, z_top, z_top, t_lo    # z_split = undercut/imaging interface
 
 

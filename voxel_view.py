@@ -499,12 +499,12 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
 
     sub = solid2d == SUBSTRATE
 
-    # grounded metal (for lift-off): contiguous metal stack from the floor up.
+    # grounded metal (for lift-off): every metal voxel connected to the substrate
+    # floor (see _grounded_metal) — slanted stacks kept as-is, resist-only islands
+    # dropped.  Sliced from the shared 3-D mask so the cross-section matches the
+    # top view exactly; metal_any (already blanked outside) trims off-grid columns.
     metal_any = al1 | al2
-    z0 = int(np.searchsorted(zs, 0.0))
-    grounded = np.zeros_like(metal_any)
-    grounded[:, z0:] = np.cumprod(metal_any[:, z0:].astype(np.int8),
-                                  axis=1).astype(bool)
+    grounded = _grounded_metal(r)[ix, iy, :] & metal_any
 
     def _paint_metal(cat, inc_al1, inc_al2, mask=None):
         """Paint bilayer electrode metal (Al #1 / Al #2); ``mask`` (e.g.
@@ -639,15 +639,62 @@ def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None
 # top view (floor map)
 # ════════════════════════════════════════════════════════════════
 
-def _floor_maps(r):
-    """Return (al1f, al2f, aloxf, upper_resist, lower_resist) as (Nx,Ny) bools."""
+def _dilate_box(m):
+    """3×3×3 (26-neighbour) dilation of a 3-D bool mask via sequential 1-D slice
+    shifts along each axis (no wrap-around).  Corner/edge connectivity keeps a
+    voxelised diagonal stack as one connected component."""
+    out = m
+    for ax in range(3):
+        a = out.copy()
+        s_o = [slice(None)] * 3; s_i = [slice(None)] * 3
+        s_o[ax] = slice(1, None); s_i[ax] = slice(0, -1)
+        a[tuple(s_o)] |= out[tuple(s_i)]
+        s_o = [slice(None)] * 3; s_i = [slice(None)] * 3
+        s_o[ax] = slice(0, -1); s_i[ax] = slice(1, None)
+        a[tuple(s_o)] |= out[tuple(s_i)]
+        out = a
+    return out
+
+
+def _grounded_metal(r):
+    """3-D mask of lift-off-surviving metal: every metal voxel **connected to the
+    substrate floor** through the metal network (26-connectivity), so slanted /
+    overhanging stacks are kept as-is.  Metal that sits only on resist with no
+    metal path down to the substrate (the undercut breaks continuity) is dropped.
+    Memoised on ``r.meta`` so the flood fill runs once per simulation."""
+    g = r.meta.get("_grounded")
+    if g is not None:
+        return g
+    zs = r.zs
+    z0 = int(np.searchsorted(zs, 0.0))        # first cell resting on substrate
+    metal = (r.al1 | r.al2)
+    g = np.zeros_like(metal)
+    g[:, :, z0] = metal[:, :, z0]             # seed: metal on the substrate floor
+    for _ in range(int(sum(metal.shape))):    # bounded; converges well before this
+        nxt = metal & _dilate_box(g)
+        if int(nxt.sum()) == int(g.sum()):
+            break
+        g = nxt
+    r.meta["_grounded"] = g
+    return g
+
+
+def _floor_maps(r, grounded=None):
+    """Return (al1f, al2f, aloxf, upper_resist, lower_resist) as (Nx,Ny) bools.
+
+    When ``grounded`` (a 3-D metal mask from :func:`_grounded_metal`) is given,
+    the metal / oxide footprints are restricted to lift-off-surviving metal, so
+    resist-only deposits are dropped (matching the cross-section lift-off)."""
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
     z_split = r.meta.get("z_split", r.z_top)
     floor = (zs >= 0) & (zs < zf)
-    al1f = r.al1[:, :, floor].any(axis=2)
-    al2f = r.al2[:, :, floor].any(axis=2)
-    aloxf = r.alox[:, :, floor].any(axis=2)
+    al1 = r.al1 if grounded is None else (r.al1 & grounded)
+    al2 = r.al2 if grounded is None else (r.al2 & grounded)
+    alox = r.alox if grounded is None else (r.alox & grounded)
+    al1f = al1[:, :, floor].any(axis=2)
+    al2f = al2[:, :, floor].any(axis=2)
+    aloxf = alox[:, :, floor].any(axis=2)
     lo_band = (zs >= 0) & (zs < z_split)
     up_band = (zs >= z_split) & (zs < r.z_top)
     lower_resist = (r.solid[:, :, lo_band] == RESIST).any(axis=2)
@@ -655,15 +702,17 @@ def _floor_maps(r):
     return al1f, al2f, aloxf, upper_resist, lower_resist
 
 
-def _film_floor_maps(r):
+def _film_floor_maps(r, grounded=None):
     """Per-film floor footprints {nb1f, al2f, al3f, nb4f} as (Nx,Ny) bools for a
-    trilayer result, else ``None`` (bilayer)."""
+    trilayer result, else ``None`` (bilayer).  ``grounded`` restricts to lift-off-
+    surviving metal (see :func:`_floor_maps`)."""
     if getattr(r, "stack", "Bilayer") != "Trilayer" or not r.films:
         return None
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
     floor = (zs >= 0) & (zs < zf)
-    return {k: g[:, :, floor].any(axis=2) for k, g in r.films.items()}
+    return {k: (g if grounded is None else (g & grounded))[:, :, floor].any(axis=2)
+            for k, g in r.films.items()}
 
 
 def _resist_cat_top(cat, upper_resist, lower_resist):
@@ -690,6 +739,11 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
     """
     al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
     films2d = _film_floor_maps(r)
+    # Grounded (lift-off-surviving) footprints — used ONLY in the lift-off panel
+    # so resist-only metal is dropped there (the build-up panels stay as-deposited).
+    _g3 = _grounded_metal(r)
+    al1g, al2g, aloxg, _, _ = _floor_maps(r, grounded=_g3)
+    films2d_g = _film_floor_maps(r, grounded=_g3)
 
     # Opaque resist base (substrate visible through the open holes).
     resist_base = np.full(al1f.shape, C_EMPTY, np.int8)
@@ -703,16 +757,19 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
         cols = {"nb1": C_E1_NB, "al2": C_E2_AL, "al3": C_E3_AL, "nb4": C_E4_NB}
         elec2f = films2d["al3"] | films2d["nb4"]      # electrode-2 floor footprint
 
-        def metal_tri(inc, emphasise_junc=False):
+        def metal_tri(inc, emphasise_junc=False, grounded=False):
+            src = films2d_g if grounded else films2d
             cat = np.full(al1f.shape, C_EMPTY, np.int8)
             for name in order:                         # later films overwrite earlier
                 if name in inc:
-                    cat[films2d[name]] = cols[name]
+                    cat[src[name]] = cols[name]
             if emphasise_junc:
                 _paint_junction_top(cat, junc_mask, combo_map)
             return cat
 
+        elec2g = films2d_g["al3"] | films2d_g["nb4"]   # grounded electrode-2 floor
         ox_post = aloxf & ~elec2f          # electrode-2 sits over the barrier
+        ox_post_g = aloxg & ~elec2g        # lift-off: oxide on grounded metal only
         # (title, base, metal grid, alpha, oxide mask, label junctions, arrow)
         panels = [
             ("1. Resist only", resist_base, metal_tri([]),                            0.62, None,    False, None),
@@ -722,7 +779,7 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
             ("5. Evap 3 (Al)", resist_base, metal_tri(["nb1", "al2", "al3"]),         0.62, ox_post, False, ("al3", C_E3_AL, "evap 3")),
             ("6. Evap 4 (Nb)", resist_base, metal_tri(["nb1", "al2", "al3", "nb4"]),  0.62, ox_post, False, ("nb4", C_E4_NB, "evap 4")),
             ("7. Lift-off (JJ)", empty_base,
-             metal_tri(order, emphasise_junc=True),                                  1.00, ox_post, True,  None),
+             metal_tri(order, emphasise_junc=True, grounded=True),                   1.00, ox_post_g, True, None),
         ]
         hw = _top_half(r, view_half)
         fig, axes = plt.subplots(2, 4, figsize=(17.5, 9.0),
@@ -750,16 +807,19 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
         return fig
 
     # ── bilayer: 5-panel top-view sequence ──
-    def metal_cat(inc_al1=False, inc_al2=False, emphasise_junc=False):
+    def metal_cat(inc_al1=False, inc_al2=False, emphasise_junc=False, grounded=False):
+        a1 = al1g if grounded else al1f
+        a2 = al2g if grounded else al2f
         cat = np.full(al1f.shape, C_EMPTY, np.int8)
-        if inc_al1: cat[al1f] = C_AL1
-        if inc_al2: cat[al2f] = C_AL2
+        if inc_al1: cat[a1] = C_AL1
+        if inc_al2: cat[a2] = C_AL2
         if emphasise_junc:
             _paint_junction_top(cat, junc_mask, combo_map)
         return cat
 
     ox_pre = aloxf                       # oxidation: oxide over all Al1
     ox_post = aloxf & ~al2f              # after evap-2: Al2 sits over the barrier
+    ox_post_g = aloxg & ~al2g            # lift-off: oxide on grounded metal only
     # (title, base_grid, metal_grid, metal_alpha, ox_mask, label_junc)
     panels = [
         ("1. Resist only",   resist_base, metal_cat(),                          0.62, None,    False),
@@ -767,7 +827,7 @@ def render_top_stages(r: DepositionResult, junc_mask=None, view_half=None,
         ("3. Oxidation",     resist_base, metal_cat(inc_al1=True),              0.62, ox_pre,  False),
         ("4. Evaporation 2", resist_base, metal_cat(inc_al1=True, inc_al2=True),0.62, ox_post, False),
         ("5. Lift-off (JJ)", empty_base,
-         metal_cat(inc_al1=True, inc_al2=True, emphasise_junc=True),            1.00, ox_post, True),
+         metal_cat(inc_al1=True, inc_al2=True, emphasise_junc=True, grounded=True), 1.00, ox_post_g, True),
     ]
 
     hw = _top_half(r, view_half)
@@ -843,8 +903,12 @@ def render_top_view(r: DepositionResult, junc_mask=None, view_half=None,
     The AlOx barrier is filled on top of Al1 and separate junctions are labelled.
     When ``slice_line=(angle_deg, offset)`` is given, the (possibly rotated)
     cross-section cut is marked with a dashed line.  For a trilayer, pass
-    ``combo_map`` to colour the junction by Nb-Al / Al-Al / Nb-Nb."""
-    al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(r)
+    ``combo_map`` to colour the junction by Nb-Al / Al-Al / Nb-Nb.
+
+    Shows the **lift-off result**: only substrate-grounded metal survives (the
+    same rule as the cross-section lift-off); resist-only deposits are dropped."""
+    al1f, al2f, aloxf, upper_resist, lower_resist = _floor_maps(
+        r, grounded=_grounded_metal(r))
     base = np.full(al1f.shape, C_EMPTY, np.int8)
     _resist_cat_top(base, upper_resist, lower_resist)
 
@@ -888,7 +952,7 @@ def _thickness_field(r: DepositionResult):
     zs = r.zs
     zf = r.meta.get("z_floor", r.z_top)
     floor = (zs >= 0) & (zs < zf)
-    metal = (r.al1 | r.al2)[:, :, floor]
+    metal = ((r.al1 | r.al2) & _grounded_metal(r))[:, :, floor]   # lift-off survivors
     return metal.sum(axis=2).astype(float) * r.vox          # (Nx, Ny) [nm]
 
 
