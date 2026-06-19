@@ -302,7 +302,28 @@ def _label_solid(xs, ys, zs, boxes):
     return lab
 
 
-def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None):
+def _cone_dirs(d, alpha_rad, az1=6, az2=8):
+    """Beam directions sampling a cone of half-angle ``alpha_rad`` about ``d``
+    (the finite source's angular size): the axis plus two rings (1+az1+az2).
+    Used for the soft-edge / penumbra deposition."""
+    d = np.asarray(d, float)
+    d = d / (np.linalg.norm(d) + 1e-12)
+    ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    e1 = np.cross(d, ref); e1 /= (np.linalg.norm(e1) + 1e-12)
+    e2 = np.cross(d, e1)
+    dirs = [d]
+    for beta, naz in ((0.5 * alpha_rad, az1), (alpha_rad, az2)):
+        if beta <= 0:
+            continue
+        for a in range(naz):
+            g = 2.0 * np.pi * a / naz
+            v = (np.cos(beta) * d
+                 + np.sin(beta) * (np.cos(g) * e1 + np.sin(g) * e2))
+            dirs.append(v / (np.linalg.norm(v) + 1e-12))
+    return dirs
+
+
+def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None):
     """Return bool grid of metal voxels for one evaporation.
 
     A cell receives metal if it is EMPTY, its beam-forward neighbour is solid
@@ -313,6 +334,13 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None):
     evaporation: a surface cell is also shadowed if its ray to the source passes
     through it — this is the sidewall effect (prior wall coating narrows the
     opening).  ``None`` ⇒ resist-only shadowing (unchanged behaviour).
+
+    ``soft`` (optional float = cone half-angle [rad]) turns on the **soft-edge
+    (penumbra)** model: occlusion is integrated over a cone of beam directions
+    spanning the finite source's angular size, giving a fractional coverage per
+    surface cell, and the grown film thickness is tapered to ``round(coverage·n)``
+    — so a rounded resist lip yields a rounded (tapered) metal shoulder.
+    ``None`` ⇒ a single parallel beam (binary, unchanged behaviour).
     """
     Nx, Ny, Nz = lab.shape
     solid = lab != EMPTY
@@ -353,24 +381,42 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None):
         return np.zeros_like(solid)
 
     origins = np.stack([xs[ii], ys[jj], zs[kk]], axis=1)
-    u = -d                                   # toward the source
-    blocked = _occluded(origins, u, boxes)
+    # Footprint = the single central beam (unchanged from the parallel-beam model,
+    # so the junction area is preserved).  The soft-edge cone only sets a per-cell
+    # coverage that *tapers the film thickness* near the shadow edge.
+    central_lit = ~_occluded(origins, -d, boxes)
     if occ_mask is not None:                 # sidewall: prior-metal wall coating shadows
-        blocked = blocked | _occluded_mask(ii, jj, kk, d, occ_mask)
-    lit = ~blocked
+        central_lit &= ~_occluded_mask(ii, jj, kk, d, occ_mask)
+    if soft is None:
+        cov = central_lit.astype(float)                # 1.0 lit, 0.0 shadowed
+    else:
+        # Integrate occlusion over a cone of beam directions spanning the source's
+        # angular size → fractional coverage (penumbra), used for thickness only.
+        dirs = _cone_dirs(d, float(soft))
+        acc = np.zeros(len(ii))
+        for dk in dirs:
+            acc += (~_occluded(origins, -dk, boxes)).astype(float)
+        cov = acc / len(dirs)
+        if occ_mask is not None:
+            cov *= (~_occluded_mask(ii, jj, kk, d, occ_mask)).astype(float)
 
+    keep = central_lit                       # footprint fixed by the central beam
+    gi, gj, gk = ii[keep], jj[keep], kk[keep]
+    covk = cov[keep]
     metal = np.zeros_like(solid)
-    gi, gj, gk = ii[lit], jj[lit], kk[lit]
     metal[gi, gj, gk] = True
 
-    # grow film thickness back toward source
+    # grow film thickness back toward source; the soft edge tapers each column to
+    # round(coverage·n) so the penumbra reads as a rounded metal shoulder.
     n = int(round(t_metal / vox))
+    target = np.maximum(1, np.round(covk * n)).astype(int)
     cur_i, cur_j, cur_k = gi.copy(), gj.copy(), gk.copy()
-    for _ in range(max(n - 1, 0)):
+    for mstep in range(1, max(n, 1)):
         cur_i = cur_i - fwd[0]; cur_j = cur_j - fwd[1]; cur_k = cur_k - fwd[2]
-        m = ((cur_i >= 0) & (cur_i < Nx) & (cur_j >= 0) & (cur_j < Ny) &
-             (cur_k >= 0) & (cur_k < Nz))
-        ci, cj, ck = cur_i[m], cur_j[m], cur_k[m]
+        grow = ((target > mstep) &
+                (cur_i >= 0) & (cur_i < Nx) & (cur_j >= 0) & (cur_j < Ny) &
+                (cur_k >= 0) & (cur_k < Nz))
+        ci, cj, ck = cur_i[grow], cur_j[grow], cur_k[grow]
         free = ~solid[ci, cj, ck]
         metal[ci[free], cj[free], ck[free]] = True
     return metal
@@ -423,17 +469,20 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     # azimuths (φ₁=0, φ₂=90).  All angles are free.
     films = None
     tri_dirs = None
+    # Soft-edge (penumbra) cone half-angle [rad], or None for a single beam.
+    _soft = (np.radians(p.soft_spread_deg)
+             if getattr(p, "soft_edge", False) and p.soft_spread_deg > 0 else None)
     if not trilayer:
         # ── Bilayer: evap1 → oxidation → evap2 ────────────────────
         d1 = beam_direction(p.angle1, p.phi1)
         d2 = beam_direction(p.angle2, p.phi2)
-        al1 = _deposit(lab, xs, ys, zs, vox, d1, p.t_metal1, boxes)
+        al1 = _deposit(lab, xs, ys, zs, vox, d1, p.t_metal1, boxes, soft=_soft)
         # Oxide: thin conformal skin on al1; NOT geometry (does not occlude).
         alox = _oxide_skin(al1)
         lab2 = lab.copy()
         lab2[al1] = RESIST
         al2 = _deposit(lab2, xs, ys, zs, vox, d2, p.t_metal2, boxes,
-                       occ_mask=(al1 if p.sidewall else None))
+                       occ_mask=(al1 if p.sidewall else None), soft=_soft)
         meta_d1, meta_d2 = d1, d2
     else:
         # ── Trilayer: Nb1 → Al2 → oxidation → Al3 → Nb4 ───────────
@@ -444,10 +493,10 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         d3 = beam_direction(p.angle2, p.phi2)        # evap3  Al
         d4 = beam_direction(p.tri_angle4, p.tri_phi4)  # evap4  Nb
 
-        nb1 = _deposit(lab, xs, ys, zs, vox, d1, p.tri_t1, boxes)
+        nb1 = _deposit(lab, xs, ys, zs, vox, d1, p.tri_t1, boxes, soft=_soft)
         lab_b = lab.copy(); lab_b[nb1] = RESIST
         al2f = _deposit(lab_b, xs, ys, zs, vox, d2, p.tri_t2, boxes,
-                        occ_mask=(nb1 if p.sidewall else None))
+                        occ_mask=(nb1 if p.sidewall else None), soft=_soft)
         elec1 = nb1 | al2f                            # bottom electrode
 
         # Oxidation after evap1+evap2: skin on ALL exposed faces of the bottom
@@ -456,10 +505,10 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
 
         lab_c = lab.copy(); lab_c[elec1] = RESIST     # electrode 2 sees elec1 solid
         al3 = _deposit(lab_c, xs, ys, zs, vox, d3, p.tri_t3, boxes,
-                       occ_mask=(elec1 if p.sidewall else None))
+                       occ_mask=(elec1 if p.sidewall else None), soft=_soft)
         lab_d = lab_c.copy(); lab_d[al3] = RESIST
         nb4 = _deposit(lab_d, xs, ys, zs, vox, d4, p.tri_t4, boxes,
-                       occ_mask=((elec1 | al3) if p.sidewall else None))
+                       occ_mask=((elec1 | al3) if p.sidewall else None), soft=_soft)
         elec2 = al3 | nb4                             # top electrode
 
         al1, al2 = elec1, elec2                       # keep al1/al2 = the two electrodes

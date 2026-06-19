@@ -54,6 +54,13 @@ judgments are based on it.
   M-O-M barrier where metal climbs the resist sidewall; the floor / sidewall /
   total areas are then shown separately and the total drives the electrical
   quantities.
+- **Soft-edge (finite-source penumbra) deposition** (opt-in): models the
+  source's finite angular size by integrating occlusion over a cone of beam
+  directions, so the deposited film **thickness tapers near the shadow edge**.
+  Combined with a rounded resist lip this reproduces the **rounded (tapered)
+  metal edge**. The junction footprint/area is set by the central beam (so the
+  area is preserved); a slider sets the source angular half-size. Visible at
+  finer resolution (the film must be several voxels thick); slower (multi-ray).
 - **Side-wall deposition effect** (opt-in): the first evaporation also coats the
   resist sidewall, narrowing the opening seen by later evaporations. The
   narrowing grows with the local incident angle, so it makes the across-wafer
@@ -183,8 +190,12 @@ streamlit run app.py
 
 Your browser opens automatically (if not, open the
 `http://localhost:8501` URL printed in the terminal).
-Adjust parameters in the left sidebar and every tab's figures and computed
-results update in real time.
+Set the parameters in the left sidebar and press **▶ Run simulation** to run the
+3-D engine. Geometry / angle / resolution changes take effect only on the next
+Run (a notice appears when inputs have changed), so dragging a slider never
+re-simulates. Display / measurement controls — critical-current density `Jc`,
+the sidewall-area toggle, the cross-section view angle/zoom, and the wafer-map
+colour/metric — update **live** without re-running the engine.
 
 ---
 
@@ -264,6 +275,7 @@ labels. The wafer centre always reproduces the single-JJ result.
 | `t_mma` | MMA thickness [nm] (Dolan: bottom resist = bridge air-gap height; Manhattan: lower undercut sublayer) |
 | `undercut` | One-sided MMA undercut [nm] |
 | `resist_round` | Resist opening corner fillet radius [nm] (0 = sharp lip/foot) |
+| `soft_edge` / `soft_spread_deg` | Soft-edge (finite-source penumbra) deposition + source angular half-size [°] |
 | θ₁ / φ₁ / d₁ | Polar angle / azimuth / metal thickness of evaporation 1 |
 | θ₂ / φ₂ / d₂ | Polar angle / azimuth / metal thickness of evaporation 2 |
 | `bridge_len` / `bridge_w` | (Dolan) bridge length / width [nm] |

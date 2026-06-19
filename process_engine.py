@@ -54,6 +54,8 @@ class ProcessParams:
     t_mma:    float = 900.0   # MMA  bot layer [nm]  (= bridge underside height / vertical gap)
     undercut: float = 150.0   # MMA one-sided undercut [nm]
     resist_round: float = 0.0 # resist opening corner fillet radius [nm] (0 = sharp)
+    soft_edge: bool = False    # soft-edge (penumbra) deposition from a finite source
+    soft_spread_deg: float = 1.0  # source angular half-size [deg] for the soft edge
 
     # ── Evaporation 1 ─────────────────────────────────────────
     # Uniaxial tilt ±24° (same azimuth φ, opposite polar θ); 30 nm Al each.

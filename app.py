@@ -218,6 +218,7 @@ _TRI_KEYS = {"tri_t1": "tri_t1", "tri_t2": "tri_t2",
 _KEY_RANGE = {
     "t_pmma": (100, 2000), "t_mma": (100, 1500), "undercut": (0, 500),
     "resist_round": (0, 200), "jc_al": (1, 1e6),
+    "soft_spread_deg": (0.1, 10.0),
     "angle1": (-60, 60), "phi1": (-90, 90), "t_metal1": (10, 200),
     "d_angle2": (-60, 60), "d_phi2": (-90, 90), "d_tmetal2": (10, 200),
     "d_bridge_len": (50, 2000), "d_bridge_w": (50, 1000),
@@ -274,6 +275,12 @@ def _apply_loaded_params(pdict, raydict):
             st.session_state["jc_al"] = v; applied += 1
     if pdict.get("jj_walls") is not None:
         st.session_state["jj_walls"] = bool(pdict["jj_walls"]); applied += 1
+    if pdict.get("soft_edge") is not None:
+        st.session_state["soft_edge"] = bool(pdict["soft_edge"]); applied += 1
+    if pdict.get("soft_spread_deg") is not None:
+        v = float(pdict["soft_spread_deg"])
+        if 0.1 <= v <= 10.0:
+            st.session_state["soft_spread_deg"] = v; applied += 1
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -408,6 +415,8 @@ _PARAM_DEFAULTS = {
     "sidewall": False,
     "jc_al": 1000,
     "jj_walls": False,
+    "soft_edge": False,
+    "soft_spread_deg": 1.0,
     "res_level": "Standard (fast)",
 }
 
@@ -486,6 +495,17 @@ st.caption(
 
 # ─── Sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
+    # ── Run gate ──────────────────────────────────────────────────
+    # The single-JJ engine runs only when this is pressed (or on first load),
+    # so dragging a slider does NOT re-simulate.  Display / measurement controls
+    # (Jc, sidewall-area toggle, cross-section view, wafer colour) stay live.
+    run_sim = st.button("▶ Run simulation", type="primary",
+                        use_container_width=True,
+                        help="Run the 3-D engine with the current sidebar "
+                             "settings.  Geometry / angle / resolution changes "
+                             "take effect only when you press this.")
+    _stale_box = st.empty()    # filled below with a 'parameters changed' notice
+
     # ── Save / Load ───────────────────────────────────────────────
     st.header("💾 Save / Load")
     _imp = st.file_uploader("Load parameters (JSON)", type=["json"],
@@ -715,6 +735,23 @@ with st.sidebar:
              "barrier where metal climbs the resist sidewall (full 3-D area, "
              "larger).  When on, the floor-only and sidewall-only areas are "
              "shown separately.")
+    st.session_state.setdefault("soft_edge", False)
+    soft_edge = st.checkbox(
+        "Soft edge (finite-source penumbra)", key="soft_edge",
+        help="Model the source's finite angular size: occlusion is integrated "
+             "over a cone of beam directions, tapering the film thickness near "
+             "the shadow edge.  Combined with a rounded resist lip this gives a "
+             "rounded (tapered) metal edge.  Visible at finer resolution (the "
+             "film must be several voxels thick); slower (multi-ray).")
+    st.session_state.setdefault("soft_spread_deg", 1.0)
+    if soft_edge:
+        soft_spread_deg = float(st.slider(
+            "Source angular half-size [°]", 0.1, 10.0, step=0.1,
+            key="soft_spread_deg",
+            help="Half-angle of the source cone (≈ source size / throw distance). "
+                 "Larger = wider penumbra = more pronounced metal rounding."))
+    else:
+        soft_spread_deg = float(st.session_state["soft_spread_deg"])
 
     st.divider()
     st.subheader("Display")
@@ -760,16 +797,22 @@ params = ProcessParams(
     tri_angle2=tri_angle2, tri_phi2=tri_phi2,
     tri_angle4=tri_angle4, tri_phi4=tri_phi4,
     sidewall=sidewall,
+    soft_edge=soft_edge, soft_spread_deg=soft_spread_deg,
 )
-res = compute_junction_area(params)
-
 # ─── 3D physical deposition engine (source of truth) ──────────────
 @st.cache_data(show_spinner=False)
 def _run_engine(ekey, _params, max_cells, min_vox):
+    """Run the engine and pre-compute every per-simulation quantity ONCE (cached
+    on `ekey`): the voxel result, the grounded-metal mask, and the floor / full
+    junction footprints + combos.  Doing it here (not per Streamlit rerun) keeps
+    display-only changes cheap — the sidewall-area toggle just selects floor/full."""
     r = simulate(_params, max_cells=max_cells, min_vox=min_vox)
-    jm, area, ox, oy, juncs = junction_footprint(r)
-    combos, combo_map = junction_combos(r)
-    return r, jm, area, ox, oy, juncs, combos, combo_map
+    vv._grounded_metal(r)                       # populate r.meta['_grounded'] once
+    full  = junction_footprint(r, include_sidewalls=True)    # (jm,area,ox,oy,juncs)
+    floor = junction_footprint(r, include_sidewalls=False)
+    combos_full  = junction_combos(r, include_sidewalls=True)
+    combos_floor = junction_combos(r, include_sidewalls=False)
+    return r, full, floor, combos_full, combos_floor
 
 def _ekey_for(p):
     """Engine cache-key tuple for a ProcessParams at the current sidebar
@@ -780,7 +823,8 @@ def _ekey_for(p):
             p.manhattan_delta, p.manhattan_h, _max_cells, _min_vox, p.stack,
             p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4, p.tri_angle2, p.tri_phi2,
             p.tri_angle4, p.tri_phi4, getattr(p, "sidewall", False),
-            getattr(p, "resist_round", 0.0))
+            getattr(p, "resist_round", 0.0),
+            getattr(p, "soft_edge", False), getattr(p, "soft_spread_deg", 1.0))
 
 @st.cache_data(show_spinner=False)
 def _mc_area(sig, _p):
@@ -792,25 +836,42 @@ def _mc_area(sig, _p):
     _, a_floor, _, _, _ = junction_footprint(r, include_sidewalls=False)
     return float(a_floor), float(a_full)
 
+# ── Run gate ──────────────────────────────────────────────────────
+# Commit the simulation inputs only when ▶ Run is pressed (or on first load).
+# Until then the engine re-uses the last committed params, so dragging a slider
+# never re-simulates.  Jc / sidewall-area / view controls are NOT part of the
+# commit, so they keep updating live (no re-sim needed).
+_live_sig = _ekey_for(params)
+_committed = st.session_state.get("_committed")
+if run_sim or _committed is None:
+    _committed = {"params": params, "max_cells": _max_cells, "min_vox": _min_vox,
+                  "sig": _live_sig}
+    st.session_state["_committed"] = _committed
+params = _committed["params"]
+_max_cells = _committed["max_cells"]; _min_vox = _committed["min_vox"]
+if _live_sig != _committed["sig"]:
+    _stale_box.warning("⚠ Inputs changed — press **▶ Run simulation** to update.")
+
+res = compute_junction_area(params)
 ekey = _ekey_for(params)
 with st.spinner("Running 3D shadow-evaporation engine..."):
-    (eng, _jm_c, _area_c, _ox_c, _oy_c, _juncs_c,
-     _combos_c, _combo_map_c) = _run_engine(
+    eng, _full, _floor, _combos_full, _combos_floor = _run_engine(
         ekey, params, _max_cells, _min_vox)
-# Measure both conventions on the cached voxel result (cheap O(N) numpy) so the
-# sidewall toggle never re-runs simulate.  Active = full when jj_walls else floor.
-eng_jm_full,  eng_area_full,  _oxf, _oyf, eng_juncs_full = junction_footprint(
-    eng, include_sidewalls=True)
-eng_jm_floor, eng_area_floor, _ox0, _oy0, eng_juncs_floor = junction_footprint(
-    eng, include_sidewalls=False)
+# Floor / full junction footprints were measured once inside _run_engine; the
+# sidewall-area toggle (live) just selects which to show — no re-measure here.
+eng_jm_full,  eng_area_full,  _oxf, _oyf, eng_juncs_full = _full
+eng_jm_floor, eng_area_floor, _ox0, _oy0, eng_juncs_floor = _floor
 eng_area_walls = max(eng_area_full - eng_area_floor, 0.0)
-eng_area = eng_area_full if jj_walls else eng_area_floor
-eng_jm, eng_ox, eng_oy, eng_juncs = (
-    (eng_jm_full,  _oxf, _oyf, eng_juncs_full) if jj_walls else
-    (eng_jm_floor, _ox0, _oy0, eng_juncs_floor))
-eng_combos, eng_combo_map = junction_combos(eng, include_sidewalls=jj_walls)
+if jj_walls:
+    eng_jm, eng_area, eng_ox, eng_oy, eng_juncs = (
+        eng_jm_full, eng_area_full, _oxf, _oyf, eng_juncs_full)
+    eng_combos, eng_combo_map = _combos_full
+else:
+    eng_jm, eng_area, eng_ox, eng_oy, eng_juncs = (
+        eng_jm_floor, eng_area_floor, _ox0, _oy0, eng_juncs_floor)
+    eng_combos, eng_combo_map = _combos_floor
 eng_njunc = len(eng_juncs)
-# Engine-based critical current via Ambegaokar-Baratoff.
+# Engine-based critical current via Ambegaokar-Baratoff (Jc is live, no re-sim).
 # Ic[µA] = area_nm2 × jc_al[A/cm²] × 1e-8  (= area × 1e-14 cm²/nm² × 1e6 µA/A × jc)
 eng_ic = eng_area * ic_factor
 # Josephson inductance L_J and energy E_J derived from that critical current.
@@ -1224,7 +1285,8 @@ with tab_scan:
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h, _smc, _smv,
                 p.stack, p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4,
                 p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4,
-                getattr(p, "sidewall", False), getattr(p, "resist_round", 0.0))
+                getattr(p, "sidewall", False), getattr(p, "resist_round", 0.0),
+                getattr(p, "soft_edge", False), getattr(p, "soft_spread_deg", 1.0))
 
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
@@ -1502,7 +1564,8 @@ with tab_wafer:
                 p.t_mma, p.t_pmma, p.manhattan_wx, p.manhattan_wy,
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h,
                 _wsmc, _wsmv, getattr(p, "sidewall", False),
-                getattr(p, "resist_round", 0.0))
+                getattr(p, "resist_round", 0.0),
+                getattr(p, "soft_edge", False), getattr(p, "soft_spread_deg", 1.0))
 
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):
