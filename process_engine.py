@@ -55,7 +55,9 @@ class ProcessParams:
     undercut: float = 150.0   # MMA one-sided undercut [nm]
     resist_round: float = 0.0 # resist opening corner fillet radius [nm] (0 = sharp)
     soft_edge: bool = False    # soft-edge (penumbra) deposition from a finite source
-    soft_spread_deg: float = 1.0  # source angular half-size [deg] for the soft edge
+    soft_pattern: str = "rotline"  # e-beam raster pattern (sample_beam_cloud key)
+    soft_size:   float = 12.0   # source spot size on the target [mm] (recipe ~10–15)
+    soft_L:      float = 550.0  # source→sample throw distance [mm] (Plassys ~550)
 
     # ── Evaporation 1 ─────────────────────────────────────────
     # Uniaxial tilt ±24° (same azimuth φ, opposite polar θ); 30 nm Al each.

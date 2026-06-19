@@ -218,7 +218,7 @@ _TRI_KEYS = {"tri_t1": "tri_t1", "tri_t2": "tri_t2",
 _KEY_RANGE = {
     "t_pmma": (100, 2000), "t_mma": (100, 1500), "undercut": (0, 500),
     "resist_round": (0, 200), "jc_al": (1, 1e6),
-    "soft_spread_deg": (0.1, 10.0),
+    "soft_L": (20.0, 2000.0),
     "angle1": (-60, 60), "phi1": (-90, 90), "t_metal1": (10, 200),
     "d_angle2": (-60, 60), "d_phi2": (-90, 90), "d_tmetal2": (10, 200),
     "d_bridge_len": (50, 2000), "d_bridge_w": (50, 1000),
@@ -277,10 +277,19 @@ def _apply_loaded_params(pdict, raydict):
         st.session_state["jj_walls"] = bool(pdict["jj_walls"]); applied += 1
     if pdict.get("soft_edge") is not None:
         st.session_state["soft_edge"] = bool(pdict["soft_edge"]); applied += 1
-    if pdict.get("soft_spread_deg") is not None:
-        v = float(pdict["soft_spread_deg"])
-        if 0.1 <= v <= 10.0:
-            st.session_state["soft_spread_deg"] = v; applied += 1
+    if pdict.get("soft_pattern") is not None:        # stored as the key (e.g. 'rotline')
+        _key2lbl = {v: k for k, v in BEAM_PATTERNS.items()}
+        _lbl = _key2lbl.get(pdict["soft_pattern"])
+        if _lbl is not None:
+            st.session_state["soft_pattern"] = _lbl; applied += 1
+    if pdict.get("soft_size") is not None:           # fills both size widgets
+        v = float(pdict["soft_size"])
+        st.session_state["soft_size"] = v
+        st.session_state["soft_sigma"] = v; applied += 1
+    if pdict.get("soft_L") is not None:
+        v = float(pdict["soft_L"])
+        if 20.0 <= v <= 2000.0:
+            st.session_state["soft_L"] = v; applied += 1
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -416,7 +425,8 @@ _PARAM_DEFAULTS = {
     "jc_al": 1000,
     "jj_walls": False,
     "soft_edge": False,
-    "soft_spread_deg": 1.0,
+    "soft_pattern": "Rotating line (disk, 1/ρ)",   # _beam_pattern_controls selectbox label
+    "soft_size": 12.0, "soft_sigma": 2.0, "soft_L": 550.0,
     "res_level": "Standard (fast)",
 }
 
@@ -738,20 +748,21 @@ with st.sidebar:
     st.session_state.setdefault("soft_edge", False)
     soft_edge = st.checkbox(
         "Soft edge (finite-source penumbra)", key="soft_edge",
-        help="Model the source's finite angular size: occlusion is integrated "
-             "over a cone of beam directions, tapering the film thickness near "
-             "the shadow edge.  Combined with a rounded resist lip this gives a "
-             "rounded (tapered) metal edge.  Visible at finer resolution (the "
-             "film must be several voxels thick); slower (multi-ray).")
-    st.session_state.setdefault("soft_spread_deg", 1.0)
+        help="Model the real Plassys source: occlusion is integrated over the "
+             "e-beam raster pattern at the throw distance, tapering the film "
+             "thickness near the shadow edge (penumbra ≈ source size / L).  "
+             "Combined with a rounded resist lip this gives a rounded metal edge.  "
+             "Visible at finer resolution (film several voxels thick); slower.")
+    soft_pat, soft_size, soft_L = "rotline", 12.0, 550.0
     if soft_edge:
-        soft_spread_deg = float(st.slider(
-            "Source angular half-size [°]", 0.1, 10.0, step=0.1,
-            key="soft_spread_deg",
-            help="Half-angle of the source cone (≈ source size / throw distance). "
-                 "Larger = wider penumbra = more pronounced metal rounding."))
-    else:
-        soft_spread_deg = float(st.session_state["soft_spread_deg"])
+        soft_pat, soft_size = _beam_pattern_controls("soft")
+        st.session_state.setdefault("soft_L", 550.0)
+        soft_L = float(st.number_input(
+            "Throw distance L [mm]", 20.0, 2000.0, step=10.0, key="soft_L",
+            help="Source→sample distance (Plassys ≈ 550 mm).  Penumbra ≈ size/L."))
+        _half = np.degrees(np.arctan((soft_size / 2.0) / max(soft_L, 1e-9)))
+        st.caption(f"Source: {soft_pat} • {soft_size:.1f} mm at {soft_L:.0f} mm "
+                   f"⇒ angular half-size ≈ {_half:.2f}°.")
 
     st.divider()
     st.subheader("Display")
@@ -797,7 +808,7 @@ params = ProcessParams(
     tri_angle2=tri_angle2, tri_phi2=tri_phi2,
     tri_angle4=tri_angle4, tri_phi4=tri_phi4,
     sidewall=sidewall,
-    soft_edge=soft_edge, soft_spread_deg=soft_spread_deg,
+    soft_edge=soft_edge, soft_pattern=soft_pat, soft_size=soft_size, soft_L=soft_L,
 )
 # ─── 3D physical deposition engine (source of truth) ──────────────
 @st.cache_data(show_spinner=False)
@@ -824,7 +835,8 @@ def _ekey_for(p):
             p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4, p.tri_angle2, p.tri_phi2,
             p.tri_angle4, p.tri_phi4, getattr(p, "sidewall", False),
             getattr(p, "resist_round", 0.0),
-            getattr(p, "soft_edge", False), getattr(p, "soft_spread_deg", 1.0))
+            getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
+            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0))
 
 @st.cache_data(show_spinner=False)
 def _mc_area(sig, _p):
@@ -1286,7 +1298,8 @@ with tab_scan:
                 p.stack, p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4,
                 p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4,
                 getattr(p, "sidewall", False), getattr(p, "resist_round", 0.0),
-                getattr(p, "soft_edge", False), getattr(p, "soft_spread_deg", 1.0))
+                getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
+            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0))
 
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
@@ -1565,7 +1578,8 @@ with tab_wafer:
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h,
                 _wsmc, _wsmv, getattr(p, "sidewall", False),
                 getattr(p, "resist_round", 0.0),
-                getattr(p, "soft_edge", False), getattr(p, "soft_spread_deg", 1.0))
+                getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
+            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0))
 
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):

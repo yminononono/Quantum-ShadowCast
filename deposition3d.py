@@ -22,7 +22,7 @@ slab ray–AABB test in NumPy — no rtree/embree needed.
 from dataclasses import dataclass
 import numpy as np
 
-from process_engine import ProcessParams
+from process_engine import ProcessParams, wafer_local_angles, sample_beam_cloud
 
 
 # ── voxel labels ────────────────────────────────────────────────
@@ -302,24 +302,19 @@ def _label_solid(xs, ys, zs, boxes):
     return lab
 
 
-def _cone_dirs(d, alpha_rad, az1=6, az2=8):
-    """Beam directions sampling a cone of half-angle ``alpha_rad`` about ``d``
-    (the finite source's angular size): the axis plus two rings (1+az1+az2).
-    Used for the soft-edge / penumbra deposition."""
-    d = np.asarray(d, float)
-    d = d / (np.linalg.norm(d) + 1e-12)
-    ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
-    e1 = np.cross(d, ref); e1 /= (np.linalg.norm(e1) + 1e-12)
-    e2 = np.cross(d, e1)
-    dirs = [d]
-    for beta, naz in ((0.5 * alpha_rad, az1), (alpha_rad, az2)):
-        if beta <= 0:
-            continue
-        for a in range(naz):
-            g = 2.0 * np.pi * a / naz
-            v = (np.cos(beta) * d
-                 + np.sin(beta) * (np.cos(g) * e1 + np.sin(g) * e2))
-            dirs.append(v / (np.linalg.norm(v) + 1e-12))
+def _plassys_dirs(theta, phi, pattern, size, L, K=24, seed=0):
+    """Beam-direction cloud for the soft edge from the **real Plassys source**: the
+    e-beam raster ``pattern`` of spot ``size`` [mm] on the target at throw distance
+    ``L`` [mm].  Each target-plane offset (dx, dy) is mapped to the local incident
+    direction by the exact displaced-source geometry (``wafer_local_angles`` with
+    ``S0``), identical to the finite-source Monte-Carlo.  Returns ``K`` unit beam
+    vectors (all == nominal for a point source / size 0 ⇒ no taper)."""
+    offs = sample_beam_cloud(pattern, size, K, np.random.default_rng(seed))
+    dirs = []
+    for dx, dy in offs:
+        lth, lph = wafer_local_angles(theta, phi, 0.0, 0.0, L,
+                                      S0=np.array([dx, dy, 0.0]))
+        dirs.append(beam_direction(float(lth), float(lph)))
     return dirs
 
 
@@ -335,12 +330,12 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None):
     through it — this is the sidewall effect (prior wall coating narrows the
     opening).  ``None`` ⇒ resist-only shadowing (unchanged behaviour).
 
-    ``soft`` (optional float = cone half-angle [rad]) turns on the **soft-edge
-    (penumbra)** model: occlusion is integrated over a cone of beam directions
-    spanning the finite source's angular size, giving a fractional coverage per
-    surface cell, and the grown film thickness is tapered to ``round(coverage·n)``
-    — so a rounded resist lip yields a rounded (tapered) metal shoulder.
-    ``None`` ⇒ a single parallel beam (binary, unchanged behaviour).
+    ``soft`` (optional list of unit beam directions = the finite source's angular
+    cloud, e.g. from :func:`_plassys_dirs`) turns on the **soft-edge (penumbra)**
+    model: occlusion is integrated over those directions, giving a fractional
+    coverage per surface cell, and the grown film thickness is tapered to
+    ``round(coverage·n)`` — so the penumbra (and any rounded resist lip) yields a
+    tapered metal shoulder.  ``None`` ⇒ a single parallel beam (binary, unchanged).
     """
     Nx, Ny, Nz = lab.shape
     solid = lab != EMPTY
@@ -390,13 +385,12 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None):
     if soft is None:
         cov = central_lit.astype(float)                # 1.0 lit, 0.0 shadowed
     else:
-        # Integrate occlusion over a cone of beam directions spanning the source's
-        # angular size → fractional coverage (penumbra), used for thickness only.
-        dirs = _cone_dirs(d, float(soft))
+        # Integrate occlusion over the source's angular cloud (the e-beam pattern
+        # at the throw distance) → fractional coverage (penumbra), thickness only.
         acc = np.zeros(len(ii))
-        for dk in dirs:
+        for dk in soft:
             acc += (~_occluded(origins, -dk, boxes)).astype(float)
-        cov = acc / len(dirs)
+        cov = acc / len(soft)
         if occ_mask is not None:
             cov *= (~_occluded_mask(ii, jj, kk, d, occ_mask)).astype(float)
 
@@ -469,20 +463,29 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     # azimuths (φ₁=0, φ₂=90).  All angles are free.
     films = None
     tri_dirs = None
-    # Soft-edge (penumbra) cone half-angle [rad], or None for a single beam.
-    _soft = (np.radians(p.soft_spread_deg)
-             if getattr(p, "soft_edge", False) and p.soft_spread_deg > 0 else None)
+    # Soft-edge (penumbra): per-evaporation beam-direction cloud from the real
+    # Plassys source (e-beam pattern at the throw distance), or None for a single
+    # beam.  Built per evap from its own nominal (θ, φ).
+    _soft_on = getattr(p, "soft_edge", False) and p.soft_size > 0 and p.soft_L > 0
+
+    def _soft_cloud(theta, phi):
+        if not _soft_on:
+            return None
+        return _plassys_dirs(theta, phi, p.soft_pattern, p.soft_size, p.soft_L)
+
     if not trilayer:
         # ── Bilayer: evap1 → oxidation → evap2 ────────────────────
         d1 = beam_direction(p.angle1, p.phi1)
         d2 = beam_direction(p.angle2, p.phi2)
-        al1 = _deposit(lab, xs, ys, zs, vox, d1, p.t_metal1, boxes, soft=_soft)
+        al1 = _deposit(lab, xs, ys, zs, vox, d1, p.t_metal1, boxes,
+                       soft=_soft_cloud(p.angle1, p.phi1))
         # Oxide: thin conformal skin on al1; NOT geometry (does not occlude).
         alox = _oxide_skin(al1)
         lab2 = lab.copy()
         lab2[al1] = RESIST
         al2 = _deposit(lab2, xs, ys, zs, vox, d2, p.t_metal2, boxes,
-                       occ_mask=(al1 if p.sidewall else None), soft=_soft)
+                       occ_mask=(al1 if p.sidewall else None),
+                       soft=_soft_cloud(p.angle2, p.phi2))
         meta_d1, meta_d2 = d1, d2
     else:
         # ── Trilayer: Nb1 → Al2 → oxidation → Al3 → Nb4 ───────────
@@ -493,10 +496,12 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         d3 = beam_direction(p.angle2, p.phi2)        # evap3  Al
         d4 = beam_direction(p.tri_angle4, p.tri_phi4)  # evap4  Nb
 
-        nb1 = _deposit(lab, xs, ys, zs, vox, d1, p.tri_t1, boxes, soft=_soft)
+        nb1 = _deposit(lab, xs, ys, zs, vox, d1, p.tri_t1, boxes,
+                       soft=_soft_cloud(p.angle1, p.phi1))
         lab_b = lab.copy(); lab_b[nb1] = RESIST
         al2f = _deposit(lab_b, xs, ys, zs, vox, d2, p.tri_t2, boxes,
-                        occ_mask=(nb1 if p.sidewall else None), soft=_soft)
+                        occ_mask=(nb1 if p.sidewall else None),
+                        soft=_soft_cloud(p.tri_angle2, p.tri_phi2))
         elec1 = nb1 | al2f                            # bottom electrode
 
         # Oxidation after evap1+evap2: skin on ALL exposed faces of the bottom
@@ -505,10 +510,12 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
 
         lab_c = lab.copy(); lab_c[elec1] = RESIST     # electrode 2 sees elec1 solid
         al3 = _deposit(lab_c, xs, ys, zs, vox, d3, p.tri_t3, boxes,
-                       occ_mask=(elec1 if p.sidewall else None), soft=_soft)
+                       occ_mask=(elec1 if p.sidewall else None),
+                       soft=_soft_cloud(p.angle2, p.phi2))
         lab_d = lab_c.copy(); lab_d[al3] = RESIST
         nb4 = _deposit(lab_d, xs, ys, zs, vox, d4, p.tri_t4, boxes,
-                       occ_mask=((elec1 | al3) if p.sidewall else None), soft=_soft)
+                       occ_mask=((elec1 | al3) if p.sidewall else None),
+                       soft=_soft_cloud(p.tri_angle4, p.tri_phi4))
         elec2 = al3 | nb4                             # top electrode
 
         al1, al2 = elec1, elec2                       # keep al1/al2 = the two electrodes

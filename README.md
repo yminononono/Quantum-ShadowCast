@@ -54,13 +54,15 @@ judgments are based on it.
   M-O-M barrier where metal climbs the resist sidewall; the floor / sidewall /
   total areas are then shown separately and the total drives the electrical
   quantities.
-- **Soft-edge (finite-source penumbra) deposition** (opt-in): models the
-  source's finite angular size by integrating occlusion over a cone of beam
-  directions, so the deposited film **thickness tapers near the shadow edge**.
-  Combined with a rounded resist lip this reproduces the **rounded (tapered)
-  metal edge**. The junction footprint/area is set by the central beam (so the
-  area is preserved); a slider sets the source angular half-size. Visible at
-  finer resolution (the film must be several voxels thick); slower (multi-ray).
+- **Soft-edge (finite-source penumbra) deposition** (opt-in): models the **real
+  Plassys source** — its **e-beam raster pattern** (rotating line / uniform disk /
+  Gaussian, spot ≈10–15 mm) at the **throw distance** (≈550 mm) — by integrating
+  occlusion over the resulting beam-direction cloud (the same exact geometry the
+  finite-source Monte-Carlo uses). The deposited film **thickness tapers near the
+  shadow edge** (penumbra ≈ source size / L), reproducing the **rounded (tapered)
+  metal edge**, especially with a rounded resist lip. The junction footprint/area
+  is set by the central beam (so the area is preserved). Visible at finer
+  resolution (the film must be several voxels thick); slower (multi-ray).
 - **Side-wall deposition effect** (opt-in): the first evaporation also coats the
   resist sidewall, narrowing the opening seen by later evaporations. The
   narrowing grows with the local incident angle, so it makes the across-wafer
@@ -275,7 +277,8 @@ labels. The wafer centre always reproduces the single-JJ result.
 | `t_mma` | MMA thickness [nm] (Dolan: bottom resist = bridge air-gap height; Manhattan: lower undercut sublayer) |
 | `undercut` | One-sided MMA undercut [nm] |
 | `resist_round` | Resist opening corner fillet radius [nm] (0 = sharp lip/foot) |
-| `soft_edge` / `soft_spread_deg` | Soft-edge (finite-source penumbra) deposition + source angular half-size [°] |
+| `soft_edge` | Soft-edge (finite-source penumbra) deposition on/off |
+| `soft_pattern` / `soft_size` / `soft_L` | Plassys source: e-beam pattern · spot size [mm] · throw distance [mm] (penumbra ≈ size/L) |
 | θ₁ / φ₁ / d₁ | Polar angle / azimuth / metal thickness of evaporation 1 |
 | θ₂ / φ₂ / d₂ | Polar angle / azimuth / metal thickness of evaporation 2 |
 | `bridge_len` / `bridge_w` | (Dolan) bridge length / width [nm] |
