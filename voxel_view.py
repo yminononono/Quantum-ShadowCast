@@ -530,6 +530,72 @@ def render_deposition_frame(r: DepositionResult, step_value, show_oxide=True,
     return fig
 
 
+def render_coverage_profile(r: DepositionResult, metal: np.ndarray, n_nominal: int,
+                            angle_deg=0.0, offset=0.0, view_half=None,
+                            view_center=0.0, label=""):
+    """Soft-edge diagnostic: floor coverage fraction along a slice.
+
+    ``metal`` is one evaporation's bool grid (``r.al1`` / ``r.al2`` /
+    ``r.films[...]``); ``n_nominal`` is that evaporation's nominal thickness in
+    voxels (``round(t_metal / r.vox)``).  The engine computes a continuous
+    per-cell coverage fraction internally (the fraction of the finite-source
+    beam cloud that clears the resist) and quantises it to
+    ``round(coverage·n_nominal)`` floor-metal voxel layers — it never stores
+    the fraction itself.  This reconstructs it: the floor thickness at each
+    lateral position (the run of metal cells starting at z-index 1, the first
+    cell above the substrate-interface cell) divided by ``n_nominal``
+    approximates the original coverage fraction.  Columns whose thickness
+    lands strictly between 0 and ``n_nominal`` are exactly the ones the
+    engine ray-tested against the source cloud (the "band"); flat columns at
+    1.0 or 0.0 were never ray-tested (interior / deep shadow shortcut).
+
+    Returns ``(fig, band_widths)`` where ``band_widths`` [nm] lists the width
+    of each contiguous band run visible in the plotted window.
+    """
+    ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
+    Nz = metal.shape[2]
+    if Nz >= 2:
+        col = metal[ix, iy, 1:]                       # floor cells only
+        first_gap = np.argmax(~col, axis=1)
+        th = np.where(col.all(axis=1), col.shape[1], first_gap)
+    else:
+        th = np.zeros(len(s), dtype=int)
+    th = np.where(inside, th, 0)
+    n = max(1, int(n_nominal))
+    cov = np.clip(th / n, 0.0, 1.0)
+    in_band = (th > 0) & (th < n)
+
+    half = _zoom_half(r, view_half)
+    hlo, hhi = view_center - half, view_center + half
+    win = (s >= hlo) & (s <= hhi)
+
+    band_idx = np.where(in_band & win)[0]
+    runs = []
+    if len(band_idx):
+        breaks = np.where(np.diff(band_idx) > 1)[0]
+        runs = np.split(band_idx, breaks + 1)
+    band_widths = [float(s[run[-1]] - s[run[0]] + r.vox) for run in runs]
+
+    fig, ax = plt.subplots(figsize=(7.6, 3.2), dpi=140)
+    for run in runs:
+        ax.axvspan(s[run[0]] - r.vox / 2, s[run[-1]] + r.vox / 2,
+                  color=_COLORS[C_AL2], alpha=0.20, lw=0, zorder=0)
+    ax.plot(s[win], cov[win], drawstyle="steps-mid", color=_COLORS[C_AL1], lw=1.6)
+    ax.axhline(1.0, color="#5a5f6b", lw=0.7, ls="--", zorder=1)
+    ax.axhline(0.0, color="#5a5f6b", lw=0.7, ls="--", zorder=1)
+    ax.set_xlim(hlo, hhi)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel(f"distance along slice  [nm]   (α = {angle_deg:.0f}°)")
+    ax.set_ylabel("floor coverage fraction")
+    ax.set_title("Soft-edge coverage profile" + (f" — {label}" if label else ""))
+    txt = ("band width: " + ", ".join(f"{w:.0f} nm" for w in band_widths)
+          if band_widths else "band width: none in view")
+    ax.text(0.015, 0.94, txt, transform=ax.transAxes, fontsize=8.5, color="#c8c8c8",
+           va="top", bbox=dict(boxstyle="round,pad=0.3", fc="#1c2030", ec="#3a3f4b"))
+    fig.tight_layout()
+    return fig, band_widths
+
+
 def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None,
                   view_half=None, zmax=None, view_center=0.0, zmin=None):
     """Staged cross section sliced at in-plane azimuth ``angle_deg`` with

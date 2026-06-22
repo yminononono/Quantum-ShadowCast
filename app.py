@@ -1261,6 +1261,53 @@ with tab_play:
             except Exception as e:
                 st.warning(f"GIF build needs Pillow: {e}")
 
+    if getattr(params, "soft_edge", False):
+        st.divider()
+        st.subheader("🔬 Soft-edge coverage check")
+        st.markdown(
+            "Diagnostic for the finite-source penumbra model: the engine computes a "
+            "continuous per-cell **coverage fraction** from the source-angle cloud, "
+            "then quantises it to an integer voxel-layer count — this reconstructs that "
+            "fraction from the deposited floor thickness and shows it as a step plot. "
+            "Shaded spans mark the **band** (the cells actually ray-tested against the "
+            "source cloud); flat 0/1 regions were never ray-tested. Uses the "
+            "**Cross-section** tab's slice angle and view window.")
+        if getattr(eng, "stack", "Bilayer") == "Trilayer":
+            _cov_choices = [
+                ("Evap 1 — Nb", eng.films["nb1"], params.tri_t1),
+                ("Evap 2 — Al", eng.films["al2"], params.tri_t2),
+                ("Evap 3 — Al", eng.films["al3"], params.tri_t3),
+                ("Evap 4 — Nb", eng.films["nb4"], params.tri_t4),
+            ]
+        else:
+            _cov_choices = [
+                ("Evap 1", eng.al1, params.t_metal1),
+                ("Evap 2", eng.al2, params.t_metal2),
+            ]
+        _cov_lbl = st.selectbox("Evaporation", [c[0] for c in _cov_choices],
+                                key="cov_evap",
+                                help="Which evaporation's floor deposit to inspect.")
+        _cov_metal, _cov_tnom = next((m, t) for lbl, m, t in _cov_choices
+                                     if lbl == _cov_lbl)
+        _cov_n = max(1, round(_cov_tnom / eng.vox))
+        with st.spinner("Rendering coverage profile..."):
+            figc, _band_widths = vv.render_coverage_profile(
+                eng, _cov_metal, _cov_n, angle_deg=slice_angle, offset=slice_pos,
+                view_half=cs_half, view_center=cs_xc, label=_cov_lbl)
+            st.pyplot(figc, use_container_width=True)
+            plt.close(figc)
+        _half = np.degrees(np.arctan(
+            (params.soft_size / 2.0) / max(params.soft_L, 1e-9)))
+        _analytic_w = np.tan(np.radians(_half)) * eng.z_top
+        _measured = (", ".join(f"{w:.0f}" for w in _band_widths)
+                    if _band_widths else "—")
+        st.caption(
+            f"Analytic penumbra-width estimate (source half-angle × resist height) "
+            f"≈ {_analytic_w:.0f} nm  •  measured band width(s) in view: "
+            f"{_measured} nm  •  voxel = {eng.vox:.1f} nm  "
+            f"(need several voxels across the band to resolve the taper — widen the "
+            f"source size or raise the grid density if it looks like a single step).")
+
 # ═══ TAB 3: φ Junction View ══════════════════════════════════════
 with tab3:
     st.subheader("Junction Map (engine) + φ azimuth view")
