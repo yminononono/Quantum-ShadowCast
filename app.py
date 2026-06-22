@@ -40,6 +40,8 @@ RES_LEVELS = {
     "Ultra-fine (slow)":   (260, 3.0),
     "Extra-fine (slower)": (340, 2.5),
     "Maximum (slowest)":   (420, 2.0),
+    "Ultra-max (heavy)":   (520, 1.5),
+    "Extreme (very heavy)": (640, 1.0),
 }
 
 # ─── Wafer sizes (SEMI primary-flat specs):  label → (radius_mm, flat_chord_mm) ──
@@ -718,6 +720,9 @@ with st.sidebar:
              "(smaller voxels) for sharper metal / junction edges, at the cost "
              "of speed and memory.")
     _max_cells, _min_vox = RES_LEVELS[res_level]
+    if _max_cells >= 520:
+        st.caption("⚠ Very fine grid — high memory & run time (cells grow ≈ as "
+                   "max_cells³).")
 
     st.divider()
     st.subheader("⚙ Process options")
