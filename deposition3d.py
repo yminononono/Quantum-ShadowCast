@@ -272,6 +272,8 @@ class DepositionResult:
     meta: dict
     stack: str = "Bilayer"    # "Bilayer" | "Trilayer"
     films: dict = None        # trilayer sub-films: {"nb1","al2","al3","nb4"} → bool grid
+    depo_order: np.ndarray = None   # int16 (Nx,Ny,Nz): global deposition step / −1
+    depo_frames: list = None        # playback timeline: [{step,label,show_oxide,liftoff}]
 
     def idx_x(self, x):  return int(np.clip(np.searchsorted(self.xs, x), 0, len(self.xs) - 1))
     def idx_y(self, y):  return int(np.clip(np.searchsorted(self.ys, y), 0, len(self.ys) - 1))
@@ -318,7 +320,8 @@ def _plassys_dirs(theta, phi, pattern, size, L, K=24, seed=0):
     return dirs
 
 
-def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None):
+def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
+             record=False):
     """Return bool grid of metal voxels for one evaporation.
 
     A cell receives metal if it is EMPTY, its beam-forward neighbour is solid
@@ -373,7 +376,10 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None):
     surface = (~solid) & nbr
     ii, jj, kk = np.where(surface)
     if len(ii) == 0:
-        return np.zeros_like(solid)
+        m0 = np.zeros_like(solid)
+        if record:
+            return m0, np.full(solid.shape, -1, np.int16)
+        return m0
 
     origins = np.stack([xs[ii], ys[jj], zs[kk]], axis=1)
     # Footprint = the single central beam (unchanged from the parallel-beam model,
@@ -399,6 +405,9 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None):
     covk = cov[keep]
     metal = np.zeros_like(solid)
     metal[gi, gj, gk] = True
+    order = np.full(solid.shape, -1, np.int16) if record else None
+    if record:
+        order[gi, gj, gk] = 0                # surface-contact layer = step 0
 
     # grow film thickness back toward source; the soft edge tapers each column to
     # round(coverage·n) so the penumbra reads as a rounded metal shoulder.
@@ -413,16 +422,23 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None):
         ci, cj, ck = cur_i[grow], cur_j[grow], cur_k[grow]
         free = ~solid[ci, cj, ck]
         metal[ci[free], cj[free], ck[free]] = True
-    return metal
+        if record:
+            order[ci[free], cj[free], ck[free]] = mstep
+    return (metal, order) if record else metal
 
 
 def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
-             min_vox: float = 6.0) -> DepositionResult:
+             min_vox: float = 6.0, record: bool = False) -> DepositionResult:
     """Run the shadow-evaporation engine.
 
     ``max_cells`` / ``min_vox`` set the ray-scan resolution: a larger
     ``max_cells`` (and smaller ``min_vox`` floor) traces the beam into a finer
     voxel grid — more accurate metal/junction edges at the cost of speed/memory.
+
+    ``record`` (opt-in) additionally captures a per-voxel **deposition timeline**
+    (``depo_order`` + ``depo_frames``) for the step-through playback — each film's
+    growth layer is tagged with a global step, so a frame at step k shows the metal
+    deposited so far.  Off by default (no extra cost on the wafer/scan/MC paths).
     """
     boxes, R, z_top, resist_h, z_split = build_occluders(p)
     trilayer = getattr(p, "stack", "Bilayer") == "Trilayer"
@@ -473,20 +489,34 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
             return None
         return _plassys_dirs(theta, phi, p.soft_pattern, p.soft_size, p.soft_L)
 
+    # Playback recording: each evaporation appends (order_grid, label, thickness_nm)
+    # in deposition order; `_ox_after` = index of the evap after which oxidation
+    # happens (oxide appears in frames past it).
+    _rec = []
+
+    def _dep(lab_, d_, t_, occ_, soft_, label):
+        if record:
+            m, o = _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
+                            occ_mask=occ_, soft=soft_, record=True)
+            _rec.append((o, label, float(t_)))
+            return m
+        return _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
+                        occ_mask=occ_, soft=soft_)
+
     if not trilayer:
         # ── Bilayer: evap1 → oxidation → evap2 ────────────────────
         d1 = beam_direction(p.angle1, p.phi1)
         d2 = beam_direction(p.angle2, p.phi2)
-        al1 = _deposit(lab, xs, ys, zs, vox, d1, p.t_metal1, boxes,
-                       soft=_soft_cloud(p.angle1, p.phi1))
+        al1 = _dep(lab, d1, p.t_metal1, None, _soft_cloud(p.angle1, p.phi1),
+                   "Evap 1")
         # Oxide: thin conformal skin on al1; NOT geometry (does not occlude).
         alox = _oxide_skin(al1)
         lab2 = lab.copy()
         lab2[al1] = RESIST
-        al2 = _deposit(lab2, xs, ys, zs, vox, d2, p.t_metal2, boxes,
-                       occ_mask=(al1 if p.sidewall else None),
-                       soft=_soft_cloud(p.angle2, p.phi2))
+        al2 = _dep(lab2, d2, p.t_metal2, (al1 if p.sidewall else None),
+                   _soft_cloud(p.angle2, p.phi2), "Evap 2")
         meta_d1, meta_d2 = d1, d2
+        _ox_after = 0                                  # oxidation after evap 1
     else:
         # ── Trilayer: Nb1 → Al2 → oxidation → Al3 → Nb4 ───────────
         # Electrode 1 (bottom) = Nb(evap1) + Al(evap2) at the Evap-1 angle;
@@ -496,12 +526,11 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         d3 = beam_direction(p.angle2, p.phi2)        # evap3  Al
         d4 = beam_direction(p.tri_angle4, p.tri_phi4)  # evap4  Nb
 
-        nb1 = _deposit(lab, xs, ys, zs, vox, d1, p.tri_t1, boxes,
-                       soft=_soft_cloud(p.angle1, p.phi1))
+        nb1 = _dep(lab, d1, p.tri_t1, None, _soft_cloud(p.angle1, p.phi1),
+                   "Evap 1 — Nb")
         lab_b = lab.copy(); lab_b[nb1] = RESIST
-        al2f = _deposit(lab_b, xs, ys, zs, vox, d2, p.tri_t2, boxes,
-                        occ_mask=(nb1 if p.sidewall else None),
-                        soft=_soft_cloud(p.tri_angle2, p.tri_phi2))
+        al2f = _dep(lab_b, d2, p.tri_t2, (nb1 if p.sidewall else None),
+                    _soft_cloud(p.tri_angle2, p.tri_phi2), "Evap 2 — Al")
         elec1 = nb1 | al2f                            # bottom electrode
 
         # Oxidation after evap1+evap2: skin on ALL exposed faces of the bottom
@@ -509,14 +538,13 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         alox = _oxide_skin(elec1)
 
         lab_c = lab.copy(); lab_c[elec1] = RESIST     # electrode 2 sees elec1 solid
-        al3 = _deposit(lab_c, xs, ys, zs, vox, d3, p.tri_t3, boxes,
-                       occ_mask=(elec1 if p.sidewall else None),
-                       soft=_soft_cloud(p.angle2, p.phi2))
+        al3 = _dep(lab_c, d3, p.tri_t3, (elec1 if p.sidewall else None),
+                   _soft_cloud(p.angle2, p.phi2), "Evap 3 — Al")
         lab_d = lab_c.copy(); lab_d[al3] = RESIST
-        nb4 = _deposit(lab_d, xs, ys, zs, vox, d4, p.tri_t4, boxes,
-                       occ_mask=((elec1 | al3) if p.sidewall else None),
-                       soft=_soft_cloud(p.tri_angle4, p.tri_phi4))
+        nb4 = _dep(lab_d, d4, p.tri_t4, ((elec1 | al3) if p.sidewall else None),
+                   _soft_cloud(p.tri_angle4, p.tri_phi4), "Evap 4 — Nb")
         elec2 = al3 | nb4                             # top electrode
+        _ox_after = 1                                  # oxidation after evap 2 (Al)
 
         al1, al2 = elec1, elec2                       # keep al1/al2 = the two electrodes
         films = dict(nb1=nb1, al2=al2f, al3=al3, nb4=nb4)
@@ -541,9 +569,34 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
                 stack="Trilayer" if trilayer else "Bilayer",
                 tri_dirs=tri_dirs,
                 max_cells=max_cells, min_vox=min_vox)
+
+    # ── Playback timeline (when recording) ────────────────────────
+    depo_order = depo_frames = None
+    if record:
+        depo_order = np.full(lab.shape, -1, np.int16)
+        depo_frames = [dict(step=-1, label="Resist (before evaporation)",
+                            show_oxide=False, liftoff=False)]
+        g = 0
+        for idx, (o, label, t_nm) in enumerate(_rec):
+            m = o >= 0
+            steps = int(o[m].max()) + 1 if m.any() else 1
+            depo_order[m] = g + o[m].astype(np.int16)   # global step of each voxel
+            for s in range(steps):
+                thick = min((s + 1) * vox, t_nm)
+                depo_frames.append(dict(
+                    step=g + s, label=f"{label} — {thick:.0f}/{t_nm:.0f} nm",
+                    show_oxide=(idx > _ox_after), liftoff=False))
+            g += steps
+            if idx == _ox_after:
+                depo_frames.append(dict(step=g - 1, label="Oxidation",
+                                        show_oxide=True, liftoff=False))
+        depo_frames.append(dict(step=g, label="Lift-off (resist stripped)",
+                                show_oxide=True, liftoff=True))
+
     return DepositionResult(xs, ys, zs, vox, lab, al1, al2, alox, z_top, meta,
                             stack="Trilayer" if trilayer else "Bilayer",
-                            films=films)
+                            films=films, depo_order=depo_order,
+                            depo_frames=depo_frames)
 
 
 # ════════════════════════════════════════════════════════════════

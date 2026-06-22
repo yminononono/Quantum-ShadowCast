@@ -471,6 +471,65 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     return fig
 
 
+def render_deposition_frame(r: DepositionResult, step_value, show_oxide=True,
+                            liftoff=False, angle_deg=0.0, offset=0.0,
+                            view_half=None, zmax=None, view_center=0.0, zmin=None,
+                            title=""):
+    """One cross-section frame of the step-through deposition playback.
+
+    Shows the metal deposited up to global timeline ``step_value`` (from
+    ``r.depo_order``): the film grows layer-by-layer toward the source as the
+    slider advances.  ``show_oxide`` draws the oxide skin (post-oxidation frames);
+    ``liftoff`` strips the resist and keeps only substrate-grounded metal."""
+    zs = r.zs
+    z_split = r.meta.get("z_split", r.z_top)
+    solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d = _slice_planes(
+        r, angle_deg, offset)
+    metal_all = al1 | al2
+    if r.depo_order is not None:
+        order2d = r.depo_order[ix, iy, :]
+        active = (order2d >= 0) & (order2d <= int(step_value)) & metal_all
+    else:
+        active = metal_all
+    if liftoff:
+        active = active & _grounded_metal(r)[ix, iy, :]
+
+    cat = np.full(solid2d.shape, C_EMPTY, np.int8)
+    cat[solid2d == SUBSTRATE] = C_SUBSTRATE
+    if not liftoff:                                   # resist present until lift-off
+        _resist_cat_cross(cat, solid2d, zs, z_split)
+    if films2d is not None:                           # trilayer: colour by evaporation
+        for name, col in (("nb1", C_E1_NB), ("al2", C_E2_AL),
+                          ("al3", C_E3_AL), ("nb4", C_E4_NB)):
+            cat[films2d[name] & active] = col
+    else:
+        cat[al1 & active] = C_AL1
+        cat[al2 & active] = C_AL2
+
+    (ux, uy), _ = _slice_dirs(angle_deg)
+    half = _zoom_half(r, view_half)
+    hwin = (view_center - half, view_center + half)
+    vlo = float(zs[0] if zmin is None else zmin)
+    vhi = float(zs[-1] if zmax is None else zmax)
+    fig, ax = plt.subplots(figsize=(7.6, 4.3), dpi=140)
+    _draw(ax, cat, h_axis, zs, h_label, "z  [nm]",
+          title or "Deposition playback", hlim=hwin, vlim=(vlo, vhi))
+    if show_oxide:                                    # oxide skin on grown Al1
+        _oxide_edges_cs(ax, al1 & active, (solid2d == RESIST) | (solid2d == SUBSTRATE),
+                        h_axis, zs)
+    c_e1 = _COLORS[C_E1_NB] if films2d is not None else _COLORS[C_AL1]
+    c_e2 = _COLORS[C_E3_AL] if films2d is not None else _COLORS[C_AL2]
+    lbl_e2 = "evap 3" if films2d is not None else "evap 2"
+    _beam_arrow_cs(ax, r.meta["d1"], (ux, uy), half, vhi, c_e1,
+                   "evap 1", side=-1, xcenter=view_center)
+    _beam_arrow_cs(ax, r.meta["d2"], (ux, uy), half, vhi, c_e2,
+                   lbl_e2, side=+1, xcenter=view_center)
+    present = [c for c in sorted(np.unique(cat).tolist()) if c != C_EMPTY]
+    _legend(fig, present)
+    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    return fig
+
+
 def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None,
                   view_half=None, zmax=None, view_center=0.0, zmin=None):
     """Staged cross section sliced at in-plane azimuth ``angle_deg`` with
@@ -999,6 +1058,7 @@ def render_thickness_surface(r: DepositionResult, view_half=None):
         ysel[:] = True
     X, Y = np.meshgrid(r.xs[xsel], r.ys[ysel], indexing="ij")
     Z = thick[np.ix_(xsel, ysel)]
+    Z = np.where(Z > 0, Z, np.nan)        # drop the zero baseline → show only film
 
     fig = plt.figure(figsize=(6.8, 5.6))
     ax = fig.add_subplot(projection="3d")
@@ -1033,6 +1093,7 @@ def render_thickness_surface_plotly(r: DepositionResult, view_half=None):
     if not ysel.any():
         ysel[:] = True
     Z = thick[np.ix_(xsel, ysel)]                           # (Nx, Ny)
+    Z = np.where(Z > 0, Z, np.nan)        # drop the zero baseline → show only film
     # go.Surface expects z shaped (len(y), len(x)) → transpose.
     fig = go.Figure(go.Surface(
         x=r.xs[xsel], y=r.ys[ysel], z=Z.T, colorscale="Viridis",

@@ -84,7 +84,7 @@ judgments are based on it.
 - **Beam-angle distribution & correlation viewer**: from the Monte-Carlo draws,
   inspect the θ₁ / φ₁ / θ₂ / φ₂ distributions as 1-D histograms, 2-D scatter of
   any pair, or a correlation matrix (per-cell on the Wafer Map).
-- **Eight visualization tabs**
+- **Nine visualization tabs**
   1. **📐 Cross-section** — cross-section that can be rotated to any in-plane
      slice angle α (**signed, −90 … 90°, default 0**: 0 = x–z, ±90 = y–z) and
      offset (with evaporation-beam arrows). The lift-off panel colours the
@@ -94,16 +94,20 @@ judgments are based on it.
   2. **🗺️ Top View** — top view (metal films, shadow, undercut, junction region),
      plus the **lift-off film-thickness map**: a 2D heat map and a **drag-rotatable
      3D surface (Plotly)** where the *z value is the stacked metal thickness*
-     (electrode overlap reads thicker).
-  3. **🔄 φ Junction View** — zoomed top view around the junction
-  4. **🔍 Break Check** — open/short verdict and electrical metrics
-  5. **📈 Parameter Scan** — parameter sweep (see below)
-  6. **🎲 Source MC** — finite e-beam source Monte-Carlo for the single junction
+     (electrode overlap reads thicker). Both panels share the same field and show
+     only the deposited film (the zero baseline is masked out).
+  3. **🎬 Playback** — step-through of the deposition: scrub a frame slider to
+     watch each evaporation's film **grow layer-by-layer** toward the source, then
+     oxidation and lift-off (reuses the Cross-section slice/view; optional GIF).
+  4. **🔄 φ Junction View** — zoomed top view around the junction
+  5. **🔍 Break Check** — open/short verdict and electrical metrics
+  6. **📈 Parameter Scan** — parameter sweep (see below)
+  7. **🎲 Source MC** — finite e-beam source Monte-Carlo for the single junction
      (beam-pattern controls, mean ± σ, area histogram, beam-angle viewer)
-  7. **🌐 Wafer Map** — JJ-area (and more) variation across the wafer for a
+  8. **🌐 Wafer Map** — JJ-area (and more) variation across the wafer for a
      fixed-source / tilted-wafer (Plassys) evaporator, drawn on a **real wafer
      disk with its primary flat (オリフラ)** (see below)
-  8. **📊 Junction Area** — full parameter summary and result export
+  9. **📊 Junction Area** — full parameter summary and result export
 - **Parameter Scan**
   - **1D / 2D** sweeps (2D rendered as a heatmap)
   - The **value range and number of points** are configurable per variable

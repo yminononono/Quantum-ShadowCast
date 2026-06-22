@@ -817,7 +817,7 @@ def _run_engine(ekey, _params, max_cells, min_vox):
     on `ekey`): the voxel result, the grounded-metal mask, and the floor / full
     junction footprints + combos.  Doing it here (not per Streamlit rerun) keeps
     display-only changes cheap — the sidewall-area toggle just selects floor/full."""
-    r = simulate(_params, max_cells=max_cells, min_vox=min_vox)
+    r = simulate(_params, max_cells=max_cells, min_vox=min_vox, record=True)
     vv._grounded_metal(r)                       # populate r.meta['_grounded'] once
     full  = junction_footprint(r, include_sidewalls=True)    # (jm,area,ox,oy,juncs)
     floor = junction_footprint(r, include_sidewalls=False)
@@ -924,9 +924,11 @@ with _save_box:
         use_container_width=True)
 
 # ─── Tabs ─────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab_scan, tab_srcmc, tab_wafer, tab5 = st.tabs([
+(tab1, tab2, tab_play, tab3, tab4, tab_scan, tab_srcmc,
+ tab_wafer, tab5) = st.tabs([
     "📐 Cross-section",
     "🗺️ Top View",
+    "🎬 Playback",
     "🔄 φ Junction View",
     "🔍 Break Check",
     "📈 Parameter Scan",
@@ -1153,6 +1155,67 @@ with tab2:
         }, use_container_width=True, hide_index=True)
     elif eng_njunc == 1:
         st.caption("Single Josephson junction.")
+
+# ═══ TAB: Playback (step-through deposition) ═════════════════════
+with tab_play:
+    st.subheader("🎬 Deposition playback — step-through")
+    st.markdown(
+        "Watch the simulation build up: each evaporation's film grows **layer by "
+        "layer** toward the source, then oxidation and lift-off.  Scrub the slider "
+        "(or build a GIF).  Uses the **Cross-section** tab's slice angle and view "
+        "window.")
+    _frames = getattr(eng, "depo_frames", None)
+    if not _frames:
+        st.info("Press **▶ Run simulation** to generate the deposition timeline.")
+    else:
+        _nfr = len(_frames)
+        st.session_state.setdefault("play_k", _nfr - 1)
+        st.session_state["play_k"] = int(np.clip(st.session_state["play_k"],
+                                                 0, _nfr - 1))
+        if _nfr >= 2:
+            k = st.slider("Frame", 0, _nfr - 1, key="play_k",
+                          help="0 = bare resist · last = lift-off.  Drag to scrub "
+                               "through the deposition.")
+        else:
+            k = 0
+        f = _frames[k]
+        st.caption(f"**Step {k + 1} / {_nfr}** — {f['label']}")
+        with st.spinner("Rendering frame..."):
+            figp = vv.render_deposition_frame(
+                eng, f["step"], show_oxide=f["show_oxide"], liftoff=f["liftoff"],
+                angle_deg=slice_angle, offset=slice_pos, view_half=cs_half,
+                zmax=cs_zmax, view_center=cs_xc, zmin=_cs_zmin,
+                title=f"Playback — {f['label']}")
+            st.pyplot(figp, use_container_width=True)
+            plt.close(figp)
+        if st.button("▶ Build animation (GIF)", key="play_gif",
+                     help="Render every frame into a downloadable animated GIF."):
+            try:
+                import io
+                from PIL import Image
+                imgs = []
+                prog = st.progress(0.0, text="Rendering frames…")
+                for i, ff in enumerate(_frames):
+                    fg = vv.render_deposition_frame(
+                        eng, ff["step"], show_oxide=ff["show_oxide"],
+                        liftoff=ff["liftoff"], angle_deg=slice_angle,
+                        offset=slice_pos, view_half=cs_half, zmax=cs_zmax,
+                        view_center=cs_xc, zmin=_cs_zmin,
+                        title=f"Playback — {ff['label']}")
+                    buf = io.BytesIO(); fg.savefig(buf, format="png", dpi=90)
+                    plt.close(fg); buf.seek(0)
+                    imgs.append(Image.open(buf).convert("RGB"))
+                    prog.progress((i + 1) / _nfr, text=f"Frame {i + 1}/{_nfr}")
+                prog.empty()
+                gif = io.BytesIO()
+                imgs[0].save(gif, format="GIF", save_all=True,
+                             append_images=imgs[1:], duration=450, loop=0)
+                st.image(gif.getvalue(), caption="Deposition playback")
+                st.download_button("💾 Download GIF", data=gif.getvalue(),
+                                   file_name="deposition_playback.gif",
+                                   mime="image/gif", use_container_width=True)
+            except Exception as e:
+                st.warning(f"GIF build needs Pillow: {e}")
 
 # ═══ TAB 3: φ Junction View ══════════════════════════════════════
 with tab3:
