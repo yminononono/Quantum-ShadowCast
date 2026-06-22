@@ -62,7 +62,9 @@ judgments are based on it.
   shadow edge** (penumbra ≈ source size / L), reproducing the **rounded (tapered)
   metal edge**, especially with a rounded resist lip. The junction footprint/area
   is set by the central beam (so the area is preserved). Visible at finer
-  resolution (the film must be several voxels thick); slower (multi-ray).
+  resolution (the film must be several voxels thick). The multi-ray cone is cast
+  only on the thin **penumbra band** near each shadow edge (interior cells stay
+  full-thickness), so it stays fast.
 - **Side-wall deposition effect** (opt-in): the first evaporation also coats the
   resist sidewall, narrowing the opening seen by later evaporations. The
   narrowing grows with the local incident angle, so it makes the across-wafer

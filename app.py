@@ -15,7 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import altair as alt
 import pandas as pd
-import json, copy, os, sys
+import json, copy, os, sys, time
 from dataclasses import asdict
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -811,19 +811,34 @@ params = ProcessParams(
     soft_edge=soft_edge, soft_pattern=soft_pat, soft_size=soft_size, soft_L=soft_L,
 )
 # ─── 3D physical deposition engine (source of truth) ──────────────
-@st.cache_data(show_spinner=False)
-def _run_engine(ekey, _params, max_cells, min_vox):
-    """Run the engine and pre-compute every per-simulation quantity ONCE (cached
-    on `ekey`): the voxel result, the grounded-metal mask, and the floor / full
-    junction footprints + combos.  Doing it here (not per Streamlit rerun) keeps
-    display-only changes cheap — the sidewall-area toggle just selects floor/full."""
-    r = simulate(_params, max_cells=max_cells, min_vox=min_vox, record=True)
+def _engine_cached(ekey):
+    """Return the cached engine bundle for ``ekey`` if it is the latest one, else
+    None.  Manual (session-state) cache — keyed by the engine signature, holds the
+    most recent result — so the heavy compute can take a live-progress callback
+    (a ``st.cache_data`` function may not call st elements, which the ETA bar does)."""
+    c = st.session_state.get("_engine_cache")
+    return c["out"] if (c is not None and c.get("ekey") == ekey) else None
+
+
+def _run_engine(ekey, params, max_cells, min_vox, progress=None):
+    """Pre-compute every per-simulation quantity ONCE per ``ekey``: voxel result,
+    grounded mask, floor/full junction footprints + combos.  Cached in
+    session_state (latest only) so display-only reruns are instant and the
+    sidewall-area toggle just selects floor/full.  ``progress`` = ``cb(frac,label)``
+    driven from the deposition iterations for the live ETA."""
+    hit = _engine_cached(ekey)
+    if hit is not None:
+        return hit
+    r = simulate(params, max_cells=max_cells, min_vox=min_vox, record=True,
+                 progress=progress)
     vv._grounded_metal(r)                       # populate r.meta['_grounded'] once
     full  = junction_footprint(r, include_sidewalls=True)    # (jm,area,ox,oy,juncs)
     floor = junction_footprint(r, include_sidewalls=False)
     combos_full  = junction_combos(r, include_sidewalls=True)
     combos_floor = junction_combos(r, include_sidewalls=False)
-    return r, full, floor, combos_full, combos_floor
+    out = (r, full, floor, combos_full, combos_floor)
+    st.session_state["_engine_cache"] = {"ekey": ekey, "out": out}
+    return out
 
 def _ekey_for(p):
     """Engine cache-key tuple for a ProcessParams at the current sidebar
@@ -866,9 +881,33 @@ if _live_sig != _committed["sig"]:
 
 res = compute_junction_area(params)
 ekey = _ekey_for(params)
-with st.spinner("Running 3D shadow-evaporation engine..."):
-    eng, _full, _floor, _combos_full, _combos_floor = _run_engine(
-        ekey, params, _max_cells, _min_vox)
+# Live ETA driven by the deposition iterations: the engine ticks once per
+# occlusion pass; elapsed ÷ fraction-done → approximate time-to-finish.  Only show
+# the bar when we will actually compute (cache miss); display-only reruns are
+# instant cache hits and skip it.
+if _engine_cached(ekey) is None:
+    _bar = st.progress(0.0, text="Running 3D engine…")
+    _t0 = time.perf_counter()
+    _last = [0.0]                               # throttle UI updates
+
+    def _run_progress(frac, label=""):
+        now = time.perf_counter()
+        if frac <= 0 or (now - _last[0] < 0.15 and frac < 1.0):
+            return
+        _last[0] = now
+        el = now - _t0
+        rem = el * (1.0 - frac) / frac
+        _bar.progress(min(max(frac, 0.0), 1.0),
+                      text=f"{label}…  ≈ {rem:.0f}s remaining "
+                           f"(≈ {el / frac:.0f}s total)")
+else:
+    _bar = None
+    _run_progress = None
+
+eng, _full, _floor, _combos_full, _combos_floor = _run_engine(
+    ekey, params, _max_cells, _min_vox, progress=_run_progress)
+if _bar is not None:
+    _bar.empty()
 # Floor / full junction footprints were measured once inside _run_engine; the
 # sidewall-area toggle (live) just selects which to show — no re-measure here.
 eng_jm_full,  eng_area_full,  _oxf, _oyf, eng_juncs_full = _full

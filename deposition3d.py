@@ -321,7 +321,7 @@ def _plassys_dirs(theta, phi, pattern, size, L, K=24, seed=0):
 
 
 def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
-             record=False):
+             record=False, on_pass=None, band_w=3):
     """Return bool grid of metal voxels for one evaporation.
 
     A cell receives metal if it is EMPTY, its beam-forward neighbour is solid
@@ -385,18 +385,42 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
     # Footprint = the single central beam (unchanged from the parallel-beam model,
     # so the junction area is preserved).  The soft-edge cone only sets a per-cell
     # coverage that *tapers the film thickness* near the shadow edge.
-    central_lit = ~_occluded(origins, -d, boxes)
+    N = len(ii)
+    # Central beam → the footprint.  Chunk the ray-cast (only when reporting
+    # progress) so the bar / ETA advances in fine steps, not one big jump.
+    C = 8 if on_pass is not None else 1
+    central_lit = np.empty(N, bool)
+    for ch in np.array_split(np.arange(N), min(C, N)):
+        central_lit[ch] = ~_occluded(origins[ch], -d, boxes)
+        if on_pass is not None:
+            on_pass()
     if occ_mask is not None:                 # sidewall: prior-metal wall coating shadows
         central_lit &= ~_occluded_mask(ii, jj, kk, d, occ_mask)
-    if soft is None:
-        cov = central_lit.astype(float)                # 1.0 lit, 0.0 shadowed
-    else:
-        # Integrate occlusion over the source's angular cloud (the e-beam pattern
-        # at the throw distance) → fractional coverage (penumbra), thickness only.
-        acc = np.zeros(len(ii))
-        for dk in soft:
-            acc += (~_occluded(origins, -dk, boxes)).astype(float)
-        cov = acc / len(soft)
+    cov = central_lit.astype(float)          # 1.0 lit, 0.0 shadowed
+    if soft is not None:
+        # Penumbra: coverage differs from 1 only NEAR the shadow edge, so cast the
+        # K source-cloud rays ONLY on lit cells within `band_w` voxels of a
+        # shadowed surface cell.  Interior lit cells stay at coverage 1 (full
+        # thickness).  This avoids re-testing every cell with every ray — the main
+        # cost of soft-edge — while giving an identical result.
+        dark = ~central_lit
+        dark3 = np.zeros(lab.shape, bool)
+        dark3[ii[dark], jj[dark], kk[dark]] = True
+        for _ in range(max(1, int(band_w))):
+            dark3 = _dilate6(dark3)
+        band = central_lit & dark3[ii, jj, kk]        # lit cells near the edge
+        bidx = np.where(band)[0]
+        if len(bidx):
+            bo = origins[bidx]
+            acc = np.zeros(len(bidx))
+            for dk in soft:
+                acc += (~_occluded(bo, -dk, boxes)).astype(float)
+                if on_pass is not None:
+                    on_pass()                # one occlusion pass per source ray
+            cov[bidx] = acc / len(soft)
+        elif on_pass is not None:
+            for _ in soft:
+                on_pass()                    # keep the tick count consistent
         if occ_mask is not None:
             cov *= (~_occluded_mask(ii, jj, kk, d, occ_mask)).astype(float)
 
@@ -428,7 +452,8 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
 
 
 def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
-             min_vox: float = 6.0, record: bool = False) -> DepositionResult:
+             min_vox: float = 6.0, record: bool = False,
+             progress=None) -> DepositionResult:
     """Run the shadow-evaporation engine.
 
     ``max_cells`` / ``min_vox`` set the ray-scan resolution: a larger
@@ -489,19 +514,48 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
             return None
         return _plassys_dirs(theta, phi, p.soft_pattern, p.soft_size, p.soft_L)
 
+    # Live progress: per evaporation the central beam is cast in C=8 chunks
+    # (fine-grained ticks) plus one tick per soft-cloud ray → finer ETA than one
+    # tick per evap.  `progress=None` ⇒ no overhead.  Penumbra band half-width
+    # `_band_w` (voxels) ≈ source half-angle × lip height, used to restrict the
+    # soft rays to the shadow-edge band.
+    _C = 8
+    _n_evap = 4 if trilayer else 2
+    if _soft_on:
+        _cloud0 = _plassys_dirs(p.angle1, p.phi1, p.soft_pattern, p.soft_size, p.soft_L)
+        _rays = len(_cloud0)
+        _d0 = beam_direction(p.angle1, p.phi1)       # max angular deviation of the
+        _dev = np.arccos(np.clip([float(np.dot(dk, _d0)) for dk in _cloud0],
+                                 -1.0, 1.0)).max()    # actual cloud (covers tails)
+        _band_w = int(np.ceil(np.tan(float(_dev)) * z_top / vox)) + 2
+    else:
+        _rays, _band_w = 0, 3
+    _U = max(1, _n_evap * (_C + _rays))
+    _done = [0]
+
+    def _on_pass_for(label):
+        if progress is None:
+            return None
+        def _op():
+            _done[0] += 1
+            progress(min(_done[0] / _U, 1.0), label)
+        return _op
+
     # Playback recording: each evaporation appends (order_grid, label, thickness_nm)
     # in deposition order; `_ox_after` = index of the evap after which oxidation
     # happens (oxide appears in frames past it).
     _rec = []
 
     def _dep(lab_, d_, t_, occ_, soft_, label):
+        op = _on_pass_for(label)
         if record:
             m, o = _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
-                            occ_mask=occ_, soft=soft_, record=True)
+                            occ_mask=occ_, soft=soft_, record=True, on_pass=op,
+                            band_w=_band_w)
             _rec.append((o, label, float(t_)))
             return m
         return _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
-                        occ_mask=occ_, soft=soft_)
+                        occ_mask=occ_, soft=soft_, on_pass=op, band_w=_band_w)
 
     if not trilayer:
         # ── Bilayer: evap1 → oxidation → evap2 ────────────────────
@@ -550,6 +604,9 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         films = dict(nb1=nb1, al2=al2f, al3=al3, nb4=nb4)
         meta_d1, meta_d2 = d1, d3                     # arrows: the two electrode beams
         tri_dirs = dict(nb1=d1, al2=d2, al3=d3, nb4=d4)  # per-evaporation beams
+
+    if progress is not None:
+        progress(1.0, "finalising")          # deposits done; measurements are a tail
 
     z_floor = metal_sum + max(p.tri_t1 * 0.1 if trilayer else p.t_metal1 * 0.1, 3) + 2 * vox
     # Junction region: where the device tunnel junction is expected.  In Dolan
