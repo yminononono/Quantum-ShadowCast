@@ -382,12 +382,18 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
         return m0
 
     origins = np.stack([xs[ii], ys[jj], zs[kk]], axis=1)
-    # Footprint = the single central beam (unchanged from the parallel-beam model,
-    # so the junction area is preserved).  The soft-edge cone only sets a per-cell
-    # coverage that *tapers the film thickness* near the shadow edge.
+    # Footprint: when soft is None, fixed by the single central beam (unchanged
+    # from the parallel-beam model, so the junction area is preserved exactly).
+    # When soft is not None, the footprint can also bleed a little past the
+    # central beam's edge into the shadow side (see `outer_band` below) — a
+    # real extended source partially illuminates just past the nominal shadow
+    # line, so the penumbra tapers symmetrically instead of cutting off dead at
+    # the central-beam edge.  Either way the soft-edge cone only adjusts film
+    # *thickness* near the edge; it never touches the interior.
     N = len(ii)
-    # Central beam → the footprint.  Chunk the ray-cast (only when reporting
-    # progress) so the bar / ETA advances in fine steps, not one big jump.
+    # Central beam → the nominal footprint.  Chunk the ray-cast (only when
+    # reporting progress) so the bar / ETA advances in fine steps, not one big
+    # jump.
     C = 8 if on_pass is not None else 1
     central_lit = np.empty(N, bool)
     for ch in np.array_split(np.arange(N), min(C, N)):
@@ -397,6 +403,8 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
     if occ_mask is not None:                 # sidewall: prior-metal wall coating shadows
         central_lit &= ~_occluded_mask(ii, jj, kk, d, occ_mask)
     cov = central_lit.astype(float)          # 1.0 lit, 0.0 shadowed
+    oidx = np.empty(0, np.int64)
+    cov_outer = np.empty(0)
     if soft is not None:
         # Penumbra: coverage differs from 1 only NEAR the shadow edge, so cast the
         # K source-cloud rays ONLY on lit cells within `band_w` voxels of a
@@ -412,31 +420,86 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
         bidx = np.where(band)[0]
         if len(bidx):
             bo = origins[bidx]
+            bi, bj, bk = ii[bidx], jj[bidx], kk[bidx]
             acc = np.zeros(len(bidx))
             for dk in soft:
-                acc += (~_occluded(bo, -dk, boxes)).astype(float)
+                # Sidewall occlusion is tested per-ray (using that ray's own
+                # `dk`), not the single nominal `d` — each source-cloud ray
+                # genuinely sees a different sidewall shadow, so folding this
+                # into the loop (rather than one binary cut applied after)
+                # keeps the penumbra's gradation instead of flattening it.
+                lit_k = ~_occluded(bo, -dk, boxes)
+                if occ_mask is not None:
+                    lit_k &= ~_occluded_mask(bi, bj, bk, dk, occ_mask)
+                acc += lit_k.astype(float)
                 if on_pass is not None:
                     on_pass()                # one occlusion pass per source ray
             cov[bidx] = acc / len(soft)
         elif on_pass is not None:
             for _ in soft:
                 on_pass()                    # keep the tick count consistent
-        if occ_mask is not None:
-            cov *= (~_occluded_mask(ii, jj, kk, d, occ_mask)).astype(float)
 
-    keep = central_lit                       # footprint fixed by the central beam
+        # Mirror: shadowed cells within band_w of the LIT region get the same
+        # ray-cloud test, so the penumbra bleeds a little past the central-beam
+        # edge instead of cutting off dead at it (symmetric, two-sided taper).
+        # Inherits one pre-existing, unrelated limitation from the block above
+        # unchanged: `surface` (so `ii,jj,kk`) only contains cells whose forward
+        # neighbour along the *central* beam's own axis signs is solid, so an
+        # off-axis cloud ray could in principle expose a cell outside that set.
+        # Not introduced by this change and out of scope here.
+        lit3 = np.zeros(lab.shape, bool)
+        lit3[ii[central_lit], jj[central_lit], kk[central_lit]] = True
+        for _ in range(max(1, int(band_w))):
+            lit3 = _dilate6(lit3)
+        outer_band = (~central_lit) & lit3[ii, jj, kk]   # shadow-side cells near the edge
+        oidx = np.where(outer_band)[0]
+        cov_outer = np.zeros(len(oidx))
+        if len(oidx):
+            oo = origins[oidx]
+            # Distinct names from the `oi, oj, ok` built later (for the
+            # target_outer/growth concatenation) — same cells, different
+            # purpose, kept separate so neither shadows the other.
+            oi_, oj_, ok_ = ii[oidx], jj[oidx], kk[oidx]
+            acc_o = np.zeros(len(oidx))
+            for dk in soft:
+                lit_k = ~_occluded(oo, -dk, boxes)
+                if occ_mask is not None:
+                    lit_k &= ~_occluded_mask(oi_, oj_, ok_, dk, occ_mask)
+                acc_o += lit_k.astype(float)
+                if on_pass is not None:
+                    on_pass()
+            cov_outer = acc_o / len(soft)
+        elif on_pass is not None:
+            for _ in soft:
+                on_pass()                    # keep the tick count consistent
+
+    n = int(round(t_metal / vox))
+    keep = central_lit                       # nominal lit footprint
     gi, gj, gk = ii[keep], jj[keep], kk[keep]
-    covk = cov[keep]
+    # Lit side keeps its floor (>=1 voxel) — unchanged visual behaviour there.
+    target_inner = np.maximum(1, np.round(cov[keep] * n)).astype(int)
+    # Shadow-side bleed: NO floor — a cell whose cloud coverage rounds to 0
+    # layers genuinely gets no metal, which is what lets the taper reach zero a
+    # few voxels past the edge instead of guaranteeing a voxel everywhere.
+    oi, oj, ok = ii[oidx], jj[oidx], kk[oidx]
+    target_outer = np.round(cov_outer * n).astype(int)
+
+    gi = np.concatenate([gi, oi]); gj = np.concatenate([gj, oj]); gk = np.concatenate([gk, ok])
+    target = np.concatenate([target_inner, target_outer])
+
     metal = np.zeros_like(solid)
-    metal[gi, gj, gk] = True
+    # step-0 (surface-contact) placement is gated on target>=1: inner cells are
+    # always >=1 (floored above) so this is a no-op for them there; outer cells
+    # with 0 coverage correctly get no metal at all.
+    place = target >= 1
+    gi_p, gj_p, gk_p = gi[place], gj[place], gk[place]
+    metal[gi_p, gj_p, gk_p] = True
     order = np.full(solid.shape, -1, np.int16) if record else None
     if record:
-        order[gi, gj, gk] = 0                # surface-contact layer = step 0
+        order[gi_p, gj_p, gk_p] = 0          # surface-contact layer = step 0
 
     # grow film thickness back toward source; the soft edge tapers each column to
     # round(coverage·n) so the penumbra reads as a rounded metal shoulder.
-    n = int(round(t_metal / vox))
-    target = np.maximum(1, np.round(covk * n)).astype(int)
     cur_i, cur_j, cur_k = gi.copy(), gj.copy(), gk.copy()
     for mstep in range(1, max(n, 1)):
         cur_i = cur_i - fwd[0]; cur_j = cur_j - fwd[1]; cur_k = cur_k - fwd[2]
@@ -530,7 +593,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         _band_w = int(np.ceil(np.tan(float(_dev)) * z_top / vox)) + 2
     else:
         _rays, _band_w = 0, 3
-    _U = max(1, _n_evap * (_C + _rays))
+    _U = max(1, _n_evap * (_C + 2 * _rays))   # ×2: inner + mirrored outer-band ray loop
     _done = [0]
 
     def _on_pass_for(label):
