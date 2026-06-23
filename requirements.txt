@@ -6,6 +6,7 @@ streamlit>=1.28.0
 numpy>=1.24.0
 matplotlib>=3.7.0
 plotly>=5.0.0          # drag-rotatable 3D lift-off thickness surface (Top View tab)
+scipy>=1.10.0          # 3-D connected-components labelling (lift-off connectivity)
 
 # GDS loader (install one of the following)
 # Recommended: gdstk (fast, actively maintained)

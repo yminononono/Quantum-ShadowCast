@@ -847,13 +847,17 @@ def _run_engine(ekey, params, max_cells, min_vox, progress=None):
     grounded mask, floor/full junction footprints + combos.  Cached in
     session_state (latest only) so display-only reruns are instant and the
     sidewall-area toggle just selects floor/full.  ``progress`` = ``cb(frac,label)``
-    driven from the deposition iterations for the live ETA."""
+    driven from the deposition iterations for the live ETA, then handed to
+    ``vv._grounded_metal`` for a second timed phase (the lift-off connectivity
+    flood fill, which can take as long as the deposits themselves)."""
     hit = _engine_cached(ekey)
     if hit is not None:
         return hit
     r = simulate(params, max_cells=max_cells, min_vox=min_vox, record=True,
                  progress=progress)
-    vv._grounded_metal(r)                       # populate r.meta['_grounded'] once
+    if progress is not None:
+        progress(0.0, "_phase2_start_")         # reset the ETA clock for the flood fill
+    vv._grounded_metal(r, progress=progress)    # populate r.meta['_grounded'] once
     full  = junction_footprint(r, include_sidewalls=True)    # (jm,area,ox,oy,juncs)
     floor = junction_footprint(r, include_sidewalls=False)
     combos_full  = junction_combos(r, include_sidewalls=True)
@@ -910,15 +914,18 @@ ekey = _ekey_for(params)
 # instant cache hits and skip it.
 if _engine_cached(ekey) is None:
     _bar = st.progress(0.0, text="Running 3D engine…")
-    _t0 = time.perf_counter()
+    _t0 = [time.perf_counter()]                 # list: mutable from the closure below
     _last = [0.0]                               # throttle UI updates
 
     def _run_progress(frac, label=""):
         now = time.perf_counter()
+        if label == "_phase2_start_":            # reset the ETA clock for a new phase
+            _t0[0] = now; _last[0] = 0.0
+            return
         if frac <= 0 or (now - _last[0] < 0.15 and frac < 1.0):
             return
         _last[0] = now
-        el = now - _t0
+        el = now - _t0[0]
         rem = el * (1.0 - frac) / frac
         _bar.progress(min(max(frac, 0.0), 1.0),
                       text=f"{label}…  ≈ {rem:.0f}s remaining "

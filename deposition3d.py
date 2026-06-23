@@ -671,7 +671,10 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         tri_dirs = dict(nb1=d1, al2=d2, al3=d3, nb4=d4)  # per-evaporation beams
 
     if progress is not None:
-        progress(1.0, "finalising")          # deposits done; measurements are a tail
+        progress(1.0, "Deposits complete")   # the lift-off connectivity flood fill
+                                              # (a second, separately-timed phase) is
+                                              # reported by the caller around
+                                              # vv._grounded_metal, not from here
 
     z_floor = metal_sum + max(p.tri_t1 * 0.1 if trilayer else p.t_metal1 * 0.1, 3) + 2 * vox
     # Junction region: where the device tunnel junction is expected.  In Dolan
