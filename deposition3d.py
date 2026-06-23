@@ -575,7 +575,8 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     def _soft_cloud(theta, phi):
         if not _soft_on:
             return None
-        return _plassys_dirs(theta, phi, p.soft_pattern, p.soft_size, p.soft_L)
+        return _plassys_dirs(theta, phi, p.soft_pattern, p.soft_size, p.soft_L,
+                             K=p.soft_rays)
 
     # Live progress: per evaporation the central beam is cast in C=8 chunks
     # (fine-grained ticks) plus one tick per soft-cloud ray → finer ETA than one
@@ -585,7 +586,8 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     _C = 8
     _n_evap = 4 if trilayer else 2
     if _soft_on:
-        _cloud0 = _plassys_dirs(p.angle1, p.phi1, p.soft_pattern, p.soft_size, p.soft_L)
+        _cloud0 = _plassys_dirs(p.angle1, p.phi1, p.soft_pattern, p.soft_size, p.soft_L,
+                                K=p.soft_rays)
         _rays = len(_cloud0)
         _d0 = beam_direction(p.angle1, p.phi1)       # max angular deviation of the
         _dev = np.arccos(np.clip([float(np.dot(dk, _d0)) for dk in _cloud0],

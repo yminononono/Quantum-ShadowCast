@@ -292,6 +292,10 @@ def _apply_loaded_params(pdict, raydict):
         v = float(pdict["soft_L"])
         if 20.0 <= v <= 2000.0:
             st.session_state["soft_L"] = v; applied += 1
+    if pdict.get("soft_rays") is not None:
+        v = int(pdict["soft_rays"])
+        if 4 <= v <= 200:
+            st.session_state["soft_rays"] = v; applied += 1
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -428,7 +432,7 @@ _PARAM_DEFAULTS = {
     "jj_walls": False,
     "soft_edge": False,
     "soft_pattern": "Rotating line (disk, 1/ρ)",   # _beam_pattern_controls selectbox label
-    "soft_size": 12.0, "soft_sigma": 2.0, "soft_L": 550.0,
+    "soft_size": 12.0, "soft_sigma": 2.0, "soft_L": 550.0, "soft_rays": 24,
     "res_level": "Standard (fast)",
 }
 
@@ -758,16 +762,28 @@ with st.sidebar:
              "thickness near the shadow edge (penumbra ≈ source size / L).  "
              "Combined with a rounded resist lip this gives a rounded metal edge.  "
              "Visible at finer resolution (film several voxels thick); slower.")
-    soft_pat, soft_size, soft_L = "rotline", 12.0, 550.0
+    soft_pat, soft_size, soft_L, soft_rays = "rotline", 12.0, 550.0, 24
     if soft_edge:
         soft_pat, soft_size = _beam_pattern_controls("soft")
         st.session_state.setdefault("soft_L", 550.0)
         soft_L = float(st.number_input(
             "Throw distance L [mm]", 20.0, 2000.0, step=10.0, key="soft_L",
             help="Source→sample distance (Plassys ≈ 550 mm).  Penumbra ≈ size/L."))
+        st.session_state.setdefault("soft_rays", 24)
+        soft_rays = int(st.number_input(
+            "Source-cloud rays K", 4, 200, step=4, key="soft_rays",
+            help="Number of sampled directions across the source used to "
+                 "integrate the penumbra coverage at each edge voxel.  Higher = "
+                 "smoother taper / finer coverage gradation (coverage is only "
+                 "resolvable in steps of 1/K), at a roughly linear cost in "
+                 "soft-edge runtime."))
         _half = np.degrees(np.arctan((soft_size / 2.0) / max(soft_L, 1e-9)))
-        st.caption(f"Source: {soft_pat} • {soft_size:.1f} mm at {soft_L:.0f} mm "
-                   f"⇒ angular half-size ≈ {_half:.2f}°.")
+        st.caption(f"Source: {soft_pat} • {soft_size:.1f} mm at {soft_L:.0f} mm • "
+                   f"{soft_rays} rays ⇒ angular half-size ≈ {_half:.2f}°  "
+                   f"(coverage resolution ≈ 1/{soft_rays}).")
+        if soft_rays > 48:
+            st.caption("⚠ High ray count — soft-edge cost scales roughly "
+                       "linearly with K.")
 
     st.divider()
     st.subheader("Display")
@@ -814,6 +830,7 @@ params = ProcessParams(
     tri_angle4=tri_angle4, tri_phi4=tri_phi4,
     sidewall=sidewall,
     soft_edge=soft_edge, soft_pattern=soft_pat, soft_size=soft_size, soft_L=soft_L,
+    soft_rays=soft_rays,
 )
 # ─── 3D physical deposition engine (source of truth) ──────────────
 def _engine_cached(ekey):
@@ -856,7 +873,8 @@ def _ekey_for(p):
             p.tri_angle4, p.tri_phi4, getattr(p, "sidewall", False),
             getattr(p, "resist_round", 0.0),
             getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
-            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0))
+            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
+            getattr(p, "soft_rays", 24))
 
 @st.cache_data(show_spinner=False)
 def _mc_area(sig, _p):
@@ -1453,7 +1471,8 @@ with tab_scan:
                 p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4,
                 getattr(p, "sidewall", False), getattr(p, "resist_round", 0.0),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
-            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0))
+            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
+            getattr(p, "soft_rays", 24))
 
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
@@ -1733,7 +1752,8 @@ with tab_wafer:
                 _wsmc, _wsmv, getattr(p, "sidewall", False),
                 getattr(p, "resist_round", 0.0),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
-            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0))
+            getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
+            getattr(p, "soft_rays", 24))
 
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):

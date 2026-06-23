@@ -58,6 +58,7 @@ class ProcessParams:
     soft_pattern: str = "rotline"  # e-beam raster pattern (sample_beam_cloud key)
     soft_size:   float = 12.0   # source spot size on the target [mm] (recipe ~10–15)
     soft_L:      float = 550.0  # source→sample throw distance [mm] (Plassys ~550)
+    soft_rays:   int = 24       # source-cloud ray count K (finer ⇒ smoother taper, slower)
 
     # ── Evaporation 1 ─────────────────────────────────────────
     # Uniaxial tilt ±24° (same azimuth φ, opposite polar θ); 30 nm Al each.
