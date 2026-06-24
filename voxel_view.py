@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm, to_rgba
 from matplotlib.patches import Rectangle, PathPatch
 from matplotlib.path import Path
-from matplotlib.collections import PatchCollection
+from matplotlib.collections import PatchCollection, LineCollection
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
 
 from deposition3d import (EMPTY, RESIST, SUBSTRATE, DepositionResult,
@@ -148,6 +148,63 @@ def _extent(h_axis, v_axis):
     hlo, hhi = _axis_edges(h_axis)
     vlo, vhi = _axis_edges(v_axis)
     return [hlo, hhi, vlo, vhi]
+
+
+def _metal_voxel_outline(ax, is_metal, h_axis, v_axis, color="white", lw=0.3,
+                         alpha=0.55):
+    """Outline every metal voxel cell (all 4 edges, including the internal
+    edges between two adjacent metal cells) so the outline traces exactly the
+    voxel granularity of the metal blocks already drawn by ``_draw`` — no
+    separate geometry, just the boundaries of the ``is_metal`` cells in the
+    same per-sample grid that's already rendered.  A boundary between two
+    neighbouring cells is drawn whenever *either* side is metal, so an
+    isolated metal cell gets all 4 sides outlined and a contiguous metal
+    block additionally shows its internal cell-to-cell divisions, while
+    resist/substrate/empty regions are left unmarked."""
+    nh, nv = is_metal.shape
+    if nh == 0 or nv == 0:
+        return
+    dh = float(h_axis[1] - h_axis[0]) if nh > 1 else 1.0
+    dv = float(v_axis[1] - v_axis[0]) if nv > 1 else 1.0
+    hh, hv = dh / 2.0, dv / 2.0
+
+    def _runs(flags):
+        """(start, end) index pairs of consecutive True runs in ``flags``."""
+        idx = np.where(flags)[0]
+        if idx.size == 0:
+            return []
+        breaks = np.where(np.diff(idx) > 1)[0]
+        starts = np.concatenate(([0], breaks + 1))
+        ends = np.concatenate((breaks, [idx.size - 1]))
+        return [(idx[a], idx[b]) for a, b in zip(starts, ends)]
+
+    segs = []
+    # vertical boundary lines: one candidate per h-edge index 0..nh (interior
+    # edges between columns i-1|i, plus the two outer edges of the array)
+    vbound = np.zeros((nh + 1, nv), dtype=bool)
+    vbound[1:-1] = is_metal[:-1, :] | is_metal[1:, :]
+    vbound[0] = is_metal[0]
+    vbound[-1] = is_metal[-1]
+    h_edges = h_axis[0] - hh + dh * np.arange(nh + 1)
+    for ei in range(nh + 1):
+        for k0, k1 in _runs(vbound[ei]):
+            segs.append([(h_edges[ei], v_axis[k0] - hv),
+                        (h_edges[ei], v_axis[k1] + hv)])
+
+    # horizontal boundary lines: one candidate per v-edge index 0..nv
+    hbound = np.zeros((nh, nv + 1), dtype=bool)
+    hbound[:, 1:-1] = is_metal[:, :-1] | is_metal[:, 1:]
+    hbound[:, 0] = is_metal[:, 0]
+    hbound[:, -1] = is_metal[:, -1]
+    v_edges = v_axis[0] - hv + dv * np.arange(nv + 1)
+    for ek in range(nv + 1):
+        for i0, i1 in _runs(hbound[:, ek]):
+            segs.append([(h_axis[i0] - hh, v_edges[ek]),
+                        (h_axis[i1] + hh, v_edges[ek])])
+
+    if segs:
+        ax.add_collection(LineCollection(segs, colors=color, linewidths=lw,
+                                         alpha=alpha, zorder=4))
 
 
 def _draw(ax, cat, h_axis, v_axis, h_label, v_label, title, hlim=None, vlim=None):
@@ -364,6 +421,44 @@ def _oblique_columns(r, angle_deg, offset):
     return ix, iy, s, inside
 
 
+def _oblique_columns_fine(r, angle_deg, offset, ns):
+    """Like :func:`_oblique_columns`, but samples ``ns`` points per coarse
+    voxel along the slice instead of one, for reading ``DepositionResult.
+    coverage_sub`` (per lateral-sub-offset coverage grids, ``ns²`` of them)
+    at full detail rather than collapsing each coarse cell to its average.
+
+    Returns ``(ix, iy, sub_idx, s, inside)``: ``ix, iy`` are the *coarse* cell
+    each fine sample falls into (same grid as ``_oblique_columns``); ``sub_idx``
+    is which of the ``ns²`` stored sub-offset slots (flattened row-major, i.e.
+    index = i*ns+j for the i-th y-row / j-th x-column of the lateral sub-grid)
+    is nearest to that fine sample's position within its coarse cell — this
+    must match exactly how ``deposition3d._deposit`` builds ``sub_offsets``
+    (``np.meshgrid(off1d, off1d)`` then ``.ravel()``) or the lookup will read
+    the wrong sub-cell."""
+    (ux, uy), (nx, ny) = _slice_dirs(angle_deg)
+    vox = r.vox
+    grid_R = r.meta.get("grid_R", r.meta["R"])
+    ns = max(1, int(ns))
+    step = vox / ns
+    s = np.arange(-grid_R, grid_R + step, step)
+    px = s * ux + offset * nx
+    py = s * uy + offset * ny
+    ix = np.rint((px - r.xs[0]) / vox).astype(int)
+    iy = np.rint((py - r.ys[0]) / vox).astype(int)
+    inside = ((ix >= 0) & (ix < len(r.xs)) &
+              (iy >= 0) & (iy < len(r.ys)))
+    ix = np.clip(ix, 0, len(r.xs) - 1)
+    iy = np.clip(iy, 0, len(r.ys) - 1)
+    if ns <= 1:
+        return ix, iy, np.zeros(len(s), int), s, inside
+    dx = px - r.xs[ix]
+    dy = py - r.ys[iy]
+    j = np.clip(np.round((dx / vox + 0.5) * ns - 0.5), 0, ns - 1).astype(int)
+    i = np.clip(np.round((dy / vox + 0.5) * ns - 0.5), 0, ns - 1).astype(int)
+    sub_idx = i * ns + j
+    return ix, iy, sub_idx, s, inside
+
+
 def _slice_planes(r, angle_deg, offset):
     """Return (solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d) for an
     oblique slice at azimuth ``angle_deg`` and perpendicular ``offset`` [nm].
@@ -417,13 +512,17 @@ def _resist_cat_cross(cat, solid2d, zs, z_split):
 
 def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
                          junc_mask=None, view_half=None, zmax=None,
-                         view_center=0.0, zmin=None):
+                         view_center=0.0, zmin=None, show_voxel_grid=False):
     """Render one combined cross-section slice (all layers, junction marked).
 
     The slice is taken at in-plane azimuth ``angle_deg`` with perpendicular
-    ``offset`` [nm] (``angle_deg=0`` → x–z cut at y=offset)."""
+    ``offset`` [nm] (``angle_deg=0`` → x–z cut at y=offset).
+
+    ``show_voxel_grid`` outlines every deposited-metal voxel cell (including
+    the internal edges between adjacent metal cells) with a thin white line,
+    so the actual voxel size/granularity of the metal is visible directly on
+    the image — resist/substrate/empty regions are left unmarked."""
     zs = r.zs
-    zf = r.meta.get("z_floor", r.z_top)
     z_split = r.meta.get("z_split", r.z_top)
     solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d = _slice_planes(
         r, angle_deg, offset)
@@ -437,12 +536,25 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
         cat[al1] = C_AL1
         cat[al2] = C_AL2
     if junc_mask is not None and films2d is None:
-        # Bilayer: highlight the Al1∩Al2 overlap column.  For trilayer the
-        # material colouring + oxide barrier already show the junction stack,
-        # and the Nb-Al/Al-Al/Nb-Nb split lives in the top / junction views.
+        # Bilayer: highlight ~10 nm on EACH side of the real Al1/Al2 interface
+        # (top of Al1, below the oxide; bottom of Al2, above it), restricted to
+        # actual metal cells — traces the true interface shape instead of a
+        # full-height rectangle over the junction's xy footprint.  Same method
+        # as render_stages' lift-off panel, minus the `grounded` gating (this
+        # view is pre-lift-off, so non-grounded metal is still legitimately
+        # shown).  For trilayer the material colouring + oxide barrier already
+        # show the junction stack, and the Nb-Al/Al-Al/Nb-Nb split lives in the
+        # top / junction views.
         jc = junc_mask[ix, iy]
-        junc2 = jc[:, None] & (zs[None, :] >= 0) & (zs[None, :] < zf)
-        cat[junc2] = C_JUNC
+        dz = float(zs[1] - zs[0]) if len(zs) > 1 else 1.0
+        n_band = max(1, int(round(10.0 / dz)))      # ≈10 nm per side, in voxels
+        band = np.zeros_like(al1)
+        for i in np.where(jc & al1.any(1) & al2.any(1))[0]:
+            a1 = np.where(al1[i])[0]                # Al1 cells (lower electrode)
+            a2 = np.where(al2[i])[0]                # Al2 cells (upper electrode)
+            band[i, a1[-n_band:]] = True            # top ~10 nm of Al1 (below oxide)
+            band[i, a2[:n_band]] = True             # bottom ~10 nm of Al2 (above oxide)
+        cat[band & (al1 | al2)] = C_JUNC
 
     title = f"Cross section  (α = {angle_deg:.0f}°,  offset = {offset:.0f} nm)"
     (ux, uy), _ = _slice_dirs(angle_deg)
@@ -453,6 +565,9 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     vlim = (vlo, vhi); vtop = vhi
     fig, ax = plt.subplots(figsize=(7.6, 4.3), dpi=140)
     _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hwin, vlim=vlim)
+    if show_voxel_grid:
+        is_metal = np.isin(cat, _METAL_CATS + _TRI_METAL_CATS)
+        _metal_voxel_outline(ax, is_metal, h_axis, zs)
     # AlOx: a thin (~3 nm) skin on every exposed Al1 face, incl. the Al1/Al2
     # interface (so Al2 sits on top of the barrier) and the metal corners.
     _oxide_edges_cs(ax, al1, (solid2d == RESIST) | (solid2d == SUBSTRATE),
@@ -532,54 +647,89 @@ def render_deposition_frame(r: DepositionResult, step_value, show_oxide=True,
 
 
 def render_coverage_profile(r: DepositionResult, metal: np.ndarray, n_nominal: int,
-                            angle_deg=0.0, offset=0.0, view_half=None,
-                            view_center=0.0, label=""):
+                            coverage_grid: np.ndarray = None, coverage_sub: list = None,
+                            angle_deg=0.0, offset=0.0,
+                            view_half=None, view_center=0.0, label=""):
     """Soft-edge diagnostic: floor coverage fraction along a slice.
 
     ``metal`` is one evaporation's bool grid (``r.al1`` / ``r.al2`` /
     ``r.films[...]``); ``n_nominal`` is that evaporation's nominal thickness in
-    voxels (``round(t_metal / r.vox)``).  The engine computes a continuous
-    per-cell coverage fraction internally (the fraction of the finite-source
-    beam cloud that clears the resist) and quantises it to
-    ``round(coverage·n_nominal)`` floor-metal voxel layers — it never stores
-    the fraction itself.  This reconstructs it: the floor thickness at each
-    lateral position (the run of metal cells starting at z-index 1, the first
-    cell above the substrate-interface cell) divided by ``n_nominal``
-    approximates the original coverage fraction.  Columns whose thickness
-    lands strictly between 0 and ``n_nominal`` are exactly the ones the
-    engine ray-tested against the source cloud (the "band"); flat columns at
-    1.0 or 0.0 were never ray-tested (interior / deep shadow shortcut).
+    voxels (``round(t_metal / r.vox)``).
+
+    ``coverage_sub`` (``r.coverage_sub[label]`` — only set when the run used
+    ``soft_supersample>1``) is a list of ``ns²`` per-lateral-sub-offset
+    coverage grids: the un-averaged detail behind ``coverage_grid``.  When
+    given, the slice is sampled at ``ns`` points per coarse voxel instead of
+    one (see :func:`_oblique_columns_fine`), so the profile shows genuinely
+    finer in-plane structure near the edge — not just a smoother *value* at
+    the same coarse spacing, but more *points*, each read from the sub-offset
+    nearest its own position.
+
+    ``coverage_grid`` (``r.coverage[label]`` when available — engine-recorded
+    runs only) is the engine's true continuous per-cell coverage fraction,
+    stored at each column's floor-contact (z-index 1) voxel before it gets
+    quantised to ``round(coverage·n_nominal)`` layers.  When given (and
+    ``coverage_sub`` is not), the profile plots this exact value at the
+    coarse voxel spacing — no reconstruction, no rounding error, and
+    correctly flags the ray-tested "band" even where quantisation rounded a
+    fractional value to exactly 0 or ``n_nominal`` layers.
+
+    Without either (older/un-recorded results), falls back to reconstructing
+    an approximate coverage from the floor thickness — the run of metal cells
+    starting at z-index 1 (the first cell above the substrate-interface cell)
+    divided by ``n_nominal``.  Columns whose thickness lands strictly between
+    0 and ``n_nominal`` are taken as the ray-tested band in this approximate
+    mode; flat columns at 1.0 or 0.0 were (almost certainly) never ray-tested.
 
     Returns ``(fig, band_widths)`` where ``band_widths`` [nm] lists the width
     of each contiguous band run visible in the plotted window.
     """
-    ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
     Nz = metal.shape[2]
-    if Nz >= 2:
+    n = max(1, int(n_nominal))
+    if coverage_sub is not None and Nz >= 2:
+        ns = max(1, round(np.sqrt(len(coverage_sub))))
+        ix, iy, sub_idx, s, inside = _oblique_columns_fine(r, angle_deg, offset, ns)
+        stacked = np.stack(coverage_sub, axis=0)        # (ns², Nx, Ny, Nz)
+        cov_raw = stacked[sub_idx, ix, iy, 1]            # floor-contact voxel only
+        has_cov = cov_raw >= 0.0
+        cov = np.where(has_cov, np.clip(cov_raw, 0.0, 1.0), 0.0)
+        in_band = has_cov & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
+    elif coverage_grid is not None and Nz >= 2:
+        ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
+        cov_raw = coverage_grid[ix, iy, 1]            # floor-contact voxel only
+        has_cov = cov_raw >= 0.0
+        cov = np.where(has_cov, np.clip(cov_raw, 0.0, 1.0), 0.0)
+        in_band = has_cov & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
+    elif Nz >= 2:
+        ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
         col = metal[ix, iy, 1:]                       # floor cells only
         first_gap = np.argmax(~col, axis=1)
         th = np.where(col.all(axis=1), col.shape[1], first_gap)
+        th = np.where(inside, th, 0)
+        cov = np.clip(th / n, 0.0, 1.0)
+        in_band = (th > 0) & (th < n)
     else:
-        th = np.zeros(len(s), dtype=int)
-    th = np.where(inside, th, 0)
-    n = max(1, int(n_nominal))
-    cov = np.clip(th / n, 0.0, 1.0)
-    in_band = (th > 0) & (th < n)
+        _, _, s, inside = _oblique_columns(r, angle_deg, offset)
+        cov = np.zeros(len(s)); in_band = np.zeros(len(s), bool)
+    cov = np.where(inside, cov, 0.0)
+    in_band = in_band & inside
 
     half = _zoom_half(r, view_half)
     hlo, hhi = view_center - half, view_center + half
     win = (s >= hlo) & (s <= hhi)
 
+    _ds = float(s[1] - s[0]) if len(s) > 1 else r.vox   # actual sample spacing
+                                                          # (vox/ns when fine-sampled)
     band_idx = np.where(in_band & win)[0]
     runs = []
     if len(band_idx):
         breaks = np.where(np.diff(band_idx) > 1)[0]
         runs = np.split(band_idx, breaks + 1)
-    band_widths = [float(s[run[-1]] - s[run[0]] + r.vox) for run in runs]
+    band_widths = [float(s[run[-1]] - s[run[0]] + _ds) for run in runs]
 
     fig, ax = plt.subplots(figsize=(7.6, 3.2), dpi=140)
     for run in runs:
-        ax.axvspan(s[run[0]] - r.vox / 2, s[run[-1]] + r.vox / 2,
+        ax.axvspan(s[run[0]] - _ds / 2, s[run[-1]] + _ds / 2,
                   color=_COLORS[C_AL2], alpha=0.20, lw=0, zorder=0)
     ax.plot(s[win], cov[win], drawstyle="steps-mid", color=_COLORS[C_AL1], lw=1.6)
     ax.axhline(1.0, color="#5a5f6b", lw=0.7, ls="--", zorder=1)
@@ -589,12 +739,91 @@ def render_coverage_profile(r: DepositionResult, metal: np.ndarray, n_nominal: i
     ax.set_xlabel(f"distance along slice  [nm]   (α = {angle_deg:.0f}°)")
     ax.set_ylabel("floor coverage fraction")
     ax.set_title("Soft-edge coverage profile" + (f" — {label}" if label else ""))
-    txt = ("band width: " + ", ".join(f"{w:.0f} nm" for w in band_widths)
-          if band_widths else "band width: none in view")
+    if coverage_sub is not None and Nz >= 2:
+        _mode = f"exact, {round(np.sqrt(len(coverage_sub)))}x fine"
+    elif coverage_grid is not None and Nz >= 2:
+        _mode = "exact"
+    else:
+        _mode = "reconstructed"
+    txt = (f"[{_mode}]  band width: " + ", ".join(f"{w:.0f} nm" for w in band_widths)
+          if band_widths else f"[{_mode}]  band width: none in view")
     ax.text(0.015, 0.94, txt, transform=ax.transAxes, fontsize=8.5, color="#c8c8c8",
            va="top", bbox=dict(boxstyle="round,pad=0.3", fc="#1c2030", ec="#3a3f4b"))
     fig.tight_layout()
     return fig, band_widths
+
+
+def render_coverage_cross_section(r: DepositionResult, metal: np.ndarray, n_nominal: int,
+                                  coverage_sub: list, angle_deg=0.0, offset=0.0,
+                                  view_half=None, view_center=0.0, label=""):
+    """2-D cross-section of one evaporation's floor metal, with the soft-edge
+    band drawn at its true lateral sub-voxel resolution (the ``ns²`` per-
+    sub-offset grids in ``coverage_sub`` — see ``render_coverage_profile``)
+    instead of one flat coarse-voxel-wide column.
+
+    The whole visible window is sampled at ``ns`` points per coarse voxel
+    (:func:`_oblique_columns_fine`) so every column in the image has the same
+    physical width — outside the band (no stored sub-offset data) a coarse
+    cell's single value is just repeated ``ns`` times, so that region looks
+    identical to today's cross-section, only relabelled into finer pixels.
+    Inside the band, each of the ``ns`` sub-columns gets its *own*
+    ``round(coverage·n_nominal)`` floor thickness, grown as a flat vertical
+    stack from the floor-contact voxel — this matches what
+    ``render_coverage_profile`` already reports for the band (a diagnostic
+    reconstruction), not the engine's true possibly-laterally-drifting growth
+    path, so treat it as showing the *taper shape*, not a substitute for the
+    main Cross-section tab's render.
+    """
+    ns = max(1, round(np.sqrt(len(coverage_sub))))
+    ix, iy, sub_idx, s, inside = _oblique_columns_fine(r, angle_deg, offset, ns)
+    Nz = metal.shape[2]
+    n = max(1, int(n_nominal))
+    zs = r.zs
+
+    stacked = np.stack(coverage_sub, axis=0)            # (ns², Nx, Ny, Nz)
+    cov_raw = stacked[sub_idx, ix, iy, 1] if Nz >= 2 else np.full(len(s), -1.0)
+    has_cov = cov_raw >= 0.0
+
+    col = metal[ix, iy, 1:] if Nz >= 2 else np.zeros((len(s), 0), bool)
+    if col.shape[1]:
+        first_gap = np.argmax(~col, axis=1)
+        th_coarse = np.where(col.all(axis=1), col.shape[1], first_gap)
+    else:
+        th_coarse = np.zeros(len(s), dtype=int)
+
+    target = np.where(has_cov, np.round(np.clip(cov_raw, 0.0, 1.0) * n), th_coarse)
+    target = np.where(inside, target, 0).astype(int)
+    target = np.clip(target, 0, Nz - 1)
+
+    cat = np.full((len(s), Nz), C_EMPTY, np.int8)
+    cat[:, 0] = C_SUBSTRATE
+    for col_i in np.where(target > 0)[0]:
+        cat[col_i, 1:1 + target[col_i]] = C_AL1
+
+    half = _zoom_half(r, view_half)
+    hlo, hhi = view_center - half, view_center + half
+    win = (s >= hlo) & (s <= hhi)
+    win_idx = np.where(win)[0]
+    in_band = has_cov & win
+    band_idx = np.where(in_band)[0]
+    runs = []
+    if len(band_idx):
+        breaks = np.where(np.diff(band_idx) > 1)[0]
+        runs = np.split(band_idx, breaks + 1)
+    _ds = float(s[1] - s[0]) if len(s) > 1 else r.vox
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.0), dpi=140)
+    vhi = float(zs[min(len(zs) - 1, max(1, int(np.max(target[win_idx]) if len(win_idx) else 1)) + 3)])
+    _draw(ax, cat, s, zs, f"distance along slice  [nm]   (α = {angle_deg:.0f}°)",
+         "z  [nm]", "Soft-edge fine cross-section" + (f" — {label}" if label else ""),
+         hlim=(hlo, hhi), vlim=(float(zs[0]), vhi))
+    for run in runs:
+        ax.axvspan(s[run[0]] - _ds / 2, s[run[-1]] + _ds / 2,
+                  color=_COLORS[C_JUNC], alpha=0.5, lw=0, zorder=2)
+    present = [c for c in sorted(np.unique(cat).tolist()) if c != C_EMPTY]
+    _legend(fig, present, oxide=False)
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
+    return fig
 
 
 def render_stages(r: DepositionResult, angle_deg=0.0, offset=0.0, junc_mask=None,

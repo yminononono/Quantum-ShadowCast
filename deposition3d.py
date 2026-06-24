@@ -274,6 +274,13 @@ class DepositionResult:
     films: dict = None        # trilayer sub-films: {"nb1","al2","al3","nb4"} → bool grid
     depo_order: np.ndarray = None   # int16 (Nx,Ny,Nz): global deposition step / −1
     depo_frames: list = None        # playback timeline: [{step,label,show_oxide,liftoff}]
+    coverage: dict = None           # soft-edge only: {evap label → float32 (Nx,Ny,Nz)},
+                                     # continuous pre-quantisation coverage fraction at
+                                     # each column's surface-contact voxel, -1 elsewhere
+    coverage_sub: dict = None       # soft_supersample>1 only: {evap label → list of
+                                     # ns² float32 (Nx,Ny,Nz) grids}, one per lateral
+                                     # sub-offset — the un-averaged detail `coverage`
+                                     # discards, for a genuinely finer in-plane render
 
     def idx_x(self, x):  return int(np.clip(np.searchsorted(self.xs, x), 0, len(self.xs) - 1))
     def idx_y(self, y):  return int(np.clip(np.searchsorted(self.ys, y), 0, len(self.ys) - 1))
@@ -320,8 +327,52 @@ def _plassys_dirs(theta, phi, pattern, size, L, K=24, seed=0):
     return dirs
 
 
+def _cloud_coverage(o, bi, bj, bk, soft, boxes, occ_mask, sub_offsets, on_pass,
+                    return_sub=False):
+    """Average lit-fraction over the source-cloud directions ``soft`` for a set
+    of surface-cell origins ``o``, optionally supersampled at ``sub_offsets``
+    lateral sub-positions within each cell (a smoother in-plane footprint
+    boundary — without it every cell is tested from its single centre point,
+    which aliases the boundary to the voxel grid).
+
+    Sidewall occlusion (``occ_mask``, via ``_occluded_mask``) is evaluated once
+    per ray at the cell's own integer indices, not per sub-offset: it marches
+    through ``occ_mask``'s integer voxel grid rather than continuous
+    coordinates, so sub-voxel positions don't apply to it the way they do to
+    the resist test (``_occluded``, continuous ray–box intersection).
+
+    ``return_sub`` additionally returns the per-sub-offset coverage (averaged
+    over the rays in ``soft`` only, NOT over ``sub_offsets``) as an
+    ``(len(o), len(sub_offsets))`` array — the un-averaged detail that lets a
+    renderer show each lateral sub-position's own value instead of the single
+    cell-average, for a genuinely finer in-plane picture near the edge."""
+    n_off = len(sub_offsets)
+    acc = np.zeros(len(o))
+    acc_sub = np.zeros((len(o), n_off)) if return_sub else None
+    n_tests = 0
+    for dk in soft:
+        side_ok = None
+        if occ_mask is not None:
+            side_ok = ~_occluded_mask(bi, bj, bk, dk, occ_mask)
+        for si, off in enumerate(sub_offsets):
+            lit_k = ~_occluded(o + off, -dk, boxes)
+            if side_ok is not None:
+                lit_k &= side_ok
+            acc += lit_k.astype(float)
+            if return_sub:
+                acc_sub[:, si] += lit_k.astype(float)
+            n_tests += 1
+        if on_pass is not None:
+            on_pass()                    # one tick per source ray (not per sub-sample)
+    cov = acc / n_tests
+    if return_sub:
+        return cov, acc_sub / max(1, len(soft))
+    return cov
+
+
 def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
-             record=False, on_pass=None, band_w=3):
+             record=False, on_pass=None, band_w=3, lateral_supersample=1,
+             return_cov=False):
     """Return bool grid of metal voxels for one evaporation.
 
     A cell receives metal if it is EMPTY, its beam-forward neighbour is solid
@@ -339,6 +390,17 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
     coverage per surface cell, and the grown film thickness is tapered to
     ``round(coverage·n)`` — so the penumbra (and any rounded resist lip) yields a
     tapered metal shoulder.  ``None`` ⇒ a single parallel beam (binary, unchanged).
+
+    ``lateral_supersample`` (only relevant when ``soft`` is set): sample an
+    ``n×n`` sub-grid of lateral (xy) offsets within each band cell for the
+    resist occlusion test instead of just the cell centre, smoothing the
+    in-plane footprint boundary at the cost of ``n²`` more ray-box tests.
+    ``1`` (default) ⇒ centre-point only, unchanged behaviour.
+
+    ``return_cov`` additionally returns the continuous per-cell coverage
+    fraction (before quantisation to an integer layer count) scattered into a
+    full-grid float array — see ``simulate()``'s ``coverage`` result field.
+    Off by default (no extra cost / memory when not wanted).
     """
     Nx, Ny, Nz = lab.shape
     solid = lab != EMPTY
@@ -377,8 +439,13 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
     ii, jj, kk = np.where(surface)
     if len(ii) == 0:
         m0 = np.zeros_like(solid)
+        empty_cov = (np.full(solid.shape, -1.0, np.float32), None)
+        if record and return_cov:
+            return m0, np.full(solid.shape, -1, np.int16), empty_cov
         if record:
             return m0, np.full(solid.shape, -1, np.int16)
+        if return_cov:
+            return m0, empty_cov
         return m0
 
     origins = np.stack([xs[ii], ys[jj], zs[kk]], axis=1)
@@ -405,7 +472,22 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
     cov = central_lit.astype(float)          # 1.0 lit, 0.0 shadowed
     oidx = np.empty(0, np.int64)
     cov_outer = np.empty(0)
+    ns = 1
+    want_sub = False
+    cov_sub_inner = None
+    cov_sub_outer = None
     if soft is not None:
+        # Lateral sub-sampling offsets for the resist test (xy only — z stays
+        # at the cell centre).  ns=1 ⇒ a single (0,0,0) offset, i.e. today's
+        # centre-point-only behaviour, unchanged.
+        ns = max(1, int(lateral_supersample))
+        if ns > 1:
+            off1d = ((np.arange(ns) + 0.5) / ns - 0.5) * vox
+            sx, sy = np.meshgrid(off1d, off1d)
+            sub_offsets = np.stack([sx.ravel(), sy.ravel(), np.zeros(ns * ns)], axis=1)
+        else:
+            sub_offsets = np.zeros((1, 3))
+
         # Penumbra: coverage differs from 1 only NEAR the shadow edge, so cast the
         # K source-cloud rays ONLY on lit cells within `band_w` voxels of a
         # shadowed surface cell.  Interior lit cells stay at coverage 1 (full
@@ -418,23 +500,24 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
             dark3 = _dilate6(dark3)
         band = central_lit & dark3[ii, jj, kk]        # lit cells near the edge
         bidx = np.where(band)[0]
+        # Per-sub-offset detail (one column of cov per lateral sub-position,
+        # not yet averaged together) — only built when both wanted (return_cov)
+        # and meaningful (ns>1); interior (non-band) cells default to 1.0,
+        # which is exact for every sub-offset there (same reasoning as `cov`'s
+        # own band-only restriction above).
+        want_sub = return_cov and ns > 1
+        cov_sub_inner = np.ones((N, ns * ns), np.float32) if want_sub else None
         if len(bidx):
             bo = origins[bidx]
             bi, bj, bk = ii[bidx], jj[bidx], kk[bidx]
-            acc = np.zeros(len(bidx))
-            for dk in soft:
-                # Sidewall occlusion is tested per-ray (using that ray's own
-                # `dk`), not the single nominal `d` — each source-cloud ray
-                # genuinely sees a different sidewall shadow, so folding this
-                # into the loop (rather than one binary cut applied after)
-                # keeps the penumbra's gradation instead of flattening it.
-                lit_k = ~_occluded(bo, -dk, boxes)
-                if occ_mask is not None:
-                    lit_k &= ~_occluded_mask(bi, bj, bk, dk, occ_mask)
-                acc += lit_k.astype(float)
-                if on_pass is not None:
-                    on_pass()                # one occlusion pass per source ray
-            cov[bidx] = acc / len(soft)
+            if want_sub:
+                cov_b, cov_sub_b = _cloud_coverage(bo, bi, bj, bk, soft, boxes, occ_mask,
+                                                   sub_offsets, on_pass, return_sub=True)
+                cov[bidx] = cov_b
+                cov_sub_inner[bidx] = cov_sub_b
+            else:
+                cov[bidx] = _cloud_coverage(bo, bi, bj, bk, soft, boxes, occ_mask,
+                                            sub_offsets, on_pass)
         elif on_pass is not None:
             for _ in soft:
                 on_pass()                    # keep the tick count consistent
@@ -454,21 +537,20 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
         outer_band = (~central_lit) & lit3[ii, jj, kk]   # shadow-side cells near the edge
         oidx = np.where(outer_band)[0]
         cov_outer = np.zeros(len(oidx))
+        cov_sub_outer = np.zeros((len(oidx), ns * ns), np.float32) if want_sub else None
         if len(oidx):
             oo = origins[oidx]
             # Distinct names from the `oi, oj, ok` built later (for the
             # target_outer/growth concatenation) — same cells, different
             # purpose, kept separate so neither shadows the other.
             oi_, oj_, ok_ = ii[oidx], jj[oidx], kk[oidx]
-            acc_o = np.zeros(len(oidx))
-            for dk in soft:
-                lit_k = ~_occluded(oo, -dk, boxes)
-                if occ_mask is not None:
-                    lit_k &= ~_occluded_mask(oi_, oj_, ok_, dk, occ_mask)
-                acc_o += lit_k.astype(float)
-                if on_pass is not None:
-                    on_pass()
-            cov_outer = acc_o / len(soft)
+            if want_sub:
+                cov_outer, cov_sub_outer = _cloud_coverage(
+                    oo, oi_, oj_, ok_, soft, boxes, occ_mask, sub_offsets, on_pass,
+                    return_sub=True)
+            else:
+                cov_outer = _cloud_coverage(oo, oi_, oj_, ok_, soft, boxes, occ_mask,
+                                            sub_offsets, on_pass)
         elif on_pass is not None:
             for _ in soft:
                 on_pass()                    # keep the tick count consistent
@@ -486,6 +568,9 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
 
     gi = np.concatenate([gi, oi]); gj = np.concatenate([gj, oj]); gk = np.concatenate([gk, ok])
     target = np.concatenate([target_inner, target_outer])
+    cov_all = np.concatenate([cov[keep], cov_outer])   # parallel to gi/gj/gk/target
+    if want_sub:
+        cov_sub_all = np.concatenate([cov_sub_inner[keep], cov_sub_outer], axis=0)
 
     metal = np.zeros_like(solid)
     # step-0 (surface-contact) placement is gated on target>=1: inner cells are
@@ -497,6 +582,23 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
     order = np.full(solid.shape, -1, np.int16) if record else None
     if record:
         order[gi_p, gj_p, gk_p] = 0          # surface-contact layer = step 0
+    cov_grid = None
+    cov_sub_grids = None
+    if return_cov:
+        # Continuous coverage (pre-quantisation), one value per column at its
+        # surface-contact (step-0) voxel — the same fraction `target` above was
+        # rounded from, kept at full precision instead of discarded.
+        cov_grid = np.full(solid.shape, -1.0, np.float32)
+        cov_grid[gi_p, gj_p, gk_p] = cov_all[place]
+        if want_sub:
+            # One grid per lateral sub-offset (ns² of them) — the un-averaged
+            # detail a renderer can use to show genuinely finer in-plane
+            # structure near the edge instead of one value per coarse voxel.
+            cov_sub_grids = []
+            for sidx in range(ns * ns):
+                g = np.full(solid.shape, -1.0, np.float32)
+                g[gi_p, gj_p, gk_p] = cov_sub_all[place, sidx]
+                cov_sub_grids.append(g)
 
     # grow film thickness back toward source; the soft edge tapers each column to
     # round(coverage·n) so the penumbra reads as a rounded metal shoulder.
@@ -511,7 +613,14 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
         metal[ci[free], cj[free], ck[free]] = True
         if record:
             order[ci[free], cj[free], ck[free]] = mstep
-    return (metal, order) if record else metal
+
+    if record and return_cov:
+        return metal, order, (cov_grid, cov_sub_grids)
+    if record:
+        return metal, order
+    if return_cov:
+        return metal, (cov_grid, cov_sub_grids)
+    return metal
 
 
 def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
@@ -610,17 +719,25 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     # in deposition order; `_ox_after` = index of the evap after which oxidation
     # happens (oxide appears in frames past it).
     _rec = []
+    _cov_rec = {}                            # label -> continuous coverage grid
+    _cov_sub_rec = {}                         # label -> list of ns² per-sub-offset grids
+    _lat_sub = getattr(p, "soft_supersample", 1)
 
     def _dep(lab_, d_, t_, occ_, soft_, label):
         op = _on_pass_for(label)
         if record:
-            m, o = _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
-                            occ_mask=occ_, soft=soft_, record=True, on_pass=op,
-                            band_w=_band_w)
+            m, o, (cg, csub) = _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
+                                        occ_mask=occ_, soft=soft_, record=True, return_cov=True,
+                                        on_pass=op, band_w=_band_w, lateral_supersample=_lat_sub)
             _rec.append((o, label, float(t_)))
+            if soft_ is not None:
+                _cov_rec[label] = cg
+                if csub is not None:
+                    _cov_sub_rec[label] = csub
             return m
         return _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
-                        occ_mask=occ_, soft=soft_, on_pass=op, band_w=_band_w)
+                        occ_mask=occ_, soft=soft_, on_pass=op, band_w=_band_w,
+                        lateral_supersample=_lat_sub)
 
     if not trilayer:
         # ── Bilayer: evap1 → oxidation → evap2 ────────────────────
@@ -693,7 +810,8 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
                 junc_xmax=junc_xmax, junc_ymax=junc_ymax, mode=p.mode,
                 stack="Trilayer" if trilayer else "Bilayer",
                 tri_dirs=tri_dirs,
-                max_cells=max_cells, min_vox=min_vox)
+                max_cells=max_cells, min_vox=min_vox,
+                soft_supersample=_lat_sub)
 
     # ── Playback timeline (when recording) ────────────────────────
     depo_order = depo_frames = None
@@ -721,7 +839,9 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     return DepositionResult(xs, ys, zs, vox, lab, al1, al2, alox, z_top, meta,
                             stack="Trilayer" if trilayer else "Bilayer",
                             films=films, depo_order=depo_order,
-                            depo_frames=depo_frames)
+                            depo_frames=depo_frames,
+                            coverage=(_cov_rec or None) if record else None,
+                            coverage_sub=(_cov_sub_rec or None) if record else None)
 
 
 # ════════════════════════════════════════════════════════════════

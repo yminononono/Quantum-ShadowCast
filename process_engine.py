@@ -59,6 +59,8 @@ class ProcessParams:
     soft_size:   float = 12.0   # source spot size on the target [mm] (recipe ~10–15)
     soft_L:      float = 550.0  # source→sample throw distance [mm] (Plassys ~550)
     soft_rays:   int = 24       # source-cloud ray count K (finer ⇒ smoother taper, slower)
+    soft_supersample: int = 1   # lateral n×n sub-sampling per band cell (smoother in-plane
+                                 # footprint edge; 1 = centre-point only, unchanged)
 
     # ── Evaporation 1 ─────────────────────────────────────────
     # Uniaxial tilt ±24° (same azimuth φ, opposite polar θ); 30 nm Al each.

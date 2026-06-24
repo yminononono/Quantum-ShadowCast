@@ -296,6 +296,10 @@ def _apply_loaded_params(pdict, raydict):
         v = int(pdict["soft_rays"])
         if 4 <= v <= 200:
             st.session_state["soft_rays"] = v; applied += 1
+    if pdict.get("soft_supersample") is not None:
+        v = int(pdict["soft_supersample"])
+        if 1 <= v <= 4:
+            st.session_state["soft_supersample"] = v; applied += 1
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -433,6 +437,7 @@ _PARAM_DEFAULTS = {
     "soft_edge": False,
     "soft_pattern": "Rotating line (disk, 1/ρ)",   # _beam_pattern_controls selectbox label
     "soft_size": 12.0, "soft_sigma": 2.0, "soft_L": 550.0, "soft_rays": 24,
+    "soft_supersample": 1,
     "res_level": "Standard (fast)",
 }
 
@@ -762,7 +767,7 @@ with st.sidebar:
              "thickness near the shadow edge (penumbra ≈ source size / L).  "
              "Combined with a rounded resist lip this gives a rounded metal edge.  "
              "Visible at finer resolution (film several voxels thick); slower.")
-    soft_pat, soft_size, soft_L, soft_rays = "rotline", 12.0, 550.0, 24
+    soft_pat, soft_size, soft_L, soft_rays, soft_supersample = "rotline", 12.0, 550.0, 24, 1
     if soft_edge:
         soft_pat, soft_size = _beam_pattern_controls("soft")
         st.session_state.setdefault("soft_L", 550.0)
@@ -777,13 +782,23 @@ with st.sidebar:
                  "smoother taper / finer coverage gradation (coverage is only "
                  "resolvable in steps of 1/K), at a roughly linear cost in "
                  "soft-edge runtime."))
+        st.session_state.setdefault("soft_supersample", 1)
+        soft_supersample = int(st.number_input(
+            "Lateral sub-sampling n (n×n per cell)", 1, 4, step=1, key="soft_supersample",
+            help="Sample an n×n sub-grid of lateral (xy) positions within each "
+                 "band voxel for the resist-occlusion test, instead of just the "
+                 "voxel centre — smooths the in-plane footprint boundary at the "
+                 "edge.  1 = centre point only (unchanged).  Cost scales as n² "
+                 "on top of the ray count above; does not change the voxel grid "
+                 "or thickness-step resolution (that's set by grid density)."))
         _half = np.degrees(np.arctan((soft_size / 2.0) / max(soft_L, 1e-9)))
         st.caption(f"Source: {soft_pat} • {soft_size:.1f} mm at {soft_L:.0f} mm • "
-                   f"{soft_rays} rays ⇒ angular half-size ≈ {_half:.2f}°  "
-                   f"(coverage resolution ≈ 1/{soft_rays}).")
-        if soft_rays > 48:
-            st.caption("⚠ High ray count — soft-edge cost scales roughly "
-                       "linearly with K.")
+                   f"{soft_rays} rays × {soft_supersample}² sub-samples ⇒ angular "
+                   f"half-size ≈ {_half:.2f}°  (coverage resolution ≈ "
+                   f"1/{soft_rays * soft_supersample * soft_supersample}).")
+        if soft_rays > 48 or soft_supersample > 2:
+            st.caption("⚠ High ray count / sub-sampling — soft-edge cost scales "
+                       "roughly linearly with rays × n².")
 
     st.divider()
     st.subheader("Display")
@@ -830,7 +845,7 @@ params = ProcessParams(
     tri_angle4=tri_angle4, tri_phi4=tri_phi4,
     sidewall=sidewall,
     soft_edge=soft_edge, soft_pattern=soft_pat, soft_size=soft_size, soft_L=soft_L,
-    soft_rays=soft_rays,
+    soft_rays=soft_rays, soft_supersample=soft_supersample,
 )
 # ─── 3D physical deposition engine (source of truth) ──────────────
 def _engine_cached(ekey):
@@ -878,7 +893,7 @@ def _ekey_for(p):
             getattr(p, "resist_round", 0.0),
             getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
-            getattr(p, "soft_rays", 24))
+            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))
 
 @st.cache_data(show_spinner=False)
 def _mc_area(sig, _p):
@@ -1083,9 +1098,15 @@ with tab1:
         st.pyplot(figs, use_container_width=True)
         plt.close(figs)
         st.markdown("**Combined slice** (all layers, junction highlighted)")
+        _show_vox_grid = st.checkbox(
+            "Show voxel outlines", key="cs_voxel_grid",
+            help="Outline every deposited-metal voxel with a thin white "
+                 "line, so the actual voxel size/granularity of the metal "
+                 "is visible directly on the image.")
         figc = vv.render_cross_section(eng, slice_angle, slice_pos, eng_jm,
                                        view_half=cs_half, zmax=cs_zmax,
-                                       view_center=cs_xc, zmin=_cs_zmin)
+                                       view_center=cs_xc, zmin=_cs_zmin,
+                                       show_voxel_grid=_show_vox_grid)
         st.pyplot(figc, use_container_width=True)
         plt.close(figc)
 
@@ -1315,9 +1336,12 @@ with tab_play:
         _cov_metal, _cov_tnom = next((m, t) for lbl, m, t in _cov_choices
                                      if lbl == _cov_lbl)
         _cov_n = max(1, round(_cov_tnom / eng.vox))
+        _cov_grid = (eng.coverage or {}).get(_cov_lbl)
+        _cov_sub = (eng.coverage_sub or {}).get(_cov_lbl)
         with st.spinner("Rendering coverage profile..."):
             figc, _band_widths = vv.render_coverage_profile(
-                eng, _cov_metal, _cov_n, angle_deg=slice_angle, offset=slice_pos,
+                eng, _cov_metal, _cov_n, coverage_grid=_cov_grid, coverage_sub=_cov_sub,
+                angle_deg=slice_angle, offset=slice_pos,
                 view_half=cs_half, view_center=cs_xc, label=_cov_lbl)
             st.pyplot(figc, use_container_width=True)
             plt.close(figc)
@@ -1332,6 +1356,23 @@ with tab_play:
             f"{_measured} nm  •  voxel = {eng.vox:.1f} nm  "
             f"(need several voxels across the band to resolve the taper — widen the "
             f"source size or raise the grid density if it looks like a single step).")
+        if _cov_sub is not None:
+            if st.checkbox(
+                "Show fine cross-section (lateral sub-voxel detail in the band)",
+                key="cov_xsection_show",
+                help="Redraws this evaporation's floor metal at the "
+                     "soft_supersample resolution instead of the coarse voxel "
+                     "grid — only the band (highlighted) is genuinely finer; "
+                     "elsewhere a coarse cell's value is just repeated. "
+                     "Diagnostic only: each fine column is a flat vertical "
+                     "stack from the floor, not the engine's true growth path."):
+                with st.spinner("Rendering fine cross-section..."):
+                    figx = vv.render_coverage_cross_section(
+                        eng, _cov_metal, _cov_n, _cov_sub,
+                        angle_deg=slice_angle, offset=slice_pos,
+                        view_half=cs_half, view_center=cs_xc, label=_cov_lbl)
+                    st.pyplot(figx, use_container_width=True)
+                    plt.close(figx)
 
 # ═══ TAB 3: φ Junction View ══════════════════════════════════════
 with tab3:
@@ -1479,7 +1520,7 @@ with tab_scan:
                 getattr(p, "sidewall", False), getattr(p, "resist_round", 0.0),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
-            getattr(p, "soft_rays", 24))
+            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))
 
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
@@ -1760,7 +1801,7 @@ with tab_wafer:
                 getattr(p, "resist_round", 0.0),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
-            getattr(p, "soft_rays", 24))
+            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))
 
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):
