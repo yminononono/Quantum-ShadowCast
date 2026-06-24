@@ -76,6 +76,48 @@ def _frame_boxes(hx, hy, z0, z1, R):
     ]
 
 
+def _cross_boxes(A, B, R, z0, z1):
+    """Exact 8-box complement of two centred, perpendicular strips sharing the
+    same reach (Manhattan's resist cross): A=(-arm,arm,-hyA,hyA) ∪
+    B=(-hxB,hxB,-arm,arm).  Equivalent to _solid_from_openings([A, B], ...)
+    but with 8 boxes instead of ~20."""
+    arm = A[1]; hyA = A[3]; hxB = B[1]
+    return [
+        _box(-R, R, arm, R, z0, z1),          # top strip
+        _box(-R, R, -R, -arm, z0, z1),        # bottom strip
+        _box(-R, -arm, -arm, arm, z0, z1),    # left strip
+        _box(arm, R, -arm, arm, z0, z1),      # right strip
+        _box(-arm, -hxB, hyA, arm, z0, z1),   # 4 corners
+        _box(hxB, arm, hyA, arm, z0, z1),
+        _box(-arm, -hxB, -arm, -hyA, z0, z1),
+        _box(hxB, arm, -arm, -hyA, z0, z1),
+    ]
+
+
+def _rect_boxes(openings, R, z0, z1):
+    """Cheaper exact equivalents of _solid_from_openings for the two opening
+    shapes this module ever builds (Dolan's single centred rectangle;
+    Manhattan's two centred perpendicular strips sharing the same reach),
+    falling back to the general method for anything else."""
+    if len(openings) == 1:
+        x0, x1, y0, y1 = openings[0]
+        hx, hy = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+        if abs(x0 + x1) < 1e-6 and abs(y0 + y1) < 1e-6:
+            return _frame_boxes(hx, hy, z0, z1, R)
+    elif len(openings) == 2:
+        rects = openings
+        centred = all(abs(x0 + x1) < 1e-6 and abs(y0 + y1) < 1e-6
+                      for x0, x1, y0, y1 in rects)
+        if centred:
+            (x0a, x1a, y0a, y1a) = rects[0]
+            (x0b, x1b, y0b, y1b) = rects[1]
+            if x1a > y1a and y1b > x1b and abs(x1a - y1b) < 1e-6:
+                return _cross_boxes(rects[0], rects[1], R, z0, z1)
+            if y1a > x1a and x1b > y1b and abs(y1a - x1b) < 1e-6:
+                return _cross_boxes(rects[1], rects[0], R, z0, z1)
+    return _solid_from_openings(openings, R, z0, z1)
+
+
 def _layer_boxes(open_rects, R, z0, z1, r=0.0, round_top=False, round_bot=False):
     """Complement of `open_rects` in [-R,R]² over [z0,z1], with the opening
     optionally flared by a radius-`r` quarter-round at its top (z1) and/or bottom
@@ -87,7 +129,7 @@ def _layer_boxes(open_rects, R, z0, z1, r=0.0, round_top=False, round_bot=False)
     """
     rr = float(max(0.0, r))
     if rr <= 0.0 or not (round_top or round_bot):
-        return _solid_from_openings(open_rects, R, z0, z1)
+        return _rect_boxes(open_rects, R, z0, z1)
     faces = int(round_top) + int(round_bot)
     rr = min(rr, (z1 - z0) / faces)                        # keep the fillets apart
     K = int(np.clip(round(rr / 5.0), 10, 20))              # ~5 nm ledges; smooth circle
@@ -99,17 +141,17 @@ def _layer_boxes(open_rects, R, z0, z1, r=0.0, round_top=False, round_bot=False)
     zlo = z0 + (rr if round_bot else 0.0)
     zhi = z1 - (rr if round_top else 0.0)
     if zhi > zlo:                                           # nominal middle
-        boxes += _solid_from_openings(open_rects, R, zlo, zhi)
+        boxes += _rect_boxes(open_rects, R, zlo, zhi)
     if round_top:
         for k in range(K):
             za, zb = z1 - rr + k * rr / K, z1 - rr + (k + 1) * rr / K
             e = rr - np.sqrt(max(rr * rr - (0.5 * (za + zb) - (z1 - rr)) ** 2, 0.0))
-            boxes += _solid_from_openings(_exp(open_rects, e), R, za, zb)
+            boxes += _rect_boxes(_exp(open_rects, e), R, za, zb)
     if round_bot:
         for k in range(K):
             za, zb = z0 + k * rr / K, z0 + (k + 1) * rr / K
             e = rr - np.sqrt(max(rr * rr - ((z0 + rr) - 0.5 * (za + zb)) ** 2, 0.0))
-            boxes += _solid_from_openings(_exp(open_rects, e), R, za, zb)
+            boxes += _rect_boxes(_exp(open_rects, e), R, za, zb)
     return boxes
 
 
@@ -180,12 +222,12 @@ def build_occluders(p: ProcessParams):
         B_u = (-wB / 2 - u, wB / 2 + u, -arm, arm)
         rr = getattr(p, "resist_round", 0.0)
         if rr <= 0.0:
-            boxes = _solid_from_openings([A_u, B_u], R, 0.0, t_lo)   # lower (undercut)
-            boxes += _solid_from_openings([A, B], R, t_lo, z_top)    # upper (imaging)
+            boxes = _rect_boxes([A_u, B_u], R, 0.0, t_lo)   # lower (undercut)
+            boxes += _rect_boxes([A, B], R, t_lo, z_top)    # upper (imaging)
         else:
             # Rounded resist: only the upper (imaging) layer is filleted — its top
             # lip and its bottom face at the interface.  The lower layer stays sharp.
-            boxes = _solid_from_openings([A_u, B_u], R, 0.0, t_lo)
+            boxes = _rect_boxes([A_u, B_u], R, 0.0, t_lo)
             boxes += _layer_boxes([A, B], R, t_lo, z_top, rr,
                                   round_top=True, round_bot=True)
         return boxes, R, z_top, z_top, t_lo    # z_split = undercut/imaging interface
