@@ -612,8 +612,8 @@ class DepositionResult:
     coverage: dict = None           # soft-edge only: {evap label → float32 (Nx,Ny,Nz)},
                                      # continuous pre-quantisation coverage fraction at
                                      # each column's surface-contact voxel, -1 elsewhere
-    coverage_sub: dict = None       # soft_supersample>1 only: {evap label → list of
-                                     # ns² float32 (Nx,Ny,Nz) grids}, one per lateral
+    coverage_sub: dict = None       # soft_supersample_xy>1 only: {evap label → list of
+                                     # n_lat float32 (Nx,Ny,Nz) grids}, one per lateral
                                      # sub-offset — the un-averaged detail `coverage`
                                      # discards, for a genuinely finer in-plane render
 
@@ -674,12 +674,13 @@ def _plassys_dirs(theta, phi, pattern, size, L, K=24, seed=0):
 
 
 def _cloud_coverage(o, bi, bj, bk, soft, boxes, rounded, occ_mask, sub_offsets, on_pass,
-                    return_sub=False):
+                    return_sub=False, n_xy=None):
     """Average lit-fraction over the source-cloud directions ``soft`` for a set
     of surface-cell origins ``o``, optionally supersampled at ``sub_offsets``
-    lateral sub-positions within each cell (a smoother in-plane footprint
-    boundary — without it every cell is tested from its single centre point,
-    which aliases the boundary to the voxel grid).
+    lateral/z sub-positions within each cell (a smoother in-plane footprint
+    boundary and/or through-thickness taper — without it every cell is tested
+    from its single centre point, which aliases the boundary to the voxel
+    grid).
 
     Sidewall occlusion (``occ_mask``, via ``_occluded_mask``) is evaluated once
     per ray at the cell's own integer indices, not per sub-offset: it marches
@@ -689,12 +690,20 @@ def _cloud_coverage(o, bi, bj, bk, soft, boxes, rounded, occ_mask, sub_offsets, 
 
     ``return_sub`` additionally returns the per-sub-offset coverage (averaged
     over the rays in ``soft`` only, NOT over ``sub_offsets``) as an
-    ``(len(o), len(sub_offsets))`` array — the un-averaged detail that lets a
-    renderer show each lateral sub-position's own value instead of the single
-    cell-average, for a genuinely finer in-plane picture near the edge."""
+    ``(len(o), n_xy)`` array — the un-averaged detail that lets a renderer show
+    each lateral sub-position's own value instead of the single cell-average,
+    for a genuinely finer in-plane picture near the edge.  When ``sub_offsets``
+    combines lateral AND z sub-positions (see ``_deposit``), this detail stays
+    indexed and averaged purely over the LATERAL dimension — z is folded into
+    each lateral bucket's average.  This requires ``sub_offsets`` laid out x-y
+    fastest / z slowest (see ``_deposit``); ``n_xy`` is the lateral bucket
+    count needed to do the fold (``None`` ⇒ no z dimension, falls back to
+    ``len(sub_offsets)``, i.e. today's behaviour unchanged)."""
     n_off = len(sub_offsets)
+    n_xy = n_off if n_xy is None else n_xy
+    n_z = max(1, n_off // n_xy)
     acc = np.zeros(len(o))
-    acc_sub = np.zeros((len(o), n_off)) if return_sub else None
+    acc_sub = np.zeros((len(o), n_xy)) if return_sub else None
     n_tests = 0
     for dk in soft:
         side_ok = None
@@ -706,19 +715,19 @@ def _cloud_coverage(o, bi, bj, bk, soft, boxes, rounded, occ_mask, sub_offsets, 
                 lit_k &= side_ok
             acc += lit_k.astype(float)
             if return_sub:
-                acc_sub[:, si] += lit_k.astype(float)
+                acc_sub[:, si % n_xy] += lit_k.astype(float)   # fold z into its xy bucket
             n_tests += 1
         if on_pass is not None:
             on_pass()                    # one tick per source ray (not per sub-sample)
     cov = acc / n_tests
     if return_sub:
-        return cov, acc_sub / max(1, len(soft))
+        return cov, acc_sub / max(1, len(soft) * n_z)
     return cov
 
 
 def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None, soft=None,
              record=False, on_pass=None, band_w=3, lateral_supersample=1,
-             return_cov=False):
+             z_supersample=1, return_cov=False):
     """Return bool grid of metal voxels for one evaporation.
 
     A cell receives metal if it is EMPTY, its beam-forward neighbour is solid
@@ -742,6 +751,18 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
     resist occlusion test instead of just the cell centre, smoothing the
     in-plane footprint boundary at the cost of ``n²`` more ray-box tests.
     ``1`` (default) ⇒ centre-point only, unchanged behaviour.
+
+    ``z_supersample`` (only relevant when ``soft`` is set): sample ``n`` more
+    offsets through each band cell's z-extent, in addition to the lateral grid
+    above, smoothing the through-thickness taper at a further linear cost in
+    ``n``.  ``1`` (default) ⇒ cell-centre z only, unchanged behaviour.  The
+    fine-render diagnostic (``coverage_sub`` / ``return_cov``'s sub-offset
+    detail) stays indexed by the LATERAL grid only — z-offsets are averaged
+    into each lateral bucket transparently, so that detail always has exactly
+    ``lateral_supersample²`` entries regardless of ``z_supersample`` (the
+    in-plane fine cross-section diagnostic does not show through-thickness
+    sub-voxel detail; only the main coverage/thickness calculation below uses
+    the z sub-samples).
 
     ``return_cov`` additionally returns the continuous per-cell coverage
     fraction (before quantisation to an integer layer count) scattered into a
@@ -818,19 +839,28 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
     cov = central_lit.astype(float)          # 1.0 lit, 0.0 shadowed
     oidx = np.empty(0, np.int64)
     cov_outer = np.empty(0)
-    ns = 1
+    ns_xy = 1
     want_sub = False
     cov_sub_inner = None
     cov_sub_outer = None
     if soft is not None:
-        # Lateral sub-sampling offsets for the resist test (xy only — z stays
-        # at the cell centre).  ns=1 ⇒ a single (0,0,0) offset, i.e. today's
-        # centre-point-only behaviour, unchanged.
-        ns = max(1, int(lateral_supersample))
-        if ns > 1:
-            off1d = ((np.arange(ns) + 0.5) / ns - 0.5) * vox
+        # Lateral (xy) and z sub-sampling offsets for the resist test, combined
+        # into one flattened (dx,dy,dz) list laid out x-y FASTEST, z SLOWEST —
+        # i.e. the n_lat-sized lateral pattern repeats unchanged once per
+        # z-sample.  `_cloud_coverage`'s per-lateral-bucket fold (`si % n_xy`)
+        # depends on exactly this ordering.  ns_xy=ns_z=1 ⇒ a single (0,0,0)
+        # offset, i.e. today's centre-point-only behaviour, unchanged.
+        ns_xy = max(1, int(lateral_supersample))
+        ns_z = max(1, int(z_supersample))
+        n_lat = ns_xy * ns_xy
+        if ns_xy > 1 or ns_z > 1:
+            off1d = ((np.arange(ns_xy) + 0.5) / ns_xy - 0.5) * vox
+            offz  = ((np.arange(ns_z) + 0.5) / ns_z - 0.5) * vox
             sx, sy = np.meshgrid(off1d, off1d)
-            sub_offsets = np.stack([sx.ravel(), sy.ravel(), np.zeros(ns * ns)], axis=1)
+            xy_flat = np.stack([sx.ravel(), sy.ravel()], axis=1)      # (n_lat, 2)
+            sub_offsets = np.zeros((n_lat * ns_z, 3))
+            sub_offsets[:, :2] = np.tile(xy_flat, (ns_z, 1))           # xy fastest
+            sub_offsets[:, 2]  = np.repeat(offz, n_lat)                # z slowest
         else:
             sub_offsets = np.zeros((1, 3))
 
@@ -848,23 +878,24 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
         bidx = np.where(band)[0]
         # Per-sub-offset detail (one column of cov per lateral sub-position,
         # not yet averaged together) — only built when both wanted (return_cov)
-        # and meaningful (ns>1); interior (non-band) cells default to 1.0,
+        # and meaningful (ns_xy>1); interior (non-band) cells default to 1.0,
         # which is exact for every sub-offset there (same reasoning as `cov`'s
-        # own band-only restriction above).
-        want_sub = return_cov and ns > 1
-        cov_sub_inner = np.ones((N, ns * ns), np.float32) if want_sub else None
+        # own band-only restriction above).  Sized at the lateral-only count
+        # `n_lat`, NOT `len(sub_offsets)` — z is folded in by `_cloud_coverage`.
+        want_sub = return_cov and ns_xy > 1
+        cov_sub_inner = np.ones((N, n_lat), np.float32) if want_sub else None
         if len(bidx):
             bo = origins[bidx]
             bi, bj, bk = ii[bidx], jj[bidx], kk[bidx]
             if want_sub:
                 cov_b, cov_sub_b = _cloud_coverage(bo, bi, bj, bk, soft, boxes, rounded,
                                                    occ_mask, sub_offsets, on_pass,
-                                                   return_sub=True)
+                                                   return_sub=True, n_xy=n_lat)
                 cov[bidx] = cov_b
                 cov_sub_inner[bidx] = cov_sub_b
             else:
                 cov[bidx] = _cloud_coverage(bo, bi, bj, bk, soft, boxes, rounded, occ_mask,
-                                            sub_offsets, on_pass)
+                                            sub_offsets, on_pass, n_xy=n_lat)
         elif on_pass is not None:
             for _ in soft:
                 on_pass()                    # keep the tick count consistent
@@ -884,7 +915,7 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
         outer_band = (~central_lit) & lit3[ii, jj, kk]   # shadow-side cells near the edge
         oidx = np.where(outer_band)[0]
         cov_outer = np.zeros(len(oidx))
-        cov_sub_outer = np.zeros((len(oidx), ns * ns), np.float32) if want_sub else None
+        cov_sub_outer = np.zeros((len(oidx), n_lat), np.float32) if want_sub else None
         if len(oidx):
             oo = origins[oidx]
             # Distinct names from the `oi, oj, ok` built later (for the
@@ -894,10 +925,10 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
             if want_sub:
                 cov_outer, cov_sub_outer = _cloud_coverage(
                     oo, oi_, oj_, ok_, soft, boxes, rounded, occ_mask, sub_offsets, on_pass,
-                    return_sub=True)
+                    return_sub=True, n_xy=n_lat)
             else:
                 cov_outer = _cloud_coverage(oo, oi_, oj_, ok_, soft, boxes, rounded, occ_mask,
-                                            sub_offsets, on_pass)
+                                            sub_offsets, on_pass, n_xy=n_lat)
         elif on_pass is not None:
             for _ in soft:
                 on_pass()                    # keep the tick count consistent
@@ -938,11 +969,11 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
         cov_grid = np.full(solid.shape, -1.0, np.float32)
         cov_grid[gi_p, gj_p, gk_p] = cov_all[place]
         if want_sub:
-            # One grid per lateral sub-offset (ns² of them) — the un-averaged
+            # One grid per lateral sub-offset (n_lat of them) — the un-averaged
             # detail a renderer can use to show genuinely finer in-plane
             # structure near the edge instead of one value per coarse voxel.
             cov_sub_grids = []
-            for sidx in range(ns * ns):
+            for sidx in range(n_lat):
                 g = np.full(solid.shape, -1.0, np.float32)
                 g[gi_p, gj_p, gk_p] = cov_sub_all[place, sidx]
                 cov_sub_grids.append(g)
@@ -1067,15 +1098,17 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     # happens (oxide appears in frames past it).
     _rec = []
     _cov_rec = {}                            # label -> continuous coverage grid
-    _cov_sub_rec = {}                         # label -> list of ns² per-sub-offset grids
-    _lat_sub = getattr(p, "soft_supersample", 1)
+    _cov_sub_rec = {}                         # label -> list of n_lat per-sub-offset grids
+    _lat_sub = getattr(p, "soft_supersample_xy", 1)
+    _z_sub = getattr(p, "soft_supersample_z", 1)
 
     def _dep(lab_, d_, t_, occ_, soft_, label):
         op = _on_pass_for(label)
         if record:
             m, o, (cg, csub) = _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes, rounded,
                                         occ_mask=occ_, soft=soft_, record=True, return_cov=True,
-                                        on_pass=op, band_w=_band_w, lateral_supersample=_lat_sub)
+                                        on_pass=op, band_w=_band_w, lateral_supersample=_lat_sub,
+                                        z_supersample=_z_sub)
             _rec.append((o, label, float(t_)))
             if soft_ is not None:
                 _cov_rec[label] = cg
@@ -1084,7 +1117,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
             return m
         return _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes, rounded,
                         occ_mask=occ_, soft=soft_, on_pass=op, band_w=_band_w,
-                        lateral_supersample=_lat_sub)
+                        lateral_supersample=_lat_sub, z_supersample=_z_sub)
 
     if not trilayer:
         # ── Bilayer: evap1 → oxidation → evap2 ────────────────────
@@ -1158,7 +1191,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
                 stack="Trilayer" if trilayer else "Bilayer",
                 tri_dirs=tri_dirs,
                 max_cells=max_cells, min_vox=min_vox,
-                soft_supersample=_lat_sub,
+                soft_supersample_xy=_lat_sub, soft_supersample_z=_z_sub,
                 resist_round=getattr(p, "resist_round", 0.0), rounded_geom=rounded)
 
     # ── Playback timeline (when recording) ────────────────────────

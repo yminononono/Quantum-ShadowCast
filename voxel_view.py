@@ -366,7 +366,7 @@ def _zoom_half(r, view_half=None):
     """
     grid_R = r.meta.get("grid_R", r.meta["R"])
     if view_half is not None:
-        return float(np.clip(view_half, 50.0, grid_R))
+        return float(np.clip(view_half, 2.0, grid_R))
     jxm = r.meta.get("junc_xmax", r.meta["R"])
     jym = r.meta.get("junc_ymax", r.meta["R"])
     half = max(jxm, jym)
@@ -657,7 +657,7 @@ def render_coverage_profile(r: DepositionResult, metal: np.ndarray, n_nominal: i
     voxels (``round(t_metal / r.vox)``).
 
     ``coverage_sub`` (``r.coverage_sub[label]`` — only set when the run used
-    ``soft_supersample>1``) is a list of ``ns²`` per-lateral-sub-offset
+    ``soft_supersample_xy>1``) is a list of ``ns²`` per-lateral-sub-offset
     coverage grids: the un-averaged detail behind ``coverage_grid``.  When
     given, the slice is sampled at ``ns`` points per coarse voxel instead of
     one (see :func:`_oblique_columns_fine`), so the profile shows genuinely

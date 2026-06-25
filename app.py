@@ -298,10 +298,14 @@ def _apply_loaded_params(pdict, raydict):
         v = int(pdict["soft_rays"])
         if 4 <= v <= 200:
             st.session_state["soft_rays"] = v; applied += 1
-    if pdict.get("soft_supersample") is not None:
-        v = int(pdict["soft_supersample"])
-        if 1 <= v <= 4:
-            st.session_state["soft_supersample"] = v; applied += 1
+    if pdict.get("soft_supersample_xy") is not None:
+        v = int(pdict["soft_supersample_xy"])
+        if 1 <= v <= 10:
+            st.session_state["soft_supersample_xy"] = v; applied += 1
+    if pdict.get("soft_supersample_z") is not None:
+        v = int(pdict["soft_supersample_z"])
+        if 1 <= v <= 10:
+            st.session_state["soft_supersample_z"] = v; applied += 1
     if raydict and raydict.get("resolution") in RES_LEVELS:
         st.session_state["res_level"] = raydict["resolution"]; applied += 1
     return applied
@@ -440,7 +444,7 @@ _PARAM_DEFAULTS = {
     "soft_edge": False,
     "soft_pattern": "Rotating line (disk, 1/ρ)",   # _beam_pattern_controls selectbox label
     "soft_size": 12.0, "soft_sigma": 2.0, "soft_L": 550.0, "soft_rays": 24,
-    "soft_supersample": 1,
+    "soft_supersample_xy": 1, "soft_supersample_z": 1,
     "res_level": "Standard (fast)",
 }
 
@@ -784,7 +788,8 @@ with st.sidebar:
              "thickness near the shadow edge (penumbra ≈ source size / L).  "
              "Combined with a rounded resist lip this gives a rounded metal edge.  "
              "Visible at finer resolution (film several voxels thick); slower.")
-    soft_pat, soft_size, soft_L, soft_rays, soft_supersample = "rotline", 12.0, 550.0, 24, 1
+    soft_pat, soft_size, soft_L, soft_rays, soft_supersample_xy, soft_supersample_z = \
+        "rotline", 12.0, 550.0, 24, 1, 1
     if soft_edge:
         soft_pat, soft_size = _beam_pattern_controls("soft")
         st.session_state.setdefault("soft_L", 550.0)
@@ -799,23 +804,34 @@ with st.sidebar:
                  "smoother taper / finer coverage gradation (coverage is only "
                  "resolvable in steps of 1/K), at a roughly linear cost in "
                  "soft-edge runtime."))
-        st.session_state.setdefault("soft_supersample", 1)
-        soft_supersample = int(st.number_input(
-            "Lateral sub-sampling n (n×n per cell)", 1, 4, step=1, key="soft_supersample",
+        st.session_state.setdefault("soft_supersample_xy", 1)
+        soft_supersample_xy = int(st.number_input(
+            "Lateral sub-sampling n (x-y, n×n per cell)", 1, 10, step=1, key="soft_supersample_xy",
             help="Sample an n×n sub-grid of lateral (xy) positions within each "
                  "band voxel for the resist-occlusion test, instead of just the "
                  "voxel centre — smooths the in-plane footprint boundary at the "
                  "edge.  1 = centre point only (unchanged).  Cost scales as n² "
                  "on top of the ray count above; does not change the voxel grid "
                  "or thickness-step resolution (that's set by grid density)."))
+        st.session_state.setdefault("soft_supersample_z", 1)
+        soft_supersample_z = int(st.number_input(
+            "Vertical sub-sampling n (z, n per cell)", 1, 10, step=1, key="soft_supersample_z",
+            help="Sample n positions through each band voxel's z-extent for the "
+                 "same resist-occlusion test, instead of just the cell-centre z — "
+                 "smooths the through-thickness taper.  1 = centre z only "
+                 "(unchanged).  Cost scales linearly with n on top of the lateral "
+                 "sub-sampling and ray count above.  Only affects the main "
+                 "coverage/thickness calculation, not the fine in-plane diagnostic "
+                 "cross-section (which stays lateral-only)."))
+        _n_sub = soft_supersample_xy * soft_supersample_xy * soft_supersample_z
         _half = np.degrees(np.arctan((soft_size / 2.0) / max(soft_L, 1e-9)))
         st.caption(f"Source: {soft_pat} • {soft_size:.1f} mm at {soft_L:.0f} mm • "
-                   f"{soft_rays} rays × {soft_supersample}² sub-samples ⇒ angular "
-                   f"half-size ≈ {_half:.2f}°  (coverage resolution ≈ "
-                   f"1/{soft_rays * soft_supersample * soft_supersample}).")
-        if soft_rays > 48 or soft_supersample > 2:
+                   f"{soft_rays} rays × {soft_supersample_xy}² xy × {soft_supersample_z} z "
+                   f"sub-samples ⇒ angular half-size ≈ {_half:.2f}°  (coverage "
+                   f"resolution ≈ 1/{soft_rays * _n_sub}).")
+        if soft_rays > 48 or _n_sub > 8:
             st.caption("⚠ High ray count / sub-sampling — soft-edge cost scales "
-                       "roughly linearly with rays × n².")
+                       "roughly linearly with rays × n_xy² × n_z.")
 
     st.divider()
     st.subheader("Display")
@@ -863,7 +879,8 @@ params = ProcessParams(
     tri_angle4=tri_angle4, tri_phi4=tri_phi4,
     sidewall=sidewall,
     soft_edge=soft_edge, soft_pattern=soft_pat, soft_size=soft_size, soft_L=soft_L,
-    soft_rays=soft_rays, soft_supersample=soft_supersample,
+    soft_rays=soft_rays, soft_supersample_xy=soft_supersample_xy,
+    soft_supersample_z=soft_supersample_z,
 )
 # ─── 3D physical deposition engine (source of truth) ──────────────
 def _engine_cached(ekey):
@@ -912,7 +929,8 @@ def _ekey_for(p):
             getattr(p, "resist_round_method", "analytic"),
             getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
-            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))
+            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample_xy", 1),
+            getattr(p, "soft_supersample_z", 1))
 
 @st.cache_data(show_spinner=False)
 def _mc_area(sig, _p):
@@ -1336,7 +1354,8 @@ with tab_play:
             "fraction from the deposited floor thickness and shows it as a step plot. "
             "Shaded spans mark the **band** (the cells actually ray-tested against the "
             "source cloud); flat 0/1 regions were never ray-tested. Uses the "
-            "**Cross-section** tab's slice angle and view window.")
+            "**Cross-section** tab's slice angle and perpendicular offset, with its "
+            "own independent zoom below.")
         if getattr(eng, "stack", "Bilayer") == "Trilayer":
             _cov_choices = [
                 ("Evap 1 — Nb", eng.films["nb1"], params.tri_t1),
@@ -1357,16 +1376,38 @@ with tab_play:
         _cov_n = max(1, round(_cov_tnom / eng.vox))
         _cov_grid = (eng.coverage or {}).get(_cov_lbl)
         _cov_sub = (eng.coverage_sub or {}).get(_cov_lbl)
+
+        _half = np.degrees(np.arctan(
+            (params.soft_size / 2.0) / max(params.soft_L, 1e-9)))
+        _analytic_w = np.tan(np.radians(_half)) * eng.z_top
+        _cov_half_lo = min(max(2.0, 2.0 * eng.vox), _gR - eng.vox)
+        st.session_state.setdefault(
+            "cov_half", float(np.clip(3.0 * _analytic_w, _cov_half_lo, cs_half)))
+        st.session_state.setdefault("cov_xc", cs_xc)
+        st.session_state["cov_half"] = float(
+            np.clip(st.session_state["cov_half"], _cov_half_lo, _gR))
+        st.session_state["cov_xc"] = float(
+            np.clip(st.session_state["cov_xc"], -_gR, _gR))
+        with st.expander("🔍 Zoom (band view)", expanded=False):
+            cov_half = st.slider("Half-width [nm]", _cov_half_lo, _gR,
+                                 step=eng.vox, key="cov_half",
+                                 help="Independent of the Cross-section tab's zoom — "
+                                      "narrow this to frame just the band so you can "
+                                      "see whether raising the sub-sampling controls "
+                                      "actually resolves finer steps inside it.")
+            cov_xc = st.slider("Center [nm]  (pan)", -_gR, _gR,
+                               step=eng.vox, key="cov_xc")
+            st.caption("Starts pre-zoomed to ~3× the analytic penumbra-width estimate "
+                       "below, centred on the Cross-section tab's current pan; adjust "
+                       "freely from there.")
+
         with st.spinner("Rendering coverage profile..."):
             figc, _band_widths = vv.render_coverage_profile(
                 eng, _cov_metal, _cov_n, coverage_grid=_cov_grid, coverage_sub=_cov_sub,
                 angle_deg=slice_angle, offset=slice_pos,
-                view_half=cs_half, view_center=cs_xc, label=_cov_lbl)
+                view_half=cov_half, view_center=cov_xc, label=_cov_lbl)
             st.pyplot(figc, use_container_width=True)
             plt.close(figc)
-        _half = np.degrees(np.arctan(
-            (params.soft_size / 2.0) / max(params.soft_L, 1e-9)))
-        _analytic_w = np.tan(np.radians(_half)) * eng.z_top
         _measured = (", ".join(f"{w:.0f}" for w in _band_widths)
                     if _band_widths else "—")
         st.caption(
@@ -1380,7 +1421,7 @@ with tab_play:
                 "Show fine cross-section (lateral sub-voxel detail in the band)",
                 key="cov_xsection_show",
                 help="Redraws this evaporation's floor metal at the "
-                     "soft_supersample resolution instead of the coarse voxel "
+                     "soft_supersample_xy resolution instead of the coarse voxel "
                      "grid — only the band (highlighted) is genuinely finer; "
                      "elsewhere a coarse cell's value is just repeated. "
                      "Diagnostic only: each fine column is a flat vertical "
@@ -1389,7 +1430,7 @@ with tab_play:
                     figx = vv.render_coverage_cross_section(
                         eng, _cov_metal, _cov_n, _cov_sub,
                         angle_deg=slice_angle, offset=slice_pos,
-                        view_half=cs_half, view_center=cs_xc, label=_cov_lbl)
+                        view_half=cov_half, view_center=cov_xc, label=_cov_lbl)
                     st.pyplot(figx, use_container_width=True)
                     plt.close(figx)
 
@@ -1540,7 +1581,8 @@ with tab_scan:
                 getattr(p, "resist_round_method", "analytic"),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
-            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))
+            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample_xy", 1),
+            getattr(p, "soft_supersample_z", 1))
 
     @st.cache_data(show_spinner=False)
     def _scan_area(sig, _p):
@@ -1822,7 +1864,8 @@ with tab_wafer:
                 getattr(p, "resist_round_method", "analytic"),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
-            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))
+            getattr(p, "soft_rays", 24), getattr(p, "soft_supersample_xy", 1),
+            getattr(p, "soft_supersample_z", 1))
 
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):
