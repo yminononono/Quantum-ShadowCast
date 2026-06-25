@@ -564,19 +564,14 @@ def _occluded_any(origins, d, boxes, rounded, eps=1e-3):
     return hit
 
 
-def _occluded_mask(ii, jj, kk, d, mask):
-    """Boolean (N,): does the ray from each surface voxel (ii, jj, kk) toward the
-    source (−d) pass through any True cell of ``mask`` (a prior evaporation's metal,
-    i.e. its resist-sidewall coating)?  Marches in ≈1-cell steps along the dominant
-    beam axis.  This is what makes a prior deposit narrow the opening seen by a later
-    evaporation (the sidewall effect)."""
+def _march_mask(fi, fj, fk, u, mask):
+    """Shared marching loop: from starting fractional indices ``(fi, fj, fk)``
+    (cell ``ii`` spans ``[ii, ii+1)``, centre at ``ii+0.5``) and step ``u``
+    (~1 cell/step along the dominant axis), march through ``mask`` and report
+    (boolean, one per ray) which rays pass through any True cell."""
     Nx, Ny, Nz = mask.shape
-    u = -np.asarray(d, float) / (np.abs(d).max() + 1e-12)   # toward source, ~1 cell/step
-    fi = ii.astype(float) + 0.5 + u[0]                      # start one step off surface
-    fj = jj.astype(float) + 0.5 + u[1]
-    fk = kk.astype(float) + 0.5 + u[2]
-    hit = np.zeros(len(ii), bool)
-    alive = np.ones(len(ii), bool)
+    hit = np.zeros(len(fi), bool)
+    alive = np.ones(len(fi), bool)
     for _ in range(Nx + Ny + Nz):
         ci = np.floor(fi).astype(int); cj = np.floor(fj).astype(int)
         ck = np.floor(fk).astype(int)
@@ -587,6 +582,19 @@ def _occluded_mask(ii, jj, kk, d, mask):
         hit[a] |= mask[ci[a], cj[a], ck[a]]
         fi += u[0]; fj += u[1]; fk += u[2]
     return hit
+
+
+def _occluded_mask(ii, jj, kk, d, mask):
+    """Boolean (N,): does the ray from each surface voxel (ii, jj, kk) toward the
+    source (−d) pass through any True cell of ``mask`` (a prior evaporation's metal,
+    i.e. its resist-sidewall coating)?  Marches in ≈1-cell steps along the dominant
+    beam axis.  This is what makes a prior deposit narrow the opening seen by a later
+    evaporation (the sidewall effect)."""
+    u = -np.asarray(d, float) / (np.abs(d).max() + 1e-12)   # toward source, ~1 cell/step
+    fi = ii.astype(float) + 0.5 + u[0]                      # start one step off surface
+    fj = jj.astype(float) + 0.5 + u[1]
+    fk = kk.astype(float) + 0.5 + u[2]
+    return _march_mask(fi, fj, fk, u, mask)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -674,7 +682,7 @@ def _plassys_dirs(theta, phi, pattern, size, L, K=24, seed=0):
 
 
 def _cloud_coverage(o, bi, bj, bk, soft, boxes, rounded, occ_mask, sub_offsets, on_pass,
-                    return_sub=False, n_xy=None):
+                    vox, return_sub=False, n_xy=None):
     """Average lit-fraction over the source-cloud directions ``soft`` for a set
     of surface-cell origins ``o``, optionally supersampled at ``sub_offsets``
     lateral/z sub-positions within each cell (a smoother in-plane footprint
@@ -682,11 +690,14 @@ def _cloud_coverage(o, bi, bj, bk, soft, boxes, rounded, occ_mask, sub_offsets, 
     from its single centre point, which aliases the boundary to the voxel
     grid).
 
-    Sidewall occlusion (``occ_mask``, via ``_occluded_mask``) is evaluated once
-    per ray at the cell's own integer indices, not per sub-offset: it marches
-    through ``occ_mask``'s integer voxel grid rather than continuous
-    coordinates, so sub-voxel positions don't apply to it the way they do to
-    the resist test (``_occluded``, continuous ray–box intersection).
+    Sidewall occlusion (``occ_mask``, via ``_march_mask``) is evaluated per
+    ``(ray, sub-offset)`` pair at the same continuous position ``o + off`` the
+    resist test uses — ``bi/bj/bk`` (the cell's own integer indices) plus the
+    sub-offset converted to fractional-index units via ``vox`` — so it
+    benefits from lateral/z sub-sampling and grid resolution the same way the
+    resist test (``_occluded``, continuous ray–box intersection) does. It's
+    bounded only by ``occ_mask``'s own voxelization, not by a fixed per-cell
+    value anymore.
 
     ``return_sub`` additionally returns the per-sub-offset coverage (averaged
     over the rays in ``soft`` only, NOT over ``sub_offsets``) as an
@@ -706,13 +717,15 @@ def _cloud_coverage(o, bi, bj, bk, soft, boxes, rounded, occ_mask, sub_offsets, 
     acc_sub = np.zeros((len(o), n_xy)) if return_sub else None
     n_tests = 0
     for dk in soft:
-        side_ok = None
         if occ_mask is not None:
-            side_ok = ~_occluded_mask(bi, bj, bk, dk, occ_mask)
+            u = -np.asarray(dk, float) / (np.abs(dk).max() + 1e-12)
         for si, off in enumerate(sub_offsets):
             lit_k = ~_occluded_any(o + off, -dk, boxes, rounded)
-            if side_ok is not None:
-                lit_k &= side_ok
+            if occ_mask is not None:
+                fi = bi.astype(float) + 0.5 + off[0] / vox + u[0]
+                fj = bj.astype(float) + 0.5 + off[1] / vox + u[1]
+                fk = bk.astype(float) + 0.5 + off[2] / vox + u[2]
+                lit_k &= ~_march_mask(fi, fj, fk, u, occ_mask)
             acc += lit_k.astype(float)
             if return_sub:
                 acc_sub[:, si % n_xy] += lit_k.astype(float)   # fold z into its xy bucket
@@ -737,7 +750,10 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
     ``occ_mask`` (optional bool grid) is extra occluding metal from a prior
     evaporation: a surface cell is also shadowed if its ray to the source passes
     through it — this is the sidewall effect (prior wall coating narrows the
-    opening).  ``None`` ⇒ resist-only shadowing (unchanged behaviour).
+    opening).  ``None`` ⇒ resist-only shadowing (unchanged behaviour).  When set
+    and ``soft`` is also set, this occlusion is tested per ``(ray, sub-offset)``
+    pair the same as the resist test, so it now also pays the lateral/z
+    sub-sampling cost below (previously a flat per-ray cost, independent of it).
 
     ``soft`` (optional list of unit beam directions = the finite source's angular
     cloud, e.g. from :func:`_plassys_dirs`) turns on the **soft-edge (penumbra)**
@@ -889,13 +905,13 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
             bi, bj, bk = ii[bidx], jj[bidx], kk[bidx]
             if want_sub:
                 cov_b, cov_sub_b = _cloud_coverage(bo, bi, bj, bk, soft, boxes, rounded,
-                                                   occ_mask, sub_offsets, on_pass,
+                                                   occ_mask, sub_offsets, on_pass, vox,
                                                    return_sub=True, n_xy=n_lat)
                 cov[bidx] = cov_b
                 cov_sub_inner[bidx] = cov_sub_b
             else:
                 cov[bidx] = _cloud_coverage(bo, bi, bj, bk, soft, boxes, rounded, occ_mask,
-                                            sub_offsets, on_pass, n_xy=n_lat)
+                                            sub_offsets, on_pass, vox, n_xy=n_lat)
         elif on_pass is not None:
             for _ in soft:
                 on_pass()                    # keep the tick count consistent
@@ -925,10 +941,10 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
             if want_sub:
                 cov_outer, cov_sub_outer = _cloud_coverage(
                     oo, oi_, oj_, ok_, soft, boxes, rounded, occ_mask, sub_offsets, on_pass,
-                    return_sub=True, n_xy=n_lat)
+                    vox, return_sub=True, n_xy=n_lat)
             else:
                 cov_outer = _cloud_coverage(oo, oi_, oj_, ok_, soft, boxes, rounded, occ_mask,
-                                            sub_offsets, on_pass, n_xy=n_lat)
+                                            sub_offsets, on_pass, vox, n_xy=n_lat)
         elif on_pass is not None:
             for _ in soft:
                 on_pass()                    # keep the tick count consistent
