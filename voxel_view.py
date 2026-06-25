@@ -646,6 +646,66 @@ def render_deposition_frame(r: DepositionResult, step_value, show_oxide=True,
     return fig
 
 
+def _coverage_profile_arrays(r, metal, n_nominal, coverage_grid, coverage_sub,
+                             angle_deg, offset):
+    """Shared data extraction for the soft-edge coverage diagnostic — returns
+    ``(s, cov, in_band)`` for the FULL slice extent, before any view window is
+    applied.  See ``render_coverage_profile``'s docstring for what
+    ``coverage_grid``/``coverage_sub``/neither mean."""
+    Nz = metal.shape[2]
+    n = max(1, int(n_nominal))
+    if coverage_sub is not None and Nz >= 2:
+        ns = max(1, round(np.sqrt(len(coverage_sub))))
+        ix, iy, sub_idx, s, inside = _oblique_columns_fine(r, angle_deg, offset, ns)
+        stacked = np.stack(coverage_sub, axis=0)        # (ns², Nx, Ny, Nz)
+        cov_raw = stacked[sub_idx, ix, iy, 1]            # floor-contact voxel only
+        has_cov = cov_raw >= 0.0
+        cov = np.where(has_cov, np.clip(cov_raw, 0.0, 1.0), 0.0)
+        in_band = has_cov & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
+    elif coverage_grid is not None and Nz >= 2:
+        ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
+        cov_raw = coverage_grid[ix, iy, 1]            # floor-contact voxel only
+        has_cov = cov_raw >= 0.0
+        cov = np.where(has_cov, np.clip(cov_raw, 0.0, 1.0), 0.0)
+        in_band = has_cov & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
+    elif Nz >= 2:
+        ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
+        col = metal[ix, iy, 1:]                       # floor cells only
+        first_gap = np.argmax(~col, axis=1)
+        th = np.where(col.all(axis=1), col.shape[1], first_gap)
+        th = np.where(inside, th, 0)
+        cov = np.clip(th / n, 0.0, 1.0)
+        in_band = (th > 0) & (th < n)
+    else:
+        _, _, s, inside = _oblique_columns(r, angle_deg, offset)
+        cov = np.zeros(len(s)); in_band = np.zeros(len(s), bool)
+    cov = np.where(inside, cov, 0.0)
+    in_band = in_band & inside
+    return s, cov, in_band
+
+
+def find_coverage_bands(r, metal, n_nominal, coverage_grid=None, coverage_sub=None,
+                        angle_deg=0.0, offset=0.0, margin_vox=2.0):
+    """Locate every contiguous soft-edge band along the FULL slice,
+    independent of any current view window — for zoom-mode navigation.
+    Returns a list of ``(center, half_width)`` [nm], sorted by position, each
+    padded by ``margin_vox`` voxels on each side."""
+    s, cov, in_band = _coverage_profile_arrays(r, metal, n_nominal, coverage_grid,
+                                               coverage_sub, angle_deg, offset)
+    idx = np.where(in_band)[0]
+    if not len(idx):
+        return []
+    breaks = np.where(np.diff(idx) > 1)[0]
+    runs = np.split(idx, breaks + 1)
+    _ds = float(s[1] - s[0]) if len(s) > 1 else r.vox
+    pad = margin_vox * r.vox
+    bands = []
+    for run in runs:
+        lo, hi = s[run[0]] - _ds / 2, s[run[-1]] + _ds / 2
+        bands.append((float((lo + hi) / 2), float((hi - lo) / 2 + pad)))
+    return bands
+
+
 def render_coverage_profile(r: DepositionResult, metal: np.ndarray, n_nominal: int,
                             coverage_grid: np.ndarray = None, coverage_sub: list = None,
                             angle_deg=0.0, offset=0.0,
@@ -685,34 +745,8 @@ def render_coverage_profile(r: DepositionResult, metal: np.ndarray, n_nominal: i
     of each contiguous band run visible in the plotted window.
     """
     Nz = metal.shape[2]
-    n = max(1, int(n_nominal))
-    if coverage_sub is not None and Nz >= 2:
-        ns = max(1, round(np.sqrt(len(coverage_sub))))
-        ix, iy, sub_idx, s, inside = _oblique_columns_fine(r, angle_deg, offset, ns)
-        stacked = np.stack(coverage_sub, axis=0)        # (ns², Nx, Ny, Nz)
-        cov_raw = stacked[sub_idx, ix, iy, 1]            # floor-contact voxel only
-        has_cov = cov_raw >= 0.0
-        cov = np.where(has_cov, np.clip(cov_raw, 0.0, 1.0), 0.0)
-        in_band = has_cov & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
-    elif coverage_grid is not None and Nz >= 2:
-        ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
-        cov_raw = coverage_grid[ix, iy, 1]            # floor-contact voxel only
-        has_cov = cov_raw >= 0.0
-        cov = np.where(has_cov, np.clip(cov_raw, 0.0, 1.0), 0.0)
-        in_band = has_cov & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
-    elif Nz >= 2:
-        ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
-        col = metal[ix, iy, 1:]                       # floor cells only
-        first_gap = np.argmax(~col, axis=1)
-        th = np.where(col.all(axis=1), col.shape[1], first_gap)
-        th = np.where(inside, th, 0)
-        cov = np.clip(th / n, 0.0, 1.0)
-        in_band = (th > 0) & (th < n)
-    else:
-        _, _, s, inside = _oblique_columns(r, angle_deg, offset)
-        cov = np.zeros(len(s)); in_band = np.zeros(len(s), bool)
-    cov = np.where(inside, cov, 0.0)
-    in_band = in_band & inside
+    s, cov, in_band = _coverage_profile_arrays(r, metal, n_nominal, coverage_grid,
+                                               coverage_sub, angle_deg, offset)
 
     half = _zoom_half(r, view_half)
     hlo, hhi = view_center - half, view_center + half

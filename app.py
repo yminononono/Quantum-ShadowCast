@@ -1380,26 +1380,56 @@ with tab_play:
         _half = np.degrees(np.arctan(
             (params.soft_size / 2.0) / max(params.soft_L, 1e-9)))
         _analytic_w = np.tan(np.radians(_half)) * eng.z_top
-        _cov_half_lo = min(max(2.0, 2.0 * eng.vox), _gR - eng.vox)
-        st.session_state.setdefault(
-            "cov_half", float(np.clip(3.0 * _analytic_w, _cov_half_lo, cs_half)))
-        st.session_state.setdefault("cov_xc", cs_xc)
-        st.session_state["cov_half"] = float(
-            np.clip(st.session_state["cov_half"], _cov_half_lo, _gR))
-        st.session_state["cov_xc"] = float(
-            np.clip(st.session_state["cov_xc"], -_gR, _gR))
-        with st.expander("🔍 Zoom (band view)", expanded=False):
-            cov_half = st.slider("Half-width [nm]", _cov_half_lo, _gR,
-                                 step=eng.vox, key="cov_half",
-                                 help="Independent of the Cross-section tab's zoom — "
-                                      "narrow this to frame just the band so you can "
-                                      "see whether raising the sub-sampling controls "
-                                      "actually resolves finer steps inside it.")
-            cov_xc = st.slider("Center [nm]  (pan)", -_gR, _gR,
-                               step=eng.vox, key="cov_xc")
-            st.caption("Starts pre-zoomed to ~3× the analytic penumbra-width estimate "
-                       "below, centred on the Cross-section tab's current pan; adjust "
-                       "freely from there.")
+
+        _cov_bands = vv.find_coverage_bands(eng, _cov_metal, _cov_n, coverage_grid=_cov_grid,
+                                            coverage_sub=_cov_sub, angle_deg=slice_angle,
+                                            offset=slice_pos)
+
+        _ZOOM_MODES = ["Full range (no zoom)", "Fit all bands", "Each band", "Manual"]
+        st.session_state.setdefault("cov_zoom_mode", _ZOOM_MODES[1] if _cov_bands else _ZOOM_MODES[0])
+        cov_zoom_mode = st.selectbox(
+            "Zoom mode", _ZOOM_MODES, key="cov_zoom_mode",
+            help="\"Fit all bands\"/\"Each band\" auto-locate the ray-tested "
+                 "shadow-edge region(s) for this evaporation along the current "
+                 "slice; \"Manual\" uses the sliders below.")
+
+        if cov_zoom_mode == "Each band" and _cov_bands:
+            _band_labels = [f"Band {i + 1}  ({c:.0f} nm)" for i, (c, h) in enumerate(_cov_bands)]
+            st.session_state["cov_band_idx"] = int(np.clip(
+                st.session_state.get("cov_band_idx", 0), 0, len(_cov_bands) - 1))
+            st.selectbox("Band", range(len(_cov_bands)), key="cov_band_idx",
+                        format_func=lambda i: _band_labels[i])
+
+        if cov_zoom_mode == "Full range (no zoom)" or not _cov_bands:
+            cov_half, cov_xc = _gR, 0.0
+            if cov_zoom_mode != "Full range (no zoom)" and not _cov_bands:
+                st.caption("No soft-edge band found along this slice — showing full range instead.")
+        elif cov_zoom_mode == "Fit all bands":
+            los = [c - h for c, h in _cov_bands]; his = [c + h for c, h in _cov_bands]
+            cov_xc = (min(los) + max(his)) / 2.0
+            cov_half = (max(his) - min(los)) / 2.0
+        elif cov_zoom_mode == "Each band":
+            cov_xc, cov_half = _cov_bands[st.session_state["cov_band_idx"]]
+        else:  # Manual
+            _cov_half_lo = min(max(2.0, 2.0 * eng.vox), _gR - eng.vox)
+            st.session_state.setdefault(
+                "cov_half", float(np.clip(3.0 * _analytic_w, _cov_half_lo, cs_half)))
+            st.session_state.setdefault("cov_xc", cs_xc)
+            st.session_state["cov_half"] = float(
+                np.clip(st.session_state["cov_half"], _cov_half_lo, _gR))
+            st.session_state["cov_xc"] = float(
+                np.clip(st.session_state["cov_xc"], -_gR, _gR))
+            with st.expander("🔍 Zoom (band view)", expanded=False):
+                cov_half = st.slider("Half-width [nm]", _cov_half_lo, _gR,
+                                     step=eng.vox, key="cov_half",
+                                     help="Narrow this to frame just the band so you can "
+                                          "see whether raising the sub-sampling controls "
+                                          "actually resolves finer steps inside it.")
+                cov_xc = st.slider("Center [nm]  (pan)", -_gR, _gR,
+                                   step=eng.vox, key="cov_xc")
+                st.caption("Starts pre-zoomed to ~3× the analytic penumbra-width estimate "
+                           "below, centred on the Cross-section tab's current pan; adjust "
+                           "freely from there.")
 
         with st.spinner("Rendering coverage profile..."):
             figc, _band_widths = vv.render_coverage_profile(
