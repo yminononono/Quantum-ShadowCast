@@ -646,6 +646,33 @@ def render_deposition_frame(r: DepositionResult, step_value, show_oxide=True,
     return fig
 
 
+def _column_coverage_value(col_data):
+    """For an (Npts, Nz) coverage array (-1 = untested), return ``(has_cov,
+    cov_raw)`` using each row's own FIRST non-negative entry — not a fixed
+    z-index — since an evaporation's surface-contact z-index varies per
+    column (e.g. when it deposits on top of an earlier evaporation's metal
+    instead of the bare floor)."""
+    has_cov_any = col_data >= 0.0
+    has_cov = has_cov_any.any(axis=1)
+    z_idx = np.argmax(has_cov_any, axis=1)
+    cov_raw = col_data[np.arange(col_data.shape[0]), z_idx]
+    return has_cov, cov_raw
+
+
+def _column_metal_thickness(col):
+    """For an (Npts, Nz) boolean metal array, return each row's contiguous
+    thickness starting from wherever ITS OWN metal first appears — not a
+    fixed z-index — for the same reason as ``_column_coverage_value``."""
+    Nz = col.shape[1]
+    any_metal = col.any(axis=1)
+    z_start = np.argmax(col, axis=1)
+    before_start = np.arange(Nz)[None, :] < z_start[:, None]
+    masked = col | before_start
+    gap_idx = np.argmax(~masked, axis=1)
+    th = np.where(masked.all(axis=1), Nz, gap_idx) - z_start
+    return np.where(any_metal, th, 0)
+
+
 def _coverage_profile_arrays(r, metal, n_nominal, coverage_grid, coverage_sub,
                              angle_deg, offset):
     """Shared data extraction for the soft-edge coverage diagnostic — returns
@@ -658,21 +685,17 @@ def _coverage_profile_arrays(r, metal, n_nominal, coverage_grid, coverage_sub,
         ns = max(1, round(np.sqrt(len(coverage_sub))))
         ix, iy, sub_idx, s, inside = _oblique_columns_fine(r, angle_deg, offset, ns)
         stacked = np.stack(coverage_sub, axis=0)        # (ns², Nx, Ny, Nz)
-        cov_raw = stacked[sub_idx, ix, iy, 1]            # floor-contact voxel only
-        has_cov = cov_raw >= 0.0
+        has_cov, cov_raw = _column_coverage_value(stacked[sub_idx, ix, iy, :])
         cov = np.where(has_cov, np.clip(cov_raw, 0.0, 1.0), 0.0)
         in_band = has_cov & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
     elif coverage_grid is not None and Nz >= 2:
         ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
-        cov_raw = coverage_grid[ix, iy, 1]            # floor-contact voxel only
-        has_cov = cov_raw >= 0.0
+        has_cov, cov_raw = _column_coverage_value(coverage_grid[ix, iy, :])
         cov = np.where(has_cov, np.clip(cov_raw, 0.0, 1.0), 0.0)
         in_band = has_cov & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
     elif Nz >= 2:
         ix, iy, s, inside = _oblique_columns(r, angle_deg, offset)
-        col = metal[ix, iy, 1:]                       # floor cells only
-        first_gap = np.argmax(~col, axis=1)
-        th = np.where(col.all(axis=1), col.shape[1], first_gap)
+        th = _column_metal_thickness(metal[ix, iy, :])
         th = np.where(inside, th, 0)
         cov = np.clip(th / n, 0.0, 1.0)
         in_band = (th > 0) & (th < n)
@@ -727,8 +750,12 @@ def render_coverage_profile(r: DepositionResult, metal: np.ndarray, n_nominal: i
 
     ``coverage_grid`` (``r.coverage[label]`` when available — engine-recorded
     runs only) is the engine's true continuous per-cell coverage fraction,
-    stored at each column's floor-contact (z-index 1) voxel before it gets
-    quantised to ``round(coverage·n_nominal)`` layers.  When given (and
+    stored at each column's own surface-contact voxel before it gets
+    quantised to ``round(coverage·n_nominal)`` layers — z-index 1 when this
+    evaporation deposits onto the bare substrate, but higher where it
+    deposits on top of an earlier evaporation's metal (e.g. a junction
+    overlap); ``_column_coverage_value`` finds it per column rather than
+    assuming z-index 1.  When given (and
     ``coverage_sub`` is not), the profile plots this exact value at the
     coarse voxel spacing — no reconstruction, no rounding error, and
     correctly flags the ray-tested "band" even where quantisation rounded a
@@ -736,7 +763,8 @@ def render_coverage_profile(r: DepositionResult, metal: np.ndarray, n_nominal: i
 
     Without either (older/un-recorded results), falls back to reconstructing
     an approximate coverage from the floor thickness — the run of metal cells
-    starting at z-index 1 (the first cell above the substrate-interface cell)
+    starting at each column's own first metal cell (its surface-contact
+    voxel, not necessarily z-index 1 — see ``_column_metal_thickness``)
     divided by ``n_nominal``.  Columns whose thickness lands strictly between
     0 and ``n_nominal`` are taken as the ray-tested band in this approximate
     mode; flat columns at 1.0 or 0.0 were (almost certainly) never ray-tested.
@@ -815,13 +843,13 @@ def render_coverage_cross_section(r: DepositionResult, metal: np.ndarray, n_nomi
     zs = r.zs
 
     stacked = np.stack(coverage_sub, axis=0)            # (ns², Nx, Ny, Nz)
-    cov_raw = stacked[sub_idx, ix, iy, 1] if Nz >= 2 else np.full(len(s), -1.0)
-    has_cov = cov_raw >= 0.0
+    if Nz >= 2:
+        has_cov, cov_raw = _column_coverage_value(stacked[sub_idx, ix, iy, :])
+    else:
+        has_cov, cov_raw = np.zeros(len(s), bool), np.full(len(s), -1.0)
 
-    col = metal[ix, iy, 1:] if Nz >= 2 else np.zeros((len(s), 0), bool)
-    if col.shape[1]:
-        first_gap = np.argmax(~col, axis=1)
-        th_coarse = np.where(col.all(axis=1), col.shape[1], first_gap)
+    if Nz >= 2:
+        th_coarse = _column_metal_thickness(metal[ix, iy, :])
     else:
         th_coarse = np.zeros(len(s), dtype=int)
 
