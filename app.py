@@ -269,6 +269,8 @@ def _apply_loaded_params(pdict, raydict):
         # the primary tilt so the loaded θ/φ are used as-is.
         st.session_state["tri_link2"] = False
         st.session_state["tri_link4"] = False
+    if pdict.get("resist_round_method") in ("analytic", "voxel"):
+        st.session_state["resist_round_method"] = pdict["resist_round_method"]; applied += 1
     if pdict.get("sidewall") is not None:
         st.session_state["sidewall"] = bool(pdict["sidewall"]); applied += 1
     if pdict.get("jc_al") is not None:
@@ -423,6 +425,7 @@ _PARAM_DEFAULTS = {
     "mode": "Dolan bridge",
     "stack": "Bilayer",
     "t_pmma": 250, "t_mma": 900, "undercut": 150, "resist_round": 0,
+    "resist_round_method": "analytic",
     "angle1": -24, "phi1": 0, "t_metal1": 30,
     "d_angle2": 24, "d_phi2": 0, "d_tmetal2": 30,
     "d_bridge_len": 250, "d_bridge_w": 250, "d_bridge_pmma_gap": 0,
@@ -602,6 +605,20 @@ with st.sidebar:
         help="Round the resist opening's top lip and bottom foot with a fillet "
              "of this radius (0 = sharp corners).  The wall flares near the top "
              "and floor, so it shifts the shadow and the junction area.")
+    resist_round_method = "analytic"
+    if resist_round > 0:
+        st.session_state.setdefault("resist_round_method", "analytic")
+        resist_round_method = st.radio(
+            "Rounding method", ["analytic", "voxel"],
+            format_func=lambda v: "Analytic (default, fast)" if v == "analytic"
+                                  else "Voxel stack (legacy, slow)",
+            key="resist_round_method", horizontal=True,
+            help="Analytic: exact continuous quarter-circle, solved directly "
+                 "per ray (fast, no K-slab approximation).  Voxel stack: the "
+                 "original method — approximates the fillet with ~10-20 thin "
+                 "box layers, which is **significantly slower** (more boxes "
+                 "to test against every ray) and only an approximation of "
+                 "the analytic curve.  Kept as a fallback / cross-check.")
     if mode == "Dolan bridge":
         st.caption(f"Total resist: {t_pmma+t_mma} nm  ·  vertical shadow gap = MMA = {t_mma} nm")
     else:
@@ -832,6 +849,7 @@ with st.sidebar:
 
 params = ProcessParams(
     t_pmma=t_pmma, t_mma=t_mma, undercut=undercut, resist_round=resist_round,
+    resist_round_method=resist_round_method,
     angle1=angle1, phi1=phi1, t_metal1=t_metal1,
     angle2=angle2, phi2=phi2, t_metal2=t_metal2,
     bridge_len=bridge_len, bridge_w=bridge_w, bridge_pmma_gap=bridge_pmma_gap,
@@ -891,6 +909,7 @@ def _ekey_for(p):
             p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4, p.tri_angle2, p.tri_phi2,
             p.tri_angle4, p.tri_phi4, getattr(p, "sidewall", False),
             getattr(p, "resist_round", 0.0),
+            getattr(p, "resist_round_method", "analytic"),
             getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
             getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))
@@ -1518,6 +1537,7 @@ with tab_scan:
                 p.stack, p.tri_t1, p.tri_t2, p.tri_t3, p.tri_t4,
                 p.tri_angle2, p.tri_phi2, p.tri_angle4, p.tri_phi4,
                 getattr(p, "sidewall", False), getattr(p, "resist_round", 0.0),
+                getattr(p, "resist_round_method", "analytic"),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
             getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))
@@ -1799,6 +1819,7 @@ with tab_wafer:
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h,
                 _wsmc, _wsmv, getattr(p, "sidewall", False),
                 getattr(p, "resist_round", 0.0),
+                getattr(p, "resist_round_method", "analytic"),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
             getattr(p, "soft_size", 12.0), getattr(p, "soft_L", 550.0),
             getattr(p, "soft_rays", 24), getattr(p, "soft_supersample", 1))

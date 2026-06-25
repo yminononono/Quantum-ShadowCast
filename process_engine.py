@@ -54,6 +54,9 @@ class ProcessParams:
     t_mma:    float = 900.0   # MMA  bot layer [nm]  (= bridge underside height / vertical gap)
     undercut: float = 150.0   # MMA one-sided undercut [nm]
     resist_round: float = 0.0 # resist opening corner fillet radius [nm] (0 = sharp)
+    resist_round_method: str = "analytic"  # "analytic" (fast, exact continuous
+                                            # quarter-circle) or "voxel" (legacy
+                                            # K-slab box-stack approximation, slow)
     soft_edge: bool = False    # soft-edge (penumbra) deposition from a finite source
     soft_pattern: str = "rotline"  # e-beam raster pattern (sample_beam_cloud key)
     soft_size:   float = 12.0   # source spot size on the target [mm] (recipe ~10–15)

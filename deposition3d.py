@@ -118,6 +118,254 @@ def _rect_boxes(openings, R, z0, z1):
     return _solid_from_openings(openings, R, z0, z1)
 
 
+def _e_of_z(z, z0, z1, rr, round_top, round_bot):
+    """Continuous quarter-circle wall-retreat e(z) for a resist layer [z0,z1]
+    rounded by radius `rr` at its top (z1) and/or bottom (z0) face: 0 ⇒ sharp
+    wall, `rr` ⇒ fully retreated at the rounded face.  `z` may be an array.
+    This is the exact (K→∞) continuous limit of the old K-slab fillet
+    approximation, used by `_label_solid`'s point test and (via
+    ``voxel_view``) the cross-section curve overlay."""
+    z = np.asarray(z, float)
+    h_top = (z - (z1 - rr)) if round_top else np.full_like(z, -1.0)
+    h_bot = ((z0 + rr) - z) if round_bot else np.full_like(z, -1.0)
+    h = np.clip(np.maximum(h_top, h_bot), 0.0, rr)
+    active = np.maximum(h_top, h_bot) >= 0
+    return np.where(active, rr - np.sqrt(np.maximum(rr * rr - h * h, 0.0)), 0.0)
+
+
+@dataclass
+class RoundedRect:
+    """One centred rectangular resist opening whose walls retreat by a shared
+    quarter-circle e(z) near the top and/or bottom z-face (Dolan's rounded
+    trench) — the analytic, continuous replacement for the old K-slab fillet
+    box stack.  Solid = complement of {|x|<hx+e(z), |y|<hy+e(z)} within
+    [z0,z1]."""
+    hx: float; hy: float
+    z0: float; z1: float
+    rr: float
+    round_top: bool
+    round_bot: bool
+
+
+@dataclass
+class RoundedCross:
+    """Manhattan's resist cross: two perpendicular RoundedRect strips sharing
+    the same z0/z1/rr/round_top/round_bot (hence the same e(z)) — solid =
+    intersection of each strip's own complement.  `arm` is the shared far
+    reach of both strips; `hy_a`/`hx_b` are strip A's y-half-width and strip
+    B's x-half-width.  No separate corner-rounding term is needed: rounding
+    only ever grows each strip's own transverse half-width, never `arm`, so
+    the two rounded surfaces are already consistent where they meet."""
+    arm: float; hy_a: float; hx_b: float
+    z0: float; z1: float
+    rr: float
+    round_top: bool
+    round_bot: bool
+
+
+def _t_range_for_z(o, d, za, zb, eps):
+    """(N,) ta, tb, valid — the ray's t-sub-range where z(t)∈[za,zb], t>eps.
+    `tb` is +inf when the ray is z-parallel and inside the slab (the actual
+    bound then comes from whichever x/y test uses this range, exactly as
+    `_occluded`'s own slab test leaves an unconstrained axis unbounded)."""
+    N = len(o)
+    dz = float(d[2])
+    if abs(dz) < 1e-12:
+        valid = (o[:, 2] >= za) & (o[:, 2] <= zb)
+        return np.full(N, eps), np.full(N, np.inf), valid
+    ta_raw = (za - o[:, 2]) / dz
+    tb_raw = (zb - o[:, 2]) / dz
+    ta = np.maximum(np.minimum(ta_raw, tb_raw), eps)
+    tb = np.maximum(ta_raw, tb_raw)
+    return ta, tb, ta < tb
+
+
+def _sharp_wall_hit(o, d, half, axis, sign, ta, tb, valid):
+    """(N,) bool — does sign·coord_axis(t) exceed the flat `half`-width wall
+    for some t∈[ta,tb]?"""
+    oc, dc = sign * o[:, axis], sign * float(d[axis])
+    if abs(dc) < 1e-12:
+        return valid & (oc > half)
+    t_cross = (half - oc) / dc
+    lo, hi = (t_cross, tb) if dc > 0 else (ta, t_cross)
+    lo, hi = np.maximum(lo, ta), np.minimum(hi, tb)
+    return valid & (lo < hi)
+
+
+def _rounded_wall_hit(o, d, half, rr, z_face, zsign, axis, sign, ta, tb, valid):
+    """(N,) bool — the quadratic rounded-wall test (does sign·coord_axis(t)
+    exceed the retreating `half`+e(z) boundary for some t∈[ta,tb]?).  Letting
+    A(t)=half+rr-sign·coord_axis(t) and h(t) the (already clipped-range)
+    distance into the fillet, the condition reduces to "A(t)<0" (past even
+    the maximum retreat) OR "A(t)²+h(t)²<rr²" (inside the quarter-circle) —
+    both linear/quadratic in t, solved directly instead of approximated by
+    K discrete slabs.  `zsign`=+1 for a top-face rounding
+    (h=z-(z_face-rr)), -1 for a bottom-face rounding (h=(z_face+rr)-z)."""
+    N = len(o)
+    if zsign > 0:
+        h0 = o[:, 2] - z_face + rr; h1 = float(d[2])
+    else:
+        h0 = z_face + rr - o[:, 2]; h1 = -float(d[2])
+    oc, dc = sign * o[:, axis], sign * float(d[axis])
+    a0 = half + rr - oc; a1 = -dc
+    hit = np.zeros(N, bool)
+    if abs(a1) < 1e-12:
+        hit |= valid & (a0 < 0)
+    else:
+        t_a0 = -a0 / a1
+        if a1 > 0:
+            hit |= valid & (ta < np.minimum(tb, t_a0))
+        else:
+            hit |= valid & (np.maximum(ta, t_a0) < tb)
+    A = a1 * a1 + h1 * h1
+    B = 2 * (a0 * a1 + h0 * h1)
+    C = a0 * a0 + h0 * h0 - rr * rr
+    if A > 1e-12:
+        disc = B * B - 4 * A * C
+        ok = disc >= 0
+        sq = np.sqrt(np.maximum(disc, 0.0))
+        r1 = (-B - sq) / (2 * A); r2 = (-B + sq) / (2 * A)
+        qa, qb = np.minimum(r1, r2), np.maximum(r1, r2)
+        lo, hi = np.maximum(qa, ta), np.minimum(qb, tb)
+        hit |= valid & ok & (lo < hi)
+    return hit
+
+
+def _wall_hit(o, d, half, rr, z0, z1, round_top, round_bot, axis, sign, eps):
+    """(N,) bool — OR of the sharp-middle / bottom-rounded / top-rounded
+    sub-ranges for one wall of a RoundedRect/RoundedCross strip."""
+    zlo = z0 + (rr if round_bot else 0.0)
+    zhi = z1 - (rr if round_top else 0.0)
+    hit = np.zeros(len(o), bool)
+    if round_bot:
+        ta, tb, valid = _t_range_for_z(o, d, z0, z0 + rr, eps)
+        hit |= _rounded_wall_hit(o, d, half, rr, z0, -1, axis, sign, ta, tb, valid)
+    if zhi > zlo:
+        ta, tb, valid = _t_range_for_z(o, d, zlo, zhi, eps)
+        hit |= _sharp_wall_hit(o, d, half, axis, sign, ta, tb, valid)
+    if round_top:
+        ta, tb, valid = _t_range_for_z(o, d, z1 - rr, z1, eps)
+        hit |= _rounded_wall_hit(o, d, half, rr, z1, +1, axis, sign, ta, tb, valid)
+    return hit
+
+
+def _corner_sharp_hit(o, d, half_x, half_y, sx, sy, ta, tb, valid):
+    """(N,) bool — AND of two flat half-space tests sharing one t-sub-range
+    (the un-rounded middle of a RoundedCross corner)."""
+    def _iv(axis, sign, half):
+        oc, dc = sign * o[:, axis], sign * float(d[axis])
+        if abs(dc) < 1e-12:
+            return ta, tb, (oc > half)
+        t_cross = (half - oc) / dc
+        lo, hi = (t_cross, tb) if dc > 0 else (ta, t_cross)
+        lo, hi = np.maximum(lo, ta), np.minimum(hi, tb)
+        return lo, hi, (lo < hi)
+    lox, hix, okx = _iv(0, sx, half_x)
+    loy, hiy, oky = _iv(1, sy, half_y)
+    lo, hi = np.maximum(lox, loy), np.minimum(hix, hiy)
+    return valid & okx & oky & (lo < hi)
+
+
+def _corner_rounded_hit(o, d, half_x, half_y, sx, sy, rr, z_face, zsign, ta, tb, valid):
+    """(N,) bool — AND of two rounded-wall tests sharing the SAME e(z) (a
+    RoundedCross corner).  Reduces to the single-wall quadratic test with
+    A(t) replaced by max(Ax(t), Ay(t)); since that max is piecewise-linear
+    (one kink where Ax(t)=Ay(t)), the t-range is split there and each half
+    uses the single-wall formula with whichever side is locally larger."""
+    N = len(o)
+    if zsign > 0:
+        h0 = o[:, 2] - z_face + rr; h1 = float(d[2])
+    else:
+        h0 = z_face + rr - o[:, 2]; h1 = -float(d[2])
+    ocx, dcx = sx * o[:, 0], sx * float(d[0])
+    ocy, dcy = sy * o[:, 1], sy * float(d[1])
+    Ax0, Ax1 = half_x + rr - ocx, -dcx
+    Ay0, Ay1 = half_y + rr - ocy, -dcy
+    dA0, dA1 = Ax0 - Ay0, Ax1 - Ay1
+    hit = np.zeros(N, bool)
+
+    def _seg(sa, sb, use_x, ok):
+        a0 = np.where(use_x, Ax0, Ay0)
+        a1 = np.where(use_x, Ax1, Ay1)
+        h_ = np.zeros(N, bool)
+        zero_a1 = np.abs(a1) < 1e-12
+        h_ |= ok & zero_a1 & (a0 < 0)
+        nz = ok & ~zero_a1
+        a1safe = np.where(a1 == 0, 1.0, a1)
+        t_a0 = -a0 / a1safe
+        h_ |= nz & (a1 > 0) & (sa < np.minimum(sb, t_a0))
+        h_ |= nz & (a1 < 0) & (np.maximum(sa, t_a0) < sb)
+        A = a1 * a1 + h1 * h1; B = 2 * (a0 * a1 + h0 * h1); C = a0 * a0 + h0 * h0 - rr * rr
+        Asafe = np.where(A == 0, 1.0, A)
+        disc = B * B - 4 * A * C
+        okd = ok & (A > 1e-12) & (disc >= 0)
+        sq = np.sqrt(np.maximum(disc, 0.0))
+        r1 = (-B - sq) / (2 * Asafe); r2 = (-B + sq) / (2 * Asafe)
+        qa, qb = np.minimum(r1, r2), np.maximum(r1, r2)
+        lo, hi = np.maximum(qa, sa), np.minimum(qb, sb)
+        h_ |= okd & (lo < hi)
+        return h_
+
+    if abs(dA1) < 1e-12:
+        hit |= _seg(ta, tb, (Ax0 >= Ay0), valid & (ta < tb))
+    else:
+        t_kink = -dA0 / dA1
+        use_x_left = (Ax0 + Ax1 * ta) >= (Ay0 + Ay1 * ta)
+        kink_inside = (t_kink > ta) & (t_kink < tb)
+        tk = np.clip(t_kink, ta, tb)
+        use_x_2 = np.where(kink_inside, ~use_x_left, use_x_left)
+        hit |= _seg(ta, tk, use_x_left, valid & (ta < tk))
+        hit |= _seg(tk, tb, use_x_2, valid & (tk < tb))
+    return hit
+
+
+def _corner_hit(o, d, half_x, half_y, sx, sy, rr, z0, z1, round_top, round_bot, eps):
+    """(N,) bool — OR of the sharp-middle / bottom-rounded / top-rounded
+    sub-ranges for one corner of a RoundedCross."""
+    zlo = z0 + (rr if round_bot else 0.0)
+    zhi = z1 - (rr if round_top else 0.0)
+    hit = np.zeros(len(o), bool)
+    if round_bot:
+        ta, tb, valid = _t_range_for_z(o, d, z0, z0 + rr, eps)
+        hit |= _corner_rounded_hit(o, d, half_x, half_y, sx, sy, rr, z0, -1, ta, tb, valid)
+    if zhi > zlo:
+        ta, tb, valid = _t_range_for_z(o, d, zlo, zhi, eps)
+        hit |= _corner_sharp_hit(o, d, half_x, half_y, sx, sy, ta, tb, valid)
+    if round_top:
+        ta, tb, valid = _t_range_for_z(o, d, z1 - rr, z1, eps)
+        hit |= _corner_rounded_hit(o, d, half_x, half_y, sx, sy, rr, z1, +1, ta, tb, valid)
+    return hit
+
+
+def _occluded_rounded_rect(origins, d, rc, eps=1e-3):
+    """Boolean (N,) — analytic equivalent of `_occluded` for one RoundedRect
+    (Dolan's rounded trench): OR of its 4 walls."""
+    o = np.asarray(origins, float)
+    d = np.asarray(d, float)
+    hit = _wall_hit(o, d, rc.hx, rc.rr, rc.z0, rc.z1, rc.round_top, rc.round_bot, 0, +1, eps)
+    hit |= _wall_hit(o, d, rc.hx, rc.rr, rc.z0, rc.z1, rc.round_top, rc.round_bot, 0, -1, eps)
+    hit |= _wall_hit(o, d, rc.hy, rc.rr, rc.z0, rc.z1, rc.round_top, rc.round_bot, 1, +1, eps)
+    hit |= _wall_hit(o, d, rc.hy, rc.rr, rc.z0, rc.z1, rc.round_top, rc.round_bot, 1, -1, eps)
+    return hit
+
+
+def _occluded_rounded_cross(origins, d, rx, eps=1e-3):
+    """Boolean (N,) — analytic equivalent of `_occluded` for one RoundedCross
+    (Manhattan's rounded resist cross): OR of its 4 strip-end walls and 4
+    corners (no special corner-rounding term needed — see RoundedCross)."""
+    o = np.asarray(origins, float)
+    d = np.asarray(d, float)
+    args = (rx.rr, rx.z0, rx.z1, rx.round_top, rx.round_bot)
+    hit = _wall_hit(o, d, rx.arm, *args, 1, +1, eps)
+    hit |= _wall_hit(o, d, rx.arm, *args, 1, -1, eps)
+    hit |= _wall_hit(o, d, rx.arm, *args, 0, -1, eps)
+    hit |= _wall_hit(o, d, rx.arm, *args, 0, +1, eps)
+    for sx in (+1, -1):
+        for sy in (+1, -1):
+            hit |= _corner_hit(o, d, rx.hx_b, rx.hy_a, sx, sy, *args, eps)
+    return hit
+
+
 def _layer_boxes(open_rects, R, z0, z1, r=0.0, round_top=False, round_bot=False):
     """Complement of `open_rects` in [-R,R]² over [z0,z1], with the opening
     optionally flared by a radius-`r` quarter-round at its top (z1) and/or bottom
@@ -126,6 +374,10 @@ def _layer_boxes(open_rects, R, z0, z1, r=0.0, round_top=False, round_bot=False)
     the wall and that face, approximated by `K` thin z-slabs.  `K` adapts to the
     radius (not the voxel grid), so the modelled fillet is a fixed, density-
     independent circle.  r<=0 ⇒ a plain layer.
+
+    Legacy ``resist_round_method="voxel"`` path — kept alongside the analytic
+    RoundedRect/RoundedCross model (`_occluded_rounded_rect`/`_cross`) as a
+    slower but independently-implemented option; see `build_occluders`.
     """
     rr = float(max(0.0, r))
     if rr <= 0.0 or not (round_top or round_bot):
@@ -156,7 +408,10 @@ def _layer_boxes(open_rects, R, z0, z1, r=0.0, round_top=False, round_bot=False)
 
 
 def build_occluders(p: ProcessParams):
-    """Return (boxes, R, z_top, resist_h) for the given process."""
+    """Return (boxes, R, z_top, resist_h, z_split, rounded) for the given
+    process.  ``rounded`` is a list of RoundedRect/RoundedCross — the
+    analytic resist-rounding occluders OR'd in alongside ``boxes`` by
+    `_occluded_any` — empty when ``resist_round<=0``."""
     if p.mode == "Dolan bridge":
         L = p.bridge_len                            # suspended bridge width (x)
         Wj = p.bridge_w                             # junction width (y)
@@ -177,6 +432,7 @@ def build_occluders(p: ProcessParams):
 
         rr = getattr(p, "resist_round", 0.0)
         boxes = []
+        rounded = []
         if rr <= 0.0:
             # MMA (undercut sublayer) fills 0..gap; trench widened by undercut.
             boxes += _frame_boxes(trench_hx + u, ap_hy + u, 0.0, gap, R)
@@ -185,15 +441,23 @@ def build_occluders(p: ProcessParams):
         else:
             # Rounded resist: only the PMMA (top) layer is filleted — its top lip
             # and its bottom face at the MMA interface.  The MMA (bottom) layer
-            # stays sharp.
+            # stays sharp.  Two interchangeable models, selected by
+            # `resist_round_method`: "analytic" (default, fast — RoundedRect /
+            # `_occluded_rounded_rect`) or "voxel" (legacy K-slab box stack,
+            # slower — `_layer_boxes`).
             boxes += _frame_boxes(trench_hx + u, ap_hy + u, 0.0, gap, R)
-            boxes += _layer_boxes(
-                [(-trench_hx, trench_hx, -ap_hy, ap_hy)],
-                R, gap, z_top, rr, round_top=True, round_bot=True)
+            if getattr(p, "resist_round_method", "analytic") == "voxel":
+                boxes += _layer_boxes(
+                    [(-trench_hx, trench_hx, -ap_hy, ap_hy)],
+                    R, gap, z_top, rr, round_top=True, round_bot=True)
+            else:
+                rr_clamped = min(rr, (z_top - gap) / 2.0)   # keep top/bottom fillets apart
+                rounded.append(RoundedRect(hx=trench_hx, hy=ap_hy, z0=gap, z1=z_top,
+                                           rr=rr_clamped, round_top=True, round_bot=True))
         # Suspended bridge: narrow strip across the middle of the trench,
         # hanging over the air gap at z = gap.
         boxes.append(_box(-L / 2, L / 2, -ap_hy, ap_hy, gap, z_top))
-        return boxes, R, z_top, gap, gap   # z_split = MMA/PMMA interface
+        return boxes, R, z_top, gap, gap, rounded   # z_split = MMA/PMMA interface
 
     else:  # Manhattan double-oblique: two perpendicular resist lines crossing
         wA = p.manhattan_wx        # electrode A linewidth (A runs along x)
@@ -221,16 +485,27 @@ def build_occluders(p: ProcessParams):
         A_u = (-arm, arm, -wA / 2 - u, wA / 2 + u)
         B_u = (-wB / 2 - u, wB / 2 + u, -arm, arm)
         rr = getattr(p, "resist_round", 0.0)
+        rounded = []
         if rr <= 0.0:
             boxes = _rect_boxes([A_u, B_u], R, 0.0, t_lo)   # lower (undercut)
             boxes += _rect_boxes([A, B], R, t_lo, z_top)    # upper (imaging)
         else:
             # Rounded resist: only the upper (imaging) layer is filleted — its top
-            # lip and its bottom face at the interface.  The lower layer stays sharp.
+            # lip and its bottom face at the interface.  The lower layer stays
+            # sharp.  Two interchangeable models, selected by
+            # `resist_round_method`: "analytic" (default, fast — RoundedCross /
+            # `_occluded_rounded_cross`) or "voxel" (legacy K-slab box stack,
+            # slower — `_layer_boxes`).
             boxes = _rect_boxes([A_u, B_u], R, 0.0, t_lo)
-            boxes += _layer_boxes([A, B], R, t_lo, z_top, rr,
-                                  round_top=True, round_bot=True)
-        return boxes, R, z_top, z_top, t_lo    # z_split = undercut/imaging interface
+            if getattr(p, "resist_round_method", "analytic") == "voxel":
+                boxes += _layer_boxes([A, B], R, t_lo, z_top, rr,
+                                      round_top=True, round_bot=True)
+            else:
+                rr_clamped = min(rr, (z_top - t_lo) / 2.0)
+                rounded.append(RoundedCross(arm=arm, hy_a=wA / 2, hx_b=wB / 2,
+                                            z0=t_lo, z1=z_top, rr=rr_clamped,
+                                            round_top=True, round_bot=True))
+        return boxes, R, z_top, z_top, t_lo, rounded   # z_split = undercut/imaging interface
 
 
 # ════════════════════════════════════════════════════════════════
@@ -268,6 +543,24 @@ def _occluded(origins, d, boxes, eps=1e-3):
         hit |= this
         if hit.all():
             break
+    return hit
+
+
+def _occluded_any(origins, d, boxes, rounded, eps=1e-3):
+    """Boolean (N,) — does the ray hit any plain box OR any analytic rounded
+    occluder (RoundedRect/RoundedCross; ``rounded`` is empty when
+    resist_round<=0, in which case this is exactly `_occluded`)?"""
+    hit = _occluded(origins, d, boxes, eps)
+    if not rounded:
+        return hit
+    o = np.asarray(origins, float)
+    for ro in rounded:
+        if hit.all():
+            break
+        if isinstance(ro, RoundedCross):
+            hit |= _occluded_rounded_cross(o, d, ro, eps)
+        else:
+            hit |= _occluded_rounded_rect(o, d, ro, eps)
     return hit
 
 
@@ -340,8 +633,9 @@ def _grid_axes(R, z_top, t_metal_tot, max_cells=MAX_CELLS_PER_AXIS, min_vox=6.0)
     return xs, ys, zs, vox, z_hi
 
 
-def _label_solid(xs, ys, zs, boxes):
-    """Label grid: SUBSTRATE for z<0, RESIST inside any box, else EMPTY."""
+def _label_solid(xs, ys, zs, boxes, rounded=()):
+    """Label grid: SUBSTRATE for z<0, RESIST inside any box or analytic
+    rounded occluder (RoundedRect/RoundedCross), else EMPTY."""
     Nx, Ny, Nz = len(xs), len(ys), len(zs)
     lab = np.zeros((Nx, Ny, Nz), np.int8)
     lab[:, :, zs < 0] = SUBSTRATE
@@ -350,6 +644,16 @@ def _label_solid(xs, ys, zs, boxes):
         inside = ((X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1) &
                   (Z >= z0) & (Z <= z1))
         lab[inside] = RESIST
+    for ro in rounded:
+        e = _e_of_z(Z, ro.z0, ro.z1, ro.rr, ro.round_top, ro.round_bot)
+        in_z = (Z >= ro.z0) & (Z <= ro.z1)
+        if isinstance(ro, RoundedCross):
+            inA = (np.abs(X) <= ro.arm + e) & (np.abs(Y) <= ro.hy_a + e)
+            inB = (np.abs(X) <= ro.hx_b + e) & (np.abs(Y) <= ro.arm + e)
+            solid = (~inA) & (~inB) & in_z
+        else:
+            solid = ~((np.abs(X) <= ro.hx + e) & (np.abs(Y) <= ro.hy + e)) & in_z
+        lab[solid] = RESIST
     return lab
 
 
@@ -369,7 +673,7 @@ def _plassys_dirs(theta, phi, pattern, size, L, K=24, seed=0):
     return dirs
 
 
-def _cloud_coverage(o, bi, bj, bk, soft, boxes, occ_mask, sub_offsets, on_pass,
+def _cloud_coverage(o, bi, bj, bk, soft, boxes, rounded, occ_mask, sub_offsets, on_pass,
                     return_sub=False):
     """Average lit-fraction over the source-cloud directions ``soft`` for a set
     of surface-cell origins ``o``, optionally supersampled at ``sub_offsets``
@@ -397,7 +701,7 @@ def _cloud_coverage(o, bi, bj, bk, soft, boxes, occ_mask, sub_offsets, on_pass,
         if occ_mask is not None:
             side_ok = ~_occluded_mask(bi, bj, bk, dk, occ_mask)
         for si, off in enumerate(sub_offsets):
-            lit_k = ~_occluded(o + off, -dk, boxes)
+            lit_k = ~_occluded_any(o + off, -dk, boxes, rounded)
             if side_ok is not None:
                 lit_k &= side_ok
             acc += lit_k.astype(float)
@@ -412,7 +716,7 @@ def _cloud_coverage(o, bi, bj, bk, soft, boxes, occ_mask, sub_offsets, on_pass,
     return cov
 
 
-def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
+def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None, soft=None,
              record=False, on_pass=None, band_w=3, lateral_supersample=1,
              return_cov=False):
     """Return bool grid of metal voxels for one evaporation.
@@ -506,7 +810,7 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
     C = 8 if on_pass is not None else 1
     central_lit = np.empty(N, bool)
     for ch in np.array_split(np.arange(N), min(C, N)):
-        central_lit[ch] = ~_occluded(origins[ch], -d, boxes)
+        central_lit[ch] = ~_occluded_any(origins[ch], -d, boxes, rounded)
         if on_pass is not None:
             on_pass()
     if occ_mask is not None:                 # sidewall: prior-metal wall coating shadows
@@ -553,12 +857,13 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
             bo = origins[bidx]
             bi, bj, bk = ii[bidx], jj[bidx], kk[bidx]
             if want_sub:
-                cov_b, cov_sub_b = _cloud_coverage(bo, bi, bj, bk, soft, boxes, occ_mask,
-                                                   sub_offsets, on_pass, return_sub=True)
+                cov_b, cov_sub_b = _cloud_coverage(bo, bi, bj, bk, soft, boxes, rounded,
+                                                   occ_mask, sub_offsets, on_pass,
+                                                   return_sub=True)
                 cov[bidx] = cov_b
                 cov_sub_inner[bidx] = cov_sub_b
             else:
-                cov[bidx] = _cloud_coverage(bo, bi, bj, bk, soft, boxes, occ_mask,
+                cov[bidx] = _cloud_coverage(bo, bi, bj, bk, soft, boxes, rounded, occ_mask,
                                             sub_offsets, on_pass)
         elif on_pass is not None:
             for _ in soft:
@@ -588,10 +893,10 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, occ_mask=None, soft=None,
             oi_, oj_, ok_ = ii[oidx], jj[oidx], kk[oidx]
             if want_sub:
                 cov_outer, cov_sub_outer = _cloud_coverage(
-                    oo, oi_, oj_, ok_, soft, boxes, occ_mask, sub_offsets, on_pass,
+                    oo, oi_, oj_, ok_, soft, boxes, rounded, occ_mask, sub_offsets, on_pass,
                     return_sub=True)
             else:
-                cov_outer = _cloud_coverage(oo, oi_, oj_, ok_, soft, boxes, occ_mask,
+                cov_outer = _cloud_coverage(oo, oi_, oj_, ok_, soft, boxes, rounded, occ_mask,
                                             sub_offsets, on_pass)
         elif on_pass is not None:
             for _ in soft:
@@ -679,7 +984,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     growth layer is tagged with a global step, so a frame at step k shows the metal
     deposited so far.  Off by default (no extra cost on the wafer/scan/MC paths).
     """
-    boxes, R, z_top, resist_h, z_split = build_occluders(p)
+    boxes, R, z_top, resist_h, z_split, rounded = build_occluders(p)
     trilayer = getattr(p, "stack", "Bilayer") == "Trilayer"
     if trilayer:
         metal_sum = p.tri_t1 + p.tri_t2 + p.tri_t3 + p.tri_t4
@@ -703,7 +1008,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         grid_R = min(R, 1.6 * span + 800.0)
     xs, ys, zs, vox, z_hi = _grid_axes(grid_R, z_top, t_tot_metal,
                                        max_cells=max_cells, min_vox=min_vox)
-    lab = _label_solid(xs, ys, zs, boxes)
+    lab = _label_solid(xs, ys, zs, boxes, rounded)
 
     def _oxide_skin(metal):
         """One-cell conformal oxide skin on all exposed faces of `metal`."""
@@ -768,7 +1073,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
     def _dep(lab_, d_, t_, occ_, soft_, label):
         op = _on_pass_for(label)
         if record:
-            m, o, (cg, csub) = _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
+            m, o, (cg, csub) = _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes, rounded,
                                         occ_mask=occ_, soft=soft_, record=True, return_cov=True,
                                         on_pass=op, band_w=_band_w, lateral_supersample=_lat_sub)
             _rec.append((o, label, float(t_)))
@@ -777,7 +1082,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
                 if csub is not None:
                     _cov_sub_rec[label] = csub
             return m
-        return _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes,
+        return _deposit(lab_, xs, ys, zs, vox, d_, t_, boxes, rounded,
                         occ_mask=occ_, soft=soft_, on_pass=op, band_w=_band_w,
                         lateral_supersample=_lat_sub)
 
@@ -853,7 +1158,8 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
                 stack="Trilayer" if trilayer else "Bilayer",
                 tri_dirs=tri_dirs,
                 max_cells=max_cells, min_vox=min_vox,
-                soft_supersample=_lat_sub)
+                soft_supersample=_lat_sub,
+                resist_round=getattr(p, "resist_round", 0.0), rounded_geom=rounded)
 
     # ── Playback timeline (when recording) ────────────────────────
     depo_order = depo_frames = None
