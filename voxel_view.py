@@ -151,7 +151,7 @@ def _extent(h_axis, v_axis):
 
 
 def _metal_voxel_outline(ax, is_metal, h_axis, v_axis, color="white", lw=0.3,
-                         alpha=0.55):
+                         alpha=0.55, h_group=None):
     """Outline every metal voxel cell (all 4 edges, including the internal
     edges between two adjacent metal cells) so the outline traces exactly the
     voxel granularity of the metal blocks already drawn by ``_draw`` — no
@@ -160,7 +160,16 @@ def _metal_voxel_outline(ax, is_metal, h_axis, v_axis, color="white", lw=0.3,
     neighbouring cells is drawn whenever *either* side is metal, so an
     isolated metal cell gets all 4 sides outlined and a contiguous metal
     block additionally shows its internal cell-to-cell divisions, while
-    resist/substrate/empty regions are left unmarked."""
+    resist/substrate/empty regions are left unmarked.
+
+    ``h_group`` (optional, length ``nh``): an opaque per-sample label along
+    the horizontal axis.  Adjacent samples sharing the same label are treated
+    as one voxel for outlining purposes — no internal boundary is drawn
+    between them — so a region that's actually several fine sample points
+    repeating one coarse cell's value (no real sub-voxel data there) reads as
+    a single voxel, while points with distinct labels (e.g. each given its
+    own unique label) still get a full per-point outline.  ``None`` (default)
+    treats every sample as its own voxel, today's behaviour."""
     nh, nv = is_metal.shape
     if nh == 0 or nv == 0:
         return
@@ -185,6 +194,9 @@ def _metal_voxel_outline(ax, is_metal, h_axis, v_axis, color="white", lw=0.3,
     vbound[1:-1] = is_metal[:-1, :] | is_metal[1:, :]
     vbound[0] = is_metal[0]
     vbound[-1] = is_metal[-1]
+    if h_group is not None and nh > 1:
+        same_group = np.asarray(h_group)[:-1] == np.asarray(h_group)[1:]
+        vbound[1:-1] &= ~same_group[:, None]
     h_edges = h_axis[0] - hh + dh * np.arange(nh + 1)
     for ei in range(nh + 1):
         for k0, k1 in _runs(vbound[ei]):
@@ -530,9 +542,14 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
     wrong guess.  Reconstruction is only attempted on (simple) columns where
     the combined structure is a single contiguous run from the floor.
 
-    Returns ``(solid2d, al1, al2, h_axis, h_label, ix, iy, films2d)`` — same
-    shape as ``_slice_planes`` minus the (here, redrawn geometrically
-    anyway, so unused) ``alox`` field."""
+    Returns ``(solid2d, al1, al2, h_axis, h_label, ix, iy, films2d, is_fine)``
+    — same as ``_slice_planes`` minus the (here, redrawn geometrically
+    anyway, so unused) ``alox`` field, plus a trailing ``(Npts,)`` bool
+    ``is_fine``: True where some evaporation's metal at that point was
+    genuinely reconstructed from coverage data, False where it's just the
+    coarse value repeated (outside any band, or a complex column copied
+    through) — so callers can avoid drawing fine-grained detail (e.g. voxel
+    outlines) where there isn't actually any."""
     ns = max(1, int(r.meta.get("soft_supersample_xy", 1)))
     ix, iy, sub_idx, s, inside = _oblique_columns_fine(r, angle_deg, offset, ns)
     Nz = r.solid.shape[2]
@@ -569,6 +586,7 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
     simple = _column_is_simple(union_coarse)
 
     running_height = np.ones(Npts, dtype=int)
+    is_fine = np.zeros(Npts, dtype=bool)
     fine = {}
     for key, label in order:
         metal_E = masks[key]
@@ -594,6 +612,15 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
         # (recorded once per column, at the first such event) cannot
         # reconstruct.  Trust the coarse mask there instead of guessing low.
         use_fine = simple & has_cov & (coarse_th <= n_E)
+        # `has_cov` alone is True almost everywhere metal exists (the engine
+        # records coverage at every surface-contact cell, including fully-lit
+        # interior ones at exactly 1.0) — not just the narrow ray-tested
+        # band.  For OUTLINE purposes specifically, only a genuinely
+        # fractional value (strictly between 0 and 1, the same "in the band"
+        # criterion used elsewhere, e.g. find_coverage_bands) represents a
+        # real sub-voxel taper; an interior cov_raw==1.0 reconstructs to
+        # exactly the coarse value, so there's nothing actually finer there.
+        is_fine |= use_fine & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
         target_E = np.where(use_fine, np.round(np.clip(cov_raw, 0.0, 1.0) * n_E),
                             coarse_th).astype(int)
         target_E = np.where(out, 0, target_E)
@@ -612,8 +639,8 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
     h_label = f"distance along slice  [nm]   (α = {angle_deg:.0f}°)"
     if trilayer:
         return (solid2d, fine["nb1"] | fine["al2"], fine["al3"] | fine["nb4"],
-                s, h_label, ix, iy, fine)
-    return solid2d, fine["al1"], fine["al2"], s, h_label, ix, iy, None
+                s, h_label, ix, iy, fine, is_fine)
+    return solid2d, fine["al1"], fine["al2"], s, h_label, ix, iy, None, is_fine
 
 
 def _paint_trilayer_metal(cat, films2d):
@@ -664,8 +691,9 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     thickness)."""
     zs = r.zs
     z_split = r.meta.get("z_split", r.z_top)
+    is_fine = None
     if fine_detail and r.coverage_sub and metal_thicknesses:
-        solid2d, al1, al2, h_axis, h_label, ix, iy, films2d = _slice_planes_fine(
+        solid2d, al1, al2, h_axis, h_label, ix, iy, films2d, is_fine = _slice_planes_fine(
             r, angle_deg, offset, metal_thicknesses)
     else:
         solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d = _slice_planes(
@@ -711,7 +739,16 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hwin, vlim=vlim)
     if show_voxel_grid:
         is_metal = np.isin(cat, _METAL_CATS + _TRI_METAL_CATS)
-        _metal_voxel_outline(ax, is_metal, h_axis, zs)
+        h_group = None
+        if is_fine is not None:
+            # Group fine sample points that just repeat one coarse cell's
+            # value (no real sub-voxel data there) under one shared label, so
+            # the outline only shows genuinely finer voxels where the
+            # reconstruction actually resolved them — not at every fine
+            # sample point regardless of whether anything new is there.
+            coarse_id = ix.astype(np.int64) * (int(iy.max()) + 1) + iy.astype(np.int64)
+            h_group = np.where(is_fine, np.arange(len(is_fine)), coarse_id)
+        _metal_voxel_outline(ax, is_metal, h_axis, zs, h_group=h_group)
     # AlOx: a thin (~3 nm) skin on every exposed Al1 face, incl. the Al1/Al2
     # interface (so Al2 sits on top of the barrier) and the metal corners.
     _oxide_edges_cs(ax, al1, (solid2d == RESIST) | (solid2d == SUBSTRATE),
