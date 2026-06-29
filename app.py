@@ -1140,10 +1140,32 @@ with tab1:
             help="Outline every deposited-metal voxel with a thin white "
                  "line, so the actual voxel size/granularity of the metal "
                  "is visible directly on the image.")
+        _has_fine = bool(getattr(eng, "coverage_sub", None))
+        _show_fine_detail = st.checkbox(
+            "Show fine sub-voxel detail (soft-edge)", key="cs_fine_detail",
+            disabled=not _has_fine,
+            help="Replace each evaporation's metal near the soft-edge band "
+                 "with its true sub-voxel taper shape (from the lateral/z "
+                 "sub-sampling controls), correctly stacked where one "
+                 "evaporation deposits on top of another (e.g. a junction "
+                 "overlap) — instead of the coarse base-grid voxel size. "
+                 "Columns with more than one disconnected metal surface "
+                 "(e.g. sidewall coating plus a separate suspended-bridge "
+                 "underside) can't be reconstructed from coverage data alone "
+                 "and render exactly as the coarse view there instead." +
+                 ("" if _has_fine else "  Needs soft edge + lateral/z "
+                  "sub-sampling > 1 (no fine data in this result)."))
+        if params.stack == "Trilayer":
+            _metal_t = {"Evap 1 — Nb": params.tri_t1, "Evap 2 — Al": params.tri_t2,
+                       "Evap 3 — Al": params.tri_t3, "Evap 4 — Nb": params.tri_t4}
+        else:
+            _metal_t = {"Evap 1": params.t_metal1, "Evap 2": params.t_metal2}
         figc = vv.render_cross_section(eng, slice_angle, slice_pos, eng_jm,
                                        view_half=cs_half, zmax=cs_zmax,
                                        view_center=cs_xc, zmin=_cs_zmin,
-                                       show_voxel_grid=_show_vox_grid)
+                                       show_voxel_grid=_show_vox_grid,
+                                       fine_detail=_show_fine_detail,
+                                       metal_thicknesses=_metal_t)
         st.pyplot(figc, use_container_width=True)
         plt.close(figc)
 

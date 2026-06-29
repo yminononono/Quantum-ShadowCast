@@ -489,6 +489,133 @@ def _slice_planes(r, angle_deg, offset):
     return solid2d, al1, al2, alox, s, label, ix, iy, films2d
 
 
+def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
+    """Like ``_slice_planes``, but at fine sub-voxel resolution (``ns`` points
+    per coarse voxel, from ``r.meta['soft_supersample_xy']``): each
+    evaporation's metal extent is reconstructed from its ``coverage``/
+    ``coverage_sub`` data where available (falling back to the coarse
+    thickness elsewhere — same "outside the band, coarse value repeated"
+    convention as ``render_coverage_cross_section``), stacked in deposition
+    order so a later evaporation that deposits on top of an earlier one (a
+    junction overlap) is placed immediately above whatever's already there,
+    not naively from the floor — sound because every evaporation's own
+    occlusion test in ``deposition3d.simulate()`` is built against the
+    cumulative union of all previously-deposited metal, so summing each
+    evaporation's own thickness in deposition order reproduces the true
+    stack height at any column.
+
+    ``metal_thicknesses`` (dict: evaporation label → nominal thickness [nm])
+    is required to correctly convert a coverage fraction into a voxel-layer
+    count (``round(coverage * t_metal/vox)``) — it is NOT safe to infer this
+    from the metal mask's own data (e.g. its tallest column), because a
+    sidewall-coated column can be far taller than the nominal floor
+    thickness (coating the full height of a resist wall), which would
+    silently inflate every fractional-coverage column's reconstructed
+    thickness too.  A per-evaporation column thicker than its own nominal
+    depth (``coarse_th > n_E``) is detected as exactly this case and falls
+    back to the coarse mask's own thickness there instead of guessing low.
+
+    A column can also have more than one physically disconnected metal
+    surface for the SAME evaporation — e.g. sidewall coating low on a wall
+    AND, separately, a suspended bridge's underside higher up, with a real
+    air-gap between them.  ``_column_metal_thickness``/
+    ``_column_coverage_value`` only ever see a column's FIRST such run, so
+    reconstructing+stacking a later evaporation against that run alone would
+    silently place it at the wrong height (on top of the sidewall coating
+    instead of on top of the real, separate floor/junction deposit).
+    ``_column_is_simple`` detects this from the union of every film's real
+    coarse structure; for those (complex) columns this function skips
+    reconstruction entirely and copies each evaporation's real coarse mask
+    straight through, so they render exactly like the coarse view — never a
+    wrong guess.  Reconstruction is only attempted on (simple) columns where
+    the combined structure is a single contiguous run from the floor.
+
+    Returns ``(solid2d, al1, al2, h_axis, h_label, ix, iy, films2d)`` — same
+    shape as ``_slice_planes`` minus the (here, redrawn geometrically
+    anyway, so unused) ``alox`` field."""
+    ns = max(1, int(r.meta.get("soft_supersample_xy", 1)))
+    ix, iy, sub_idx, s, inside = _oblique_columns_fine(r, angle_deg, offset, ns)
+    Nz = r.solid.shape[2]
+    Npts = len(s)
+    out = ~inside
+
+    solid2d = r.solid[ix, iy, :].copy()
+    if out.any():
+        solid2d[out, :] = EMPTY
+
+    trilayer = getattr(r, "stack", "Bilayer") == "Trilayer" and r.films
+    if trilayer:
+        order = [("nb1", "Evap 1 — Nb"), ("al2", "Evap 2 — Al"),
+                 ("al3", "Evap 3 — Al"), ("nb4", "Evap 4 — Nb")]
+        masks = {k: r.films[k] for k, _ in order}
+    else:
+        order = [("al1", "Evap 1"), ("al2", "Evap 2")]
+        masks = {"al1": r.al1, "al2": r.al2}
+
+    # A column can have more than one physically disconnected metal surface
+    # for the same evaporation (sidewall coating low on a wall, separately a
+    # suspended bridge's underside higher up, with a real air-gap between) —
+    # `_column_metal_thickness`/`_column_coverage_value` only ever see the
+    # FIRST such run, so reconstructing+stacking against the combined union
+    # would silently misplace a later evaporation onto the wrong run.  Detect
+    # that case from the union of every film's real coarse structure and, for
+    # those columns only, skip reconstruction entirely and copy the real
+    # structure straight through instead of guessing.
+    union_coarse = masks[order[0][0]][ix, iy, :].copy()
+    for key, _ in order[1:]:
+        union_coarse |= masks[key][ix, iy, :]
+    if out.any():
+        union_coarse[out, :] = False
+    simple = _column_is_simple(union_coarse)
+
+    running_height = np.ones(Npts, dtype=int)
+    fine = {}
+    for key, label in order:
+        metal_E = masks[key]
+        coarse_full = metal_E[ix, iy, :]
+        if out.any():
+            coarse_full = coarse_full.copy()
+            coarse_full[out, :] = False
+        n_E = max(1, int(round(metal_thicknesses[label] / r.vox)))
+        coarse_th = _column_metal_thickness(coarse_full)
+        cov_sub_E = (r.coverage_sub or {}).get(label)
+        cov_grid_E = (r.coverage or {}).get(label)
+        if cov_sub_E is not None:
+            stacked_E = np.stack(cov_sub_E, axis=0)
+            has_cov, cov_raw = _column_coverage_value(stacked_E[sub_idx, ix, iy, :])
+        elif cov_grid_E is not None:
+            has_cov, cov_raw = _column_coverage_value(cov_grid_E[ix, iy, :])
+        else:
+            has_cov = np.zeros(Npts, bool); cov_raw = np.full(Npts, -1.0)
+        # A single floor-deposition growth event can be at most n_E voxels
+        # deep — a column thicker than that in the coarse mask is multiple
+        # independent 1-voxel-deep surface-contact events stacked along a
+        # resist wall (sidewall coating), which `coverage`/`coverage_sub`
+        # (recorded once per column, at the first such event) cannot
+        # reconstruct.  Trust the coarse mask there instead of guessing low.
+        use_fine = simple & has_cov & (coarse_th <= n_E)
+        target_E = np.where(use_fine, np.round(np.clip(cov_raw, 0.0, 1.0) * n_E),
+                            coarse_th).astype(int)
+        target_E = np.where(out, 0, target_E)
+
+        end = np.minimum(running_height + target_E, Nz)
+        mask_E = np.zeros((Npts, Nz), dtype=bool)
+        for p in range(Npts):
+            if simple[p]:
+                if end[p] > running_height[p]:
+                    mask_E[p, running_height[p]:end[p]] = True
+            else:
+                mask_E[p, :] = coarse_full[p, :]
+        fine[key] = mask_E
+        running_height = np.where(simple, end, running_height)
+
+    h_label = f"distance along slice  [nm]   (α = {angle_deg:.0f}°)"
+    if trilayer:
+        return (solid2d, fine["nb1"] | fine["al2"], fine["al3"] | fine["nb4"],
+                s, h_label, ix, iy, fine)
+    return solid2d, fine["al1"], fine["al2"], s, h_label, ix, iy, None
+
+
 def _paint_trilayer_metal(cat, films2d):
     """Colour trilayer metal cells by evaporation (per-film brightness shade).
 
@@ -512,7 +639,8 @@ def _resist_cat_cross(cat, solid2d, zs, z_split):
 
 def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
                          junc_mask=None, view_half=None, zmax=None,
-                         view_center=0.0, zmin=None, show_voxel_grid=False):
+                         view_center=0.0, zmin=None, show_voxel_grid=False,
+                         fine_detail=False, metal_thicknesses=None):
     """Render one combined cross-section slice (all layers, junction marked).
 
     The slice is taken at in-plane azimuth ``angle_deg`` with perpendicular
@@ -521,11 +649,27 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     ``show_voxel_grid`` outlines every deposited-metal voxel cell (including
     the internal edges between adjacent metal cells) with a thin white line,
     so the actual voxel size/granularity of the metal is visible directly on
-    the image — resist/substrate/empty regions are left unmarked."""
+    the image — resist/substrate/empty regions are left unmarked.
+
+    ``fine_detail`` (only meaningful when ``r.coverage_sub`` has data — i.e.
+    a soft-edge run with lateral/z sub-sampling > 1) swaps the coarse
+    per-voxel metal extent for the true sub-voxel taper shape near the
+    shadow edge, via :func:`_slice_planes_fine` — both metals (or all 4
+    Trilayer films) shown together, correctly stacked.  Requires
+    ``metal_thicknesses`` (dict: evaporation label → nominal thickness [nm],
+    e.g. ``{"Evap 1": params.t_metal1, "Evap 2": params.t_metal2}``) to
+    convert coverage fractions into voxel-layer counts correctly; without it,
+    falls back to the coarse rendering rather than guessing (a sidewall-
+    coated column's height is not a safe stand-in for the nominal floor
+    thickness)."""
     zs = r.zs
     z_split = r.meta.get("z_split", r.z_top)
-    solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d = _slice_planes(
-        r, angle_deg, offset)
+    if fine_detail and r.coverage_sub and metal_thicknesses:
+        solid2d, al1, al2, h_axis, h_label, ix, iy, films2d = _slice_planes_fine(
+            r, angle_deg, offset, metal_thicknesses)
+    else:
+        solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d = _slice_planes(
+            r, angle_deg, offset)
 
     cat = np.full(solid2d.shape, C_EMPTY, np.int8)
     cat[solid2d == SUBSTRATE] = C_SUBSTRATE
@@ -671,6 +815,21 @@ def _column_metal_thickness(col):
     gap_idx = np.argmax(~masked, axis=1)
     th = np.where(masked.all(axis=1), Nz, gap_idx) - z_start
     return np.where(any_metal, th, 0)
+
+
+def _column_is_simple(union_row_2d):
+    """(Npts, Nz) bool -> (Npts,) bool: True where the combined metal in this
+    column is a single contiguous run starting at the floor (z=1), with
+    nothing else anywhere else in the column — i.e. no separate physically
+    disconnected surface (sidewall coating below a gap, a suspended bridge's
+    underside above one, etc.) that per-evaporation coverage data can't be
+    correctly positioned against, since ``_column_metal_thickness``/
+    ``_column_coverage_value`` only ever see a column's first such run."""
+    any_metal = union_row_2d.any(axis=1)
+    z_start = np.argmax(union_row_2d, axis=1)
+    run_len = _column_metal_thickness(union_row_2d)
+    total = union_row_2d.sum(axis=1)
+    return (~any_metal) | ((z_start <= 1) & (run_len == total))
 
 
 def _coverage_profile_arrays(r, metal, n_nominal, coverage_grid, coverage_sub,
