@@ -20,6 +20,7 @@ slab ray–AABB test in NumPy — no rtree/embree needed.
 """
 
 from dataclasses import dataclass
+from itertools import combinations
 import numpy as np
 
 from process_engine import ProcessParams, wafer_local_angles, sample_beam_cloud
@@ -818,6 +819,24 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
     # dominant-axis step used only for growing the film back toward the source
     fwd = np.round(d / (np.abs(d).max() + 1e-12)).astype(int)
 
+    # Past ~26.57 deg (tan(theta) >= 0.5) `fwd` gains a second nonzero axis,
+    # making the growth step a true diagonal -- consecutive grown voxels then
+    # only touch at a shared edge/corner, never a shared face, leaving a
+    # one-voxel staircase crack through what a continuous deposit would
+    # render as solid metal.  `corner_fill_offsets` lists every partial step
+    # (one nonzero-fwd axis at a time, for each proper non-empty subset of
+    # the nonzero axes) needed to fill that crack in; empty -- a guaranteed
+    # no-op -- whenever fwd is already axis-aligned.
+    _nz_axes = [ax for ax in range(3) if fwd[ax] != 0]
+    corner_fill_offsets = []
+    if len(_nz_axes) >= 2:
+        for r in range(1, len(_nz_axes)):
+            for combo in combinations(_nz_axes, r):
+                off = [0, 0, 0]
+                for ax in combo:
+                    off[ax] = fwd[ax]
+                corner_fill_offsets.append(tuple(off))
+
     surface = (~solid) & nbr
     ii, jj, kk = np.where(surface)
     if len(ii) == 0:
@@ -998,15 +1017,38 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
     # round(coverage·n) so the penumbra reads as a rounded metal shoulder.
     cur_i, cur_j, cur_k = gi.copy(), gj.copy(), gk.copy()
     for mstep in range(1, max(n, 1)):
+        prev_i, prev_j, prev_k = cur_i, cur_j, cur_k
         cur_i = cur_i - fwd[0]; cur_j = cur_j - fwd[1]; cur_k = cur_k - fwd[2]
         grow = ((target > mstep) &
                 (cur_i >= 0) & (cur_i < Nx) & (cur_j >= 0) & (cur_j < Ny) &
                 (cur_k >= 0) & (cur_k < Nz))
         ci, cj, ck = cur_i[grow], cur_j[grow], cur_k[grow]
         free = ~solid[ci, cj, ck]
-        metal[ci[free], cj[free], ck[free]] = True
+        gci, gcj, gck = ci[free], cj[free], ck[free]
+        metal[gci, gcj, gck] = True
         if record:
-            order[ci[free], cj[free], ck[free]] = mstep
+            # First write wins: neighbouring columns' growth chains are
+            # translates of each other by fwd and routinely revisit the same
+            # absolute cell at a later mstep, which must not overwrite an
+            # earlier (truer) deposition step.
+            new = order[gci, gcj, gck] < 0
+            order[gci[new], gcj[new], gck[new]] = mstep
+        # L-corner fill: when fwd has more than one nonzero axis, also place
+        # the partial-step cells between prev and cur so the path stays
+        # face-connected instead of only touching at a shared edge/corner.
+        if corner_fill_offsets:
+            pi, pj, pk = prev_i[grow], prev_j[grow], prev_k[grow]
+            for doff in corner_fill_offsets:
+                xi = pi - doff[0]; xj = pj - doff[1]; xk = pk - doff[2]
+                inb = ((xi >= 0) & (xi < Nx) & (xj >= 0) & (xj < Ny) &
+                       (xk >= 0) & (xk < Nz))
+                xi, xj, xk = xi[inb], xj[inb], xk[inb]
+                xfree = ~solid[xi, xj, xk]
+                gxi, gxj, gxk = xi[xfree], xj[xfree], xk[xfree]
+                metal[gxi, gxj, gxk] = True
+                if record:
+                    xnew = order[gxi, gxj, gxk] < 0
+                    order[gxi[xnew], gxj[xnew], gxk[xnew]] = mstep
 
     if record and return_cov:
         return metal, order, (cov_grid, cov_sub_grids)
