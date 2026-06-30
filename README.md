@@ -64,7 +64,16 @@ judgments are based on it.
   is set by the central beam (so the area is preserved). Visible at finer
   resolution (the film must be several voxels thick). The multi-ray cone is cast
   only on the thin **penumbra band** near each shadow edge (interior cells stay
-  full-thickness), so it stays fast.
+  full-thickness), so it stays fast. Independent **lateral (x-y) and vertical (z)
+  sub-sampling** controls (each 1–10) further smooth the in-plane footprint
+  boundary and the through-thickness taper by sampling a sub-grid of positions
+  within each band voxel for the occlusion test, instead of just its centre.
+- **Soft-edge coverage check** (diagnostic, shown when soft-edge is on): plots
+  the continuous per-cell coverage fraction reconstructed from the deposited
+  floor thickness against the shaded ray-tested band, for the chosen
+  evaporation, along the Cross-section tab's current slice. An auto-zoom
+  selector (**full range / fit all bands / each band / manual**) locates the
+  shadow-edge region(s) without manual slider tuning.
 - **Side-wall deposition effect** (opt-in): the first evaporation also coats the
   resist sidewall, narrowing the opening seen by later evaporations. The
   narrowing grows with the local incident angle, so it makes the across-wafer
@@ -92,7 +101,15 @@ judgments are based on it.
      offset (with evaporation-beam arrows). The lift-off panel colours the
      thin **metal–oxide–metal band** on both oxide sides of the junction, and a
      **process-stages figure** (resist → evap 1 → oxidation → evap 2 → lift-off)
-     can be panned/zoomed.
+     can be panned/zoomed. An optional **voxel outline** overlay shows the grid
+     granularity of the metal. With soft-edge runs that used lateral/z
+     sub-sampling > 1, **"Show fine sub-voxel detail"** swaps each
+     evaporation's metal near the shadow edge for its true sub-voxel taper
+     shape — correctly stacked where one evaporation deposits on top of
+     another — instead of the coarse base-grid voxel size; columns with more
+     than one physically disconnected metal surface (e.g. sidewall coating
+     plus a separate suspended-bridge underside) render as the coarse view
+     there instead, since coverage data alone can't place them.
   2. **🗺️ Top View** — top view (metal films, shadow, undercut, junction region),
      plus the **lift-off film-thickness map**: a 2D heat map and a **drag-rotatable
      3D surface (Plotly)** where the *z value is the stacked metal thickness*
@@ -285,6 +302,7 @@ labels. The wafer centre always reproduces the single-JJ result.
 | `resist_round` | Resist opening corner fillet radius [nm] (0 = sharp lip/foot) |
 | `soft_edge` | Soft-edge (finite-source penumbra) deposition on/off |
 | `soft_pattern` / `soft_size` / `soft_L` | Plassys source: e-beam pattern · spot size [mm] · throw distance [mm] (penumbra ≈ size/L) |
+| `soft_supersample_xy` / `soft_supersample_z` | (soft-edge) lateral (x-y, n×n) / vertical (z, n) sub-sampling per band voxel, 1–10 each |
 | θ₁ / φ₁ / d₁ | Polar angle / azimuth / metal thickness of evaporation 1 |
 | θ₂ / φ₂ / d₂ | Polar angle / azimuth / metal thickness of evaporation 2 |
 | `bridge_len` / `bridge_w` | (Dolan) bridge length / width [nm] |
@@ -328,6 +346,13 @@ Beam direction: `beam = (sinθcosφ, sinθsinφ, −cosθ)` (θ measured from th
 - A coarse voxel resolution introduces quantization error in the area and the
   open/short verdict. Near the boundary conditions, increase the resolution to
   confirm.
+- Metal grown at a steep incidence (θ greater than ~26.6°, e.g. Manhattan's
+  default second evaporation at 60°) is voxelised along a diagonal step so it
+  stays a solid, face-connected film instead of a one-voxel staircase — most
+  visible as stacked metal climbing a resist corner. A small residual gap can
+  still appear right at a resist corner where two evaporations' own shadowing
+  interact; this is typically a genuine shadow boundary rather than a
+  rendering artifact.
 - The analytic model (`junction_area.py`) is for estimates and trend
   exploration; the final verdict is based on the 3D engine (`deposition3d.py`).
 - The **Wafer Map** assumes an ideal point source (with an optional finite
