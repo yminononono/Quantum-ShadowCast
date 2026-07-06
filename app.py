@@ -1145,14 +1145,20 @@ with tab1:
             "Show fine sub-voxel detail (soft-edge)", key="cs_fine_detail",
             disabled=not _has_fine,
             help="Replace each evaporation's metal near the soft-edge band "
-                 "with its true sub-voxel taper shape (from the lateral/z "
-                 "sub-sampling controls), correctly stacked where one "
-                 "evaporation deposits on top of another (e.g. a junction "
-                 "overlap) — instead of the coarse base-grid voxel size. "
-                 "Columns with more than one disconnected metal surface "
-                 "(e.g. sidewall coating plus a separate suspended-bridge "
-                 "underside) can't be reconstructed from coverage data alone "
-                 "and render exactly as the coarse view there instead." +
+                 "with its true sub-voxel taper shape, correctly stacked "
+                 "where one evaporation deposits on top of another (e.g. a "
+                 "junction overlap) — instead of the coarse base-grid voxel "
+                 "size. Lateral (x-y) sub-sampling makes this finer-grained "
+                 "across the slice, one independently-tested column per "
+                 "lateral sub-position. Vertical (z) sub-sampling instead "
+                 "makes each column's own outermost film boundary more "
+                 "precise — shown as a partial-height sliver instead of "
+                 "always a whole voxel — rather than adding distinct z "
+                 "sub-layers. Columns with more than one disconnected metal "
+                 "surface (e.g. sidewall coating plus a separate "
+                 "suspended-bridge underside) can't be reconstructed from "
+                 "coverage data alone and render exactly as the coarse view "
+                 "there instead." +
                  ("" if _has_fine else "  Needs soft edge + lateral/z "
                   "sub-sampling > 1 (no fine data in this result)."))
         if params.stack == "Trilayer":

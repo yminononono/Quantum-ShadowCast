@@ -260,7 +260,8 @@ def _overlay_cats(ax, cat, h_axis, v_axis, cats, alpha=0.62, zorder=3):
               aspect="auto", interpolation="nearest", zorder=zorder)
 
 
-def _oxide_edges_cs(ax, al1, exclude, h_axis, v_axis, ox_t=_OX_THICK, zorder=6):
+def _oxide_edges_cs(ax, al1, exclude, h_axis, v_axis, ox_t=_OX_THICK, zorder=6,
+                    patch_evap=None, patch_z0=None, patch_frac=None, lower_keys=()):
     """Draw the AlOx barrier as a thin (≈few-nm) skin on the exposed Al1 faces.
 
     For every Al1 cell, each of its 4 in-plane neighbours that is *oxidizable*
@@ -270,6 +271,15 @@ def _oxide_edges_cs(ax, al1, exclude, h_axis, v_axis, ox_t=_OX_THICK, zorder=6):
     Al2-facing faces are oxidizable, the barrier is drawn at the Al1/Al2
     interface too — so Al2 (its filled imshow cell) reads as sitting on top of
     the thin oxide rather than the oxide being omitted there.
+
+    ``patch_evap``/``patch_z0``/``patch_frac`` (optional, from
+    :func:`_slice_planes_fine`'s z-precision remainder patch) plus
+    ``lower_keys`` (the evaporation keys that make up the lower electrode
+    ``al1`` represents — ``{"al1"}`` for bilayer, ``{"nb1","al2"}`` for
+    trilayer): where a column's outermost lower-electrode film ends in a
+    fractional remainder, the cell right below it has its default top-face
+    oxide rectangle replaced by one at the patch's true (lower) top, so the
+    oxide skin doesn't float above a partial-height metal surface.
     """
     if not al1.any():
         return
@@ -278,11 +288,17 @@ def _oxide_edges_cs(ax, al1, exclude, h_axis, v_axis, ox_t=_OX_THICK, zorder=6):
     dv = float(v_axis[1] - v_axis[0]) if nv > 1 else 1.0
     hh, hv = dh / 2.0, dv / 2.0
     oxidizable = ~(exclude | al1)          # air OR Al2 (everything Al1 can oxidize against)
+    patched_top = np.zeros(nh, dtype=bool)
+    if patch_evap is not None and lower_keys:
+        patched_top = np.array([(e in lower_keys) for e in patch_evap])
     ii, kk = np.where(al1)
     rects = []
     for i, k in zip(ii.tolist(), kk.tolist()):
         x, z = float(h_axis[i]), float(v_axis[k])
-        if k + 1 < nv and oxidizable[i, k + 1]:
+        if patched_top[i] and k == int(patch_z0[i]) - 1:
+            z_top = float(v_axis[int(patch_z0[i])]) - hv + float(patch_frac[i]) * dv
+            rects.append(Rectangle((x - hh - ox_t, z_top), dh + 2 * ox_t, ox_t))
+        elif k + 1 < nv and oxidizable[i, k + 1]:
             rects.append(Rectangle((x - hh - ox_t, z + hv), dh + 2 * ox_t, ox_t))
         if k - 1 >= 0 and oxidizable[i, k - 1]:
             rects.append(Rectangle((x - hh - ox_t, z - hv - ox_t), dh + 2 * ox_t, ox_t))
@@ -292,6 +308,46 @@ def _oxide_edges_cs(ax, al1, exclude, h_axis, v_axis, ox_t=_OX_THICK, zorder=6):
             rects.append(Rectangle((x - hh - ox_t, z - hv - ox_t), ox_t, dv + 2 * ox_t))
     if rects:
         ax.add_collection(PatchCollection(rects, facecolor=_OX_LINE,
+                                          edgecolor="none", zorder=zorder))
+
+
+_BILAYER_PATCH_COLOR = {"al1": C_AL1, "al2": C_AL2}
+_TRILAYER_PATCH_COLOR = {"nb1": C_E1_NB, "al2": C_E2_AL, "al3": C_E3_AL, "nb4": C_E4_NB}
+
+
+def _draw_fine_remainder_patches(ax, patch_evap, patch_z0, patch_frac, h_axis,
+                                 v_axis, trilayer, zorder=2):
+    """Draw the z-precision remainder from :func:`_slice_planes_fine` (a
+    fractional voxel height for each column's outermost evaporation) as a
+    partial-height rectangle, instead of letting that last voxel be silently
+    dropped (today's rounding-down case) or fully filled and over-stated
+    (today's rounding-up case). A higher ``soft_supersample_z`` makes the
+    underlying coverage value — and so this patch's height — a more accurate
+    estimate of the true boundary; it does not add distinct sub-layers."""
+    if patch_evap is None:
+        return
+    sel = np.array([e is not None for e in patch_evap])
+    if not sel.any():
+        return
+    nh, nv = len(h_axis), len(v_axis)
+    dh = float(h_axis[1] - h_axis[0]) if nh > 1 else 1.0
+    dv = float(v_axis[1] - v_axis[0]) if nv > 1 else 1.0
+    color_map = _TRILAYER_PATCH_COLOR if trilayer else _BILAYER_PATCH_COLOR
+    rects_by_color = {}
+    for p in np.where(sel)[0].tolist():
+        z0 = int(patch_z0[p])
+        if z0 >= nv:
+            continue
+        cat_id = color_map.get(patch_evap[p])
+        if cat_id is None:
+            continue
+        x = float(h_axis[p])
+        z_bot = float(v_axis[z0]) - dv / 2.0
+        height = float(patch_frac[p]) * dv
+        rects_by_color.setdefault(cat_id, []).append(
+            Rectangle((x - dh / 2.0, z_bot), dh, height))
+    for cat_id, rects in rects_by_color.items():
+        ax.add_collection(PatchCollection(rects, facecolor=_COLORS[cat_id],
                                           edgecolor="none", zorder=zorder))
 
 
@@ -542,14 +598,23 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
     wrong guess.  Reconstruction is only attempted on (simple) columns where
     the combined structure is a single contiguous run from the floor.
 
-    Returns ``(solid2d, al1, al2, h_axis, h_label, ix, iy, films2d, is_fine)``
-    — same as ``_slice_planes`` minus the (here, redrawn geometrically
-    anyway, so unused) ``alox`` field, plus a trailing ``(Npts,)`` bool
-    ``is_fine``: True where some evaporation's metal at that point was
-    genuinely reconstructed from coverage data, False where it's just the
-    coarse value repeated (outside any band, or a complex column copied
-    through) — so callers can avoid drawing fine-grained detail (e.g. voxel
-    outlines) where there isn't actually any."""
+    Returns ``(solid2d, al1, al2, h_axis, h_label, ix, iy, films2d, is_fine,
+    patch_evap, patch_z0, patch_frac)`` — the first nine same as before
+    (``films2d``/``is_fine`` as already documented), plus three new
+    ``(Npts,)`` arrays giving the z-precision remainder patch for each
+    column's OUTERMOST evaporation only (``None``/``0`` where there's no
+    qualifying patch — a complex column, nothing reconstructed there, or a
+    remainder too small to matter): ``patch_evap`` (the evaporation's mask
+    key, e.g. ``"al1"``, or ``None``), ``patch_z0`` (the z-index right above
+    the whole voxels already filled — where the partial-height patch starts),
+    and ``patch_frac`` (0–1, the fractional voxel height of that remainder —
+    `cov_raw * n_E` minus its floor, made more accurate by a higher
+    ``soft_supersample_z`` even though it's still a single boundary, not a
+    discrete sub-layer count). The corresponding cell in the returned
+    ``al1``/``al2``/``films2d`` masks is left UNFILLED for that remainder
+    (hollowed out where rounding had included it), so a caller that ignores
+    the patch arrays simply sees a slightly shorter column there instead of
+    a wrong one."""
     ns = max(1, int(r.meta.get("soft_supersample_xy", 1)))
     ix, iy, sub_idx, s, inside = _oblique_columns_fine(r, angle_deg, offset, ns)
     Nz = r.solid.shape[2]
@@ -588,7 +653,19 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
     running_height = np.ones(Npts, dtype=int)
     is_fine = np.zeros(Npts, dtype=bool)
     fine = {}
-    for key, label in order:
+    # Per-column bookkeeping for the z-precision remainder patch: which
+    # evaporation is the OUTERMOST one actually present (so a later
+    # evaporation deposited on top doesn't get a patch on an interior,
+    # already-covered boundary), the z-index where its rounded-down whole
+    # voxels end, the fractional voxel-height remainder `soft_supersample_z`
+    # makes a more accurate estimate of, and whether rounding (vs flooring)
+    # had included one extra whole cell that needs removing so the patch can
+    # represent it as partial instead.
+    patch_key = np.full(Npts, -1, dtype=int)
+    patch_z0 = np.zeros(Npts, dtype=int)
+    patch_frac = np.zeros(Npts, dtype=float)
+    patch_round_added = np.zeros(Npts, dtype=bool)
+    for ei, (key, label) in enumerate(order):
         metal_E = masks[key]
         coarse_full = metal_E[ix, iy, :]
         if out.any():
@@ -621,8 +698,8 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
         # real sub-voxel taper; an interior cov_raw==1.0 reconstructs to
         # exactly the coarse value, so there's nothing actually finer there.
         is_fine |= use_fine & (cov_raw > 1e-6) & (cov_raw < 1.0 - 1e-6)
-        target_E = np.where(use_fine, np.round(np.clip(cov_raw, 0.0, 1.0) * n_E),
-                            coarse_th).astype(int)
+        frac_E = np.clip(cov_raw, 0.0, 1.0) * n_E
+        target_E = np.where(use_fine, np.round(frac_E), coarse_th).astype(int)
         target_E = np.where(out, 0, target_E)
 
         end = np.minimum(running_height + target_E, Nz)
@@ -634,13 +711,39 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
             else:
                 mask_E[p, :] = coarse_full[p, :]
         fine[key] = mask_E
+
+        # This evaporation is a patch candidate wherever it genuinely
+        # deposited something here via coverage-based reconstruction; later
+        # evaporations overwrite the record, so by the end of the loop only
+        # the truly outermost film per column remains.
+        floor_part = np.floor(frac_E).astype(int)
+        z0 = running_height + floor_part
+        qualifies = use_fine & (target_E > 0) & (z0 < Nz)
+        patch_key = np.where(qualifies, ei, patch_key)
+        patch_z0 = np.where(qualifies, z0, patch_z0)
+        patch_frac = np.where(qualifies, frac_E - floor_part, patch_frac)
+        patch_round_added = np.where(qualifies, target_E > floor_part, patch_round_added)
+
         running_height = np.where(simple, end, running_height)
+
+    # Only the last-recorded (outermost) qualifying evaporation per column
+    # gets its rounded-up cell hollowed out, so the caller can draw that
+    # fractional remainder as a partial-height patch instead.
+    for ei, (key, _) in enumerate(order):
+        sel = (patch_key == ei) & patch_round_added
+        if sel.any():
+            rows = np.where(sel)[0]
+            fine[key][rows, patch_z0[rows]] = False
+    no_patch = patch_frac <= 1e-6
+    patch_evap = np.array([(order[k][0] if (k >= 0) else None) for k in patch_key], dtype=object)
+    patch_evap[no_patch] = None
 
     h_label = f"distance along slice  [nm]   (α = {angle_deg:.0f}°)"
     if trilayer:
         return (solid2d, fine["nb1"] | fine["al2"], fine["al3"] | fine["nb4"],
-                s, h_label, ix, iy, fine, is_fine)
-    return solid2d, fine["al1"], fine["al2"], s, h_label, ix, iy, None, is_fine
+                s, h_label, ix, iy, fine, is_fine, patch_evap, patch_z0, patch_frac)
+    return (solid2d, fine["al1"], fine["al2"], s, h_label, ix, iy, None, is_fine,
+            patch_evap, patch_z0, patch_frac)
 
 
 def _paint_trilayer_metal(cat, films2d):
@@ -688,12 +791,19 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     convert coverage fractions into voxel-layer counts correctly; without it,
     falls back to the coarse rendering rather than guessing (a sidewall-
     coated column's height is not a safe stand-in for the nominal floor
-    thickness)."""
+    thickness).  Each column's outermost film also gets a z-precision
+    remainder patch (:func:`_draw_fine_remainder_patches`) — a fractional
+    voxel-height sliver instead of always rounding to a whole cell, made
+    more accurate (not more subdivided) by a higher ``soft_supersample_z``;
+    the AlOx skin (:func:`_oxide_edges_cs`) is adjusted to sit at that
+    patch's true top rather than the coarse cell boundary where it applies."""
     zs = r.zs
     z_split = r.meta.get("z_split", r.z_top)
     is_fine = None
+    patch_evap = patch_z0 = patch_frac = None
     if fine_detail and r.coverage_sub and metal_thicknesses:
-        solid2d, al1, al2, h_axis, h_label, ix, iy, films2d, is_fine = _slice_planes_fine(
+        (solid2d, al1, al2, h_axis, h_label, ix, iy, films2d, is_fine,
+         patch_evap, patch_z0, patch_frac) = _slice_planes_fine(
             r, angle_deg, offset, metal_thicknesses)
     else:
         solid2d, al1, al2, alox, h_axis, h_label, ix, iy, films2d = _slice_planes(
@@ -737,6 +847,12 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     vlim = (vlo, vhi); vtop = vhi
     fig, ax = plt.subplots(figsize=(7.6, 4.3), dpi=140)
     _draw(ax, cat, h_axis, zs, h_label, "z  [nm]", title, hlim=hwin, vlim=vlim)
+    if patch_evap is not None:
+        # z-precision remainder: each column's outermost fine-reconstructed
+        # film gets a partial-height patch (from soft_supersample_z's
+        # coverage-accuracy improvement) instead of an integer-rounded cell.
+        _draw_fine_remainder_patches(ax, patch_evap, patch_z0, patch_frac,
+                                     h_axis, zs, trilayer=films2d is not None)
     if show_voxel_grid:
         is_metal = np.isin(cat, _METAL_CATS + _TRI_METAL_CATS)
         h_group = None
@@ -751,8 +867,11 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
         _metal_voxel_outline(ax, is_metal, h_axis, zs, h_group=h_group)
     # AlOx: a thin (~3 nm) skin on every exposed Al1 face, incl. the Al1/Al2
     # interface (so Al2 sits on top of the barrier) and the metal corners.
+    _lower_keys = (({"nb1", "al2"} if films2d is not None else {"al1"})
+                  if patch_evap is not None else ())
     _oxide_edges_cs(ax, al1, (solid2d == RESIST) | (solid2d == SUBSTRATE),
-                    h_axis, zs)
+                    h_axis, zs, patch_evap=patch_evap, patch_z0=patch_z0,
+                    patch_frac=patch_frac, lower_keys=_lower_keys)
     # The two arrows are the two electrode beams: evap 1 (Nb) and evap 3 (Al)
     # for a trilayer, evap 1 / evap 2 for a bilayer.
     c_e1 = _COLORS[C_E1_NB] if films2d is not None else _COLORS[C_AL1]
