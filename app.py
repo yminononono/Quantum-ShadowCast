@@ -235,6 +235,11 @@ _KEY_RANGE = {
 
 def _set_clamped_int(key, val):
     lo, hi = _KEY_RANGE[key]
+    if key == "resist_round":
+        # Same dynamic cap as the live slider (half the PMMA/upper-resist
+        # thickness) — t_pmma is applied earlier in the same _SHARED_KEYS
+        # loop, so st.session_state["t_pmma"] already holds its loaded value.
+        hi = max(5, int(float(st.session_state.get("t_pmma", 250)) // 10) * 5)
     st.session_state[key] = int(round(min(max(float(val), lo), hi)))
 
 
@@ -604,11 +609,21 @@ with st.sidebar:
     undercut = st.slider("MMA undercut u [nm]  (one-sided)", 0, 500,
                          step=10, key="undercut")
     st.session_state.setdefault("resist_round", 0)
+    # Cap = half the PMMA/upper-resist thickness: deposition3d.build_occluders
+    # already hard-clamps to this (top-lip + bottom-foot fillets must not
+    # overlap) — keep the slider's own max in sync with that, snapped to the
+    # slider's step=5.  (Manhattan mode's own driver, manhattan_h, is set equal
+    # to t_pmma at runtime below, so t_pmma alone is correct for both modes
+    # today; revisit if that ever decouples.)
+    resist_round_max = max(5, int(t_pmma // 10) * 5)
+    st.session_state["resist_round"] = min(st.session_state["resist_round"], resist_round_max)
     resist_round = st.slider(
-        "Resist corner rounding r [nm]", 0, 200, step=5, key="resist_round",
+        "Resist corner rounding r [nm]", 0, resist_round_max, step=5, key="resist_round",
         help="Round the resist opening's top lip and bottom foot with a fillet "
-             "of this radius (0 = sharp corners).  The wall flares near the top "
-             "and floor, so it shifts the shadow and the junction area.")
+             "of this radius (0 = sharp corners).  Capped at half the PMMA/upper-"
+             "resist thickness so the top and bottom fillets never overlap.  The "
+             "wall flares near the top and floor, so it shifts the shadow and "
+             "the junction area.")
     resist_round_method = "analytic"
     if resist_round > 0:
         st.session_state.setdefault("resist_round_method", "analytic")

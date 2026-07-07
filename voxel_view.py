@@ -266,11 +266,16 @@ def _oxide_edges_cs(ax, al1, exclude, h_axis, v_axis, ox_t=_OX_THICK, zorder=6,
 
     For every Al1 cell, each of its 4 in-plane neighbours that is *oxidizable*
     (i.e. air or Al2 — anything not in ``exclude`` and not Al1) gets a thin
-    ``ox_t``-wide stroke laid on that face.  Perpendicular faces are extended by
-    ``ox_t`` so convex CORNERS fill in (oxide wraps the metal corner).  Because
-    Al2-facing faces are oxidizable, the barrier is drawn at the Al1/Al2
-    interface too — so Al2 (its filled imshow cell) reads as sitting on top of
-    the thin oxide rather than the oxide being omitted there.
+    ``ox_t``-wide stroke laid flush on that face.  Where two such strokes meet
+    at a convex corner of the same cell, a small ``ox_t``-square is added to
+    fill the corner (oxide wraps the metal corner) — but only when the cell
+    diagonally across that corner is itself oxidizable (not Al1); when two Al1
+    cells touch only diagonally, their flush strokes already tile the
+    intervening cells with no gap, and a bridging square there would paint
+    over the diagonal cell's own interior instead of closing a real corner.
+    Because Al2-facing faces are oxidizable, the barrier is drawn at the
+    Al1/Al2 interface too — so Al2 (its filled imshow cell) reads as sitting
+    on top of the thin oxide rather than the oxide being omitted there.
 
     ``patch_evap``/``patch_z0``/``patch_frac`` (optional, from
     :func:`_slice_planes_fine`'s z-precision remainder patch) plus
@@ -295,17 +300,41 @@ def _oxide_edges_cs(ax, al1, exclude, h_axis, v_axis, ox_t=_OX_THICK, zorder=6,
     rects = []
     for i, k in zip(ii.tolist(), kk.tolist()):
         x, z = float(h_axis[i]), float(v_axis[k])
-        if patched_top[i] and k == int(patch_z0[i]) - 1:
-            z_top = float(v_axis[int(patch_z0[i])]) - hv + float(patch_frac[i]) * dv
-            rects.append(Rectangle((x - hh - ox_t, z_top), dh + 2 * ox_t, ox_t))
-        elif k + 1 < nv and oxidizable[i, k + 1]:
-            rects.append(Rectangle((x - hh - ox_t, z + hv), dh + 2 * ox_t, ox_t))
-        if k - 1 >= 0 and oxidizable[i, k - 1]:
-            rects.append(Rectangle((x - hh - ox_t, z - hv - ox_t), dh + 2 * ox_t, ox_t))
-        if i + 1 < nh and oxidizable[i + 1, k]:
-            rects.append(Rectangle((x + hh, z - hv - ox_t), ox_t, dv + 2 * ox_t))
-        if i - 1 >= 0 and oxidizable[i - 1, k]:
-            rects.append(Rectangle((x - hh - ox_t, z - hv - ox_t), ox_t, dv + 2 * ox_t))
+        is_patched = patched_top[i] and k == int(patch_z0[i]) - 1
+        if is_patched:
+            top_y = float(v_axis[int(patch_z0[i])]) - hv + float(patch_frac[i]) * dv
+            top_ox = True
+        else:
+            top_y = z + hv
+            top_ox = k + 1 < nv and oxidizable[i, k + 1]
+        if top_ox:
+            rects.append(Rectangle((x - hh, top_y), dh, ox_t))
+
+        bot_ox = k - 1 >= 0 and oxidizable[i, k - 1]
+        if bot_ox:
+            rects.append(Rectangle((x - hh, z - hv - ox_t), dh, ox_t))
+
+        right_ox = i + 1 < nh and oxidizable[i + 1, k]
+        if right_ox:
+            rects.append(Rectangle((x + hh, z - hv), ox_t, dv))
+
+        left_ox = i - 1 >= 0 and oxidizable[i - 1, k]
+        if left_ox:
+            rects.append(Rectangle((x - hh - ox_t, z - hv), ox_t, dv))
+
+        # Corner fills: only true convex corners, i.e. the diagonal cell is
+        # itself oxidizable (not Al1) -- otherwise the flush faces above
+        # already tile the two intervening cells with no gap, and a bridging
+        # square would paint over the diagonal Al1 cell's own interior.
+        if not is_patched:
+            if top_ox and right_ox and oxidizable[i + 1, k + 1]:
+                rects.append(Rectangle((x + hh, top_y), ox_t, ox_t))
+            if top_ox and left_ox and oxidizable[i - 1, k + 1]:
+                rects.append(Rectangle((x - hh - ox_t, top_y), ox_t, ox_t))
+        if bot_ox and right_ox and oxidizable[i + 1, k - 1]:
+            rects.append(Rectangle((x + hh, z - hv - ox_t), ox_t, ox_t))
+        if bot_ox and left_ox and oxidizable[i - 1, k - 1]:
+            rects.append(Rectangle((x - hh - ox_t, z - hv - ox_t), ox_t, ox_t))
     if rects:
         ax.add_collection(PatchCollection(rects, facecolor=_OX_LINE,
                                           edgecolor="none", zorder=zorder))
