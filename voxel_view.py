@@ -601,9 +601,11 @@ def _slice_planes_fine(r, angle_deg, offset, metal_thicknesses):
     evaporation's own thickness in deposition order reproduces the true
     stack height at any column.
 
-    ``metal_thicknesses`` (dict: evaporation label → nominal thickness [nm])
-    is required to correctly convert a coverage fraction into a voxel-layer
-    count (``round(coverage * t_metal/vox)``) — it is NOT safe to infer this
+    ``metal_thicknesses`` (dict: evaporation label → expected floor thickness
+    [nm], i.e. the nominal along-beam thickness already scaled by cosθ to
+    match the vertical extent :func:`_deposit` actually grows) is required to
+    correctly convert a coverage fraction into a voxel-layer count
+    (``round(coverage * n/vox)``) — it is NOT safe to infer this
     from the metal mask's own data (e.g. its tallest column), because a
     sidewall-coated column can be far taller than the nominal floor
     thickness (coating the full height of a resist wall), which would
@@ -815,8 +817,10 @@ def render_cross_section(r: DepositionResult, angle_deg=0.0, offset=0.0,
     per-voxel metal extent for the true sub-voxel taper shape near the
     shadow edge, via :func:`_slice_planes_fine` — both metals (or all 4
     Trilayer films) shown together, correctly stacked.  Requires
-    ``metal_thicknesses`` (dict: evaporation label → nominal thickness [nm],
-    e.g. ``{"Evap 1": params.t_metal1, "Evap 2": params.t_metal2}``) to
+    ``metal_thicknesses`` (dict: evaporation label → expected floor thickness
+    [nm], i.e. each evaporation's nominal along-beam thickness scaled by
+    cosθ, e.g. ``{"Evap 1": params.t_metal1 * abs(cos(radians(params.angle1))),
+    "Evap 2": params.t_metal2 * abs(cos(radians(params.angle2)))}``) to
     convert coverage fractions into voxel-layer counts correctly; without it,
     falls back to the coarse rendering rather than guessing (a sidewall-
     coated column's height is not a safe stand-in for the nominal floor

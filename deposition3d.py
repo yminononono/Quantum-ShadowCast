@@ -748,6 +748,19 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
     (it sits on a surface facing the beam), and the ray toward the source is
     unobstructed.  The film is then grown `n` cells back toward the source.
 
+    ``t_metal`` is the nominal thickness measured ALONG THE BEAM DIRECTION
+    (the standard deposition-rate-monitor convention — the thickness that
+    would form on a witness surface facing the beam directly), not a raw
+    vertical thickness.  Since the growth step's z-component is always
+    exactly ±1 voxel whenever nonzero (for the whole practical tilt range),
+    the vertical extent actually grown on a horizontal floor is `n·vox`, so
+    `n` is scaled by `cosθ = |d[2]|` below to make that vertical extent equal
+    `t_metal·cosθ` — thinner at more oblique tilts, per the standard cosine
+    deposition law.  φ doesn't enter this scaling: a horizontal floor's
+    normal is always vertical, so its angle to the beam is θ regardless of
+    φ (φ only rotates the beam's horizontal direction, already reflected in
+    `fwd`'s shape/direction below, e.g. sidewall coating).
+
     ``occ_mask`` (optional bool grid) is extra occluding metal from a prior
     evaporation: a surface cell is also shadowed if its ray to the source passes
     through it — this is the sidewall effect (prior wall coating narrows the
@@ -968,7 +981,7 @@ def _deposit(lab, xs, ys, zs, vox, d, t_metal, boxes, rounded=(), occ_mask=None,
             for _ in soft:
                 on_pass()                    # keep the tick count consistent
 
-    n = int(round(t_metal / vox))
+    n = int(round(t_metal * abs(d[2]) / vox))
     keep = central_lit                       # nominal lit footprint
     gi, gj, gk = ii[keep], jj[keep], kk[keep]
     # Lit side keeps its floor (>=1 voxel) — unchanged visual behaviour there.
@@ -1167,7 +1180,7 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
                                         occ_mask=occ_, soft=soft_, record=True, return_cov=True,
                                         on_pass=op, band_w=_band_w, lateral_supersample=_lat_sub,
                                         z_supersample=_z_sub)
-            _rec.append((o, label, float(t_)))
+            _rec.append((o, label, float(t_), d_))
             if soft_ is not None:
                 _cov_rec[label] = cg
                 if csub is not None:
@@ -1259,14 +1272,18 @@ def simulate(p: ProcessParams, max_cells: int = MAX_CELLS_PER_AXIS,
         depo_frames = [dict(step=-1, label="Resist (before evaporation)",
                             show_oxide=False, liftoff=False)]
         g = 0
-        for idx, (o, label, t_nm) in enumerate(_rec):
+        for idx, (o, label, t_nm, d_ev) in enumerate(_rec):
             m = o >= 0
             steps = int(o[m].max()) + 1 if m.any() else 1
             depo_order[m] = g + o[m].astype(np.int16)   # global step of each voxel
+            # Actual floor thickness achieved (t_nm is along-beam; the grown
+            # vertical extent is t_nm·cosθ) — used as the label's own cap so
+            # it reaches "X/X nm" at completion instead of stopping short.
+            t_floor = t_nm * abs(d_ev[2])
             for s in range(steps):
-                thick = min((s + 1) * vox, t_nm)
+                thick = min((s + 1) * vox, t_floor)
                 depo_frames.append(dict(
-                    step=g + s, label=f"{label} — {thick:.0f}/{t_nm:.0f} nm",
+                    step=g + s, label=f"{label} — {thick:.0f}/{t_floor:.0f} nm",
                     show_oxide=(idx > _ox_after), liftoff=False))
             g += steps
             if idx == _ox_after:

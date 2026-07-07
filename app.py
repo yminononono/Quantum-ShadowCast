@@ -399,10 +399,18 @@ def _combo_metrics(combos):
 _SUB = {1: "₁", 2: "₂", 3: "₃", 4: "₄"}
 
 
+_METAL_THICKNESS_HELP = (
+    "Nominal thickness measured along the beam direction (the standard "
+    "deposition-rate-monitor convention). The actual vertical thickness "
+    "deposited on a horizontal floor is this value × cos(tilt angle) — "
+    "thinner at more oblique angles.")
+
+
 def _tri_thickness(label, key, default, lo, hi, step):
     """Render one trilayer sublayer-thickness slider; return its value [nm]."""
     st.session_state.setdefault(key, default)
-    return float(st.slider(label, lo, hi, step=step, key=key))
+    return float(st.slider(label, lo, hi, step=step, key=key,
+                           help=_METAL_THICKNESS_HELP))
 
 
 def _tri_linked_tilt(idx, src_idx, prim_angle, prim_phi,
@@ -655,7 +663,8 @@ with st.sidebar:
     phi1 = st.slider("Azimuthal φ₁ [°]", -90, 90, step=1, key="phi1")
     st.session_state.setdefault("t_metal1", 30)
     if stack == "Bilayer":
-        t_metal1 = st.slider("Metal d₁ [nm]", 10, 200, step=5, key="t_metal1")
+        t_metal1 = st.slider("Metal d₁ [nm]", 10, 200, step=5, key="t_metal1",
+                             help=_METAL_THICKNESS_HELP)
     else:
         t_metal1 = float(st.session_state["t_metal1"])  # unused by trilayer engine
         tri_t1 = _tri_thickness("Nb d₁ [nm]  (evap 1)", "tri_t1", 80, 10, 300, 5)
@@ -681,7 +690,8 @@ with st.sidebar:
                          step=1, key="d_phi2")
         st.session_state.setdefault("d_tmetal2", 30)
         if not _tri:
-            t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="d_tmetal2")
+            t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="d_tmetal2",
+                                 help=_METAL_THICKNESS_HELP)
         else:
             t_metal2 = float(st.session_state["d_tmetal2"])  # unused by trilayer
             tri_t3 = _tri_thickness("Al d₃ [nm]  (evap 3)", "tri_t3", 10, 1, 100, 1)
@@ -732,7 +742,8 @@ with st.sidebar:
                          help="Default 90° → perpendicular to Evap 1")
         st.session_state.setdefault("m_tmetal2", 30)
         if not _tri:
-            t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="m_tmetal2")
+            t_metal2 = st.slider("Metal d₂ [nm]", 10, 200, step=5, key="m_tmetal2",
+                                 help=_METAL_THICKNESS_HELP)
         else:
             t_metal2 = float(st.session_state["m_tmetal2"])  # unused by trilayer
             tri_t3 = _tri_thickness("Al d₃ [nm]  (evap 3)", "tri_t3", 10, 1, 100, 1)
@@ -1176,11 +1187,23 @@ with tab1:
                  "there instead." +
                  ("" if _has_fine else "  Needs soft edge + lateral/z "
                   "sub-sampling > 1 (no fine data in this result)."))
+        # Cosine-corrected expected floor thickness per evaporation (t_metal is
+        # nominal/along-beam; the engine actually grows t_metal·cosθ vertically
+        # on the floor) — must match what _deposit() used, so _slice_planes_fine
+        # (which compares a column's coarse height against this) isn't fooled
+        # into treating a normal floor deposit as stacked sidewall coating.
         if params.stack == "Trilayer":
-            _metal_t = {"Evap 1 — Nb": params.tri_t1, "Evap 2 — Al": params.tri_t2,
-                       "Evap 3 — Al": params.tri_t3, "Evap 4 — Nb": params.tri_t4}
+            _metal_t = {
+                "Evap 1 — Nb": params.tri_t1 * abs(np.cos(np.radians(params.angle1))),
+                "Evap 2 — Al": params.tri_t2 * abs(np.cos(np.radians(params.tri_angle2))),
+                "Evap 3 — Al": params.tri_t3 * abs(np.cos(np.radians(params.angle2))),
+                "Evap 4 — Nb": params.tri_t4 * abs(np.cos(np.radians(params.tri_angle4))),
+            }
         else:
-            _metal_t = {"Evap 1": params.t_metal1, "Evap 2": params.t_metal2}
+            _metal_t = {
+                "Evap 1": params.t_metal1 * abs(np.cos(np.radians(params.angle1))),
+                "Evap 2": params.t_metal2 * abs(np.cos(np.radians(params.angle2))),
+            }
         figc = vv.render_cross_section(eng, slice_angle, slice_pos, eng_jm,
                                        view_half=cs_half, zmax=cs_zmax,
                                        view_center=cs_xc, zmin=_cs_zmin,
@@ -1401,22 +1424,25 @@ with tab_play:
             "own independent zoom below.")
         if getattr(eng, "stack", "Bilayer") == "Trilayer":
             _cov_choices = [
-                ("Evap 1 — Nb", eng.films["nb1"], params.tri_t1),
-                ("Evap 2 — Al", eng.films["al2"], params.tri_t2),
-                ("Evap 3 — Al", eng.films["al3"], params.tri_t3),
-                ("Evap 4 — Nb", eng.films["nb4"], params.tri_t4),
+                ("Evap 1 — Nb", eng.films["nb1"], params.tri_t1, params.angle1),
+                ("Evap 2 — Al", eng.films["al2"], params.tri_t2, params.tri_angle2),
+                ("Evap 3 — Al", eng.films["al3"], params.tri_t3, params.angle2),
+                ("Evap 4 — Nb", eng.films["nb4"], params.tri_t4, params.tri_angle4),
             ]
         else:
             _cov_choices = [
-                ("Evap 1", eng.al1, params.t_metal1),
-                ("Evap 2", eng.al2, params.t_metal2),
+                ("Evap 1", eng.al1, params.t_metal1, params.angle1),
+                ("Evap 2", eng.al2, params.t_metal2, params.angle2),
             ]
         _cov_lbl = st.selectbox("Evaporation", [c[0] for c in _cov_choices],
                                 key="cov_evap",
                                 help="Which evaporation's floor deposit to inspect.")
-        _cov_metal, _cov_tnom = next((m, t) for lbl, m, t in _cov_choices
-                                     if lbl == _cov_lbl)
-        _cov_n = max(1, round(_cov_tnom / eng.vox))
+        _cov_metal, _cov_tnom, _cov_theta = next(
+            (m, t, th) for lbl, m, t, th in _cov_choices if lbl == _cov_lbl)
+        # Cosine-corrected expected floor thickness (t_metal is nominal/along-
+        # beam; the engine actually grows t_metal·cosθ vertically), so this
+        # matches the n _deposit() used internally for this evaporation.
+        _cov_n = max(1, round(_cov_tnom * abs(np.cos(np.radians(_cov_theta))) / eng.vox))
         _cov_grid = (eng.coverage or {}).get(_cov_lbl)
         _cov_sub = (eng.coverage_sub or {}).get(_cov_lbl)
 

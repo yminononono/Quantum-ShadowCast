@@ -71,6 +71,11 @@ class ProcessParams:
 
     # ── Evaporation 1 ─────────────────────────────────────────
     # Uniaxial tilt ±24° (same azimuth φ, opposite polar θ); 30 nm Al each.
+    # t_metal1/t_metal2 (and tri_t1..tri_t4 below) are nominal thicknesses
+    # measured ALONG THE BEAM DIRECTION (deposition-rate-monitor convention),
+    # not a raw vertical thickness — the actual vertical thickness deposited
+    # on a horizontal floor is t_metal·cos(tilt angle), thinner at more
+    # oblique tilts.
     angle1:   float = -24.0
     phi1:     float =   0.0
     t_metal1: float =  30.0
