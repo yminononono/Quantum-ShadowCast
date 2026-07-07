@@ -1864,7 +1864,7 @@ with tab_wafer:
         "(with its primary flat / オリフラ); the centre reproduces the "
         "single-JJ result.")
 
-    wc1, wc2, wc3, wc4, wc5 = st.columns(5)
+    wc1, wc2, wc3, wc4 = st.columns(4)
     waf_L = wc1.number_input(
         "Throw distance L [mm]", min_value=20.0, max_value=2000.0,
         value=550.0, step=10.0, key="waf_L",
@@ -1898,10 +1898,6 @@ with tab_wafer:
              f"whose {waf_cell:.1f} mm pitch spans the full {waf_size} wafer "
              f"(2R = {2 * R_mm:.0f} mm); raise the cell size to fill the wafer "
              f"with fewer cells."))
-    waf_res = wc5.selectbox(
-        "Voxel grid density", list(RES_LEVELS.keys()), key="waf_res",
-        help="Finer = slower; each grid cell is a full engine run.")
-    _wsmc, _wsmv = RES_LEVELS[waf_res]
     # Centred N×N grid with the chosen pitch (fills from the centre; cells outside
     # the disk or below the primary flat are skipped).  Reused below.
     wcoords = (np.arange(waf_n) - (waf_n - 1) / 2.0) * waf_cell
@@ -1912,7 +1908,7 @@ with tab_wafer:
     _fills = _span >= 2 * R_mm
     st.caption(f"{waf_size} wafer (R = {R_mm:.1f} mm) • {waf_n}×{waf_n} grid at "
                f"{waf_cell:.1f} mm pitch (span {_span:.1f} mm, centred) • "
-               f"{n_on}/{waf_n * waf_n} on-wafer cells at '{waf_res}'"
+               f"{n_on}/{waf_n * waf_n} on-wafer cells at '{res_level}'"
                + (" • spans full wafer" if _fills else "") + ".")
     if n_on > 200:
         st.caption(f"⚠ {n_on} on-wafer cells = {n_on} full engine runs — this "
@@ -1958,7 +1954,7 @@ with tab_wafer:
                 p.bridge_len, p.bridge_w, p.bridge_pmma_gap, p.undercut,
                 p.t_mma, p.t_pmma, p.manhattan_wx, p.manhattan_wy,
                 p.manhattan_theta, p.manhattan_delta, p.manhattan_h,
-                _wsmc, _wsmv, getattr(p, "sidewall", False),
+                _max_cells, _min_vox, getattr(p, "sidewall", False),
                 getattr(p, "resist_round", 0.0),
                 getattr(p, "resist_round_method", "analytic"),
                 getattr(p, "soft_edge", False), getattr(p, "soft_pattern", "rotline"),
@@ -1968,7 +1964,7 @@ with tab_wafer:
 
     @st.cache_data(show_spinner=False)
     def _wafer_area(sig, _p):
-        r = simulate(_p, max_cells=_wsmc, min_vox=_wsmv)
+        r = simulate(_p, max_cells=_max_cells, min_vox=_min_vox)
         _, a_full, ox, oy, _ = junction_footprint(r, include_sidewalls=True)
         _, a_floor, _, _, _ = junction_footprint(r, include_sidewalls=False)
         return float(a_floor), float(a_full), float(ox), float(oy)
@@ -2047,7 +2043,7 @@ with tab_wafer:
                 std=wstd, samples=wsamp,
                 theta=theta_grids, phi=phi_grids, dist=dist_grids,
                 L=waf_L, R=R_mm, c=c_flat, d=d_flat,
-                size=waf_size, n=waf_n, res=waf_res, mode=params.mode,
+                size=waf_size, n=waf_n, res=res_level, mode=params.mode,
                 stack=params.stack, gauss=bool(gauss_on), pattern=waf_pat,
                 src_size=waf_size_src, n_mc=n_mc, sidewall=bool(params.sidewall),
                 walls=bool(jj_walls),
